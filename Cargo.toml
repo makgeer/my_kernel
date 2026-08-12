@@ -1,0 +1,18 @@
+[package]
+name = "my_kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+x86_64 = "0.15.2"
+spin = "0.9.8"
+heapless = "0.7.16"
+limine = "0.6.5"
+volatile = "0.6.1"
+
+[[bin]]
+name = "my_kernel"
+path = "src/main.rs"
+
+[profile.release]
+lto = true

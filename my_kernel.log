@@ -1,0 +1,129 @@
+# ЛОГ ПРОЕКТА my_kernel
+# Начало логирования: 2025-08-10
+
+[2025-08-10] Пользователь запросил помощь с запуском ядра. Проект — ядро ОС на Rust (x86_64, Limine, QEMU).
+[2025-08-10] Обнаруженные проблемы:
+  - Цель компиляции x86_64-unknown-none не была установлена (исправлено: rustup target add)
+  - Cargo.toml не содержал зависимостей (добавлен spin = "0.9")
+  - build.rs компилировал ASM как elf32 вместо elf64 (исправлено)
+  - Cargo.toml содержал неверный ключ [target.cfg(...).rustflags] (убран)
+  - .cargo/config.toml содержал build-std, но без toolchain override
+  - interrupts.rs использует x86_64 crate, несовместимый с nightly
+  - ASM boot.asm содержал ошибки в метках GDT
+  - Линкер не получал флаги no-pie, execstack и т.д.
+
+[2025-08-10] Проверены все файлы проекта:
+  - src/main.rs — точка входа, VGA терминал (133 строки)
+  - src/boot.asm — загрузчик (110 строк, 64-бит)
+  - src/interrupts.rs.bak — бэкап прерываний (51 строка)
+  - build.rs — компиляция ASM (29 строк)
+  - linker.ld — линкер-скрипт (31 строка)
+  - Cargo.toml — манифест (11 строк)
+  - .cargo/config.toml — конфиг cargo (7 строк)
+  - i686-unknown-none.json — целевой JSON (19 строк, не используется)
+
+[2025-08-10] Последняя ошибка сборки:
+  rust-lld: error: relocation R_X86_64_32 cannot be used against local symbol; recompile with -fPIC
+  Флаги из Cargo.toml не применяются (ключ неверный). Нужно использовать .cargo/config.toml.
+[2025-08-10] Пользователь указал НЕ УДАЛЯТЬ код! Восстановил main.rs с Terminal и print().
+[2025-08-10] Проблема: на экране синий текст на чёрном фоне (цифры разрешения экрана вместо сообщения ядра).
+[2025-08-10] Причина: vesa_print_str() рисует текст, но он может не отображаться корректно.
+[2025-08-10] Нужно проверить: правильно ли vesa_print_str() выводит текст, и работает ли инициализация VESA.
+
+[2025-08-10] Пользователь прервал работу, говорит "Пока прервемся, мне нужно подумать."
+[2025-08-10] Текущее состояние:
+  - Ядро загружается через Limine BIOS
+  - VESA инициализируется (показывается "1024 x 768 Graphic mode")
+  - vesa_print_str() рисует текст, но текст может не отображаться корректно
+  - main.rs восстановлен с Terminal и print()
+  - make_iso.sh использует /run/host/usr/local/bin/xorriso
+[2025-08-10] Возможные проблемы для исправления позже:
+  - vesa_print_str() может иметь ошибку в расчёте смещения
+  - VESA_PITCH может быть неправильным
+  - Режим 1280x800x32 может не поддерживаться эмуляцией
+[2025-08-10] Файлы для проверки:
+  - src/main.rs - точка входа
+  - src/vesa.rs - VESA драйвер
+  - src/vga.rs - текстовый буфер VGA
+  - src/boot.asm - загрузчик
+  - linker.ld - линкер-скрипт
+  - build.rs - сборка ASM
+
+[2026-08-11] Интеграция Limine Framebuffer Protocol:
+  - Добавлен crate limine = "0.6.5" в Cargo.toml
+  - Создан src/limine_fb.rs для запроса framebuffer от Limine
+  - Обновлён src/main.rs для вывода информации о framebuffer
+  - Обновлён linker.ld для поддержки секции .requests
+  
+[2026-08-11] Исправление ошибок компиляции:
+  - Исправлен VgaWriter::new() на const fn для использования в статике
+  - Обновлена версия x86_64 с 0.14.12 до 0.15.2 для совместимости с nightly Rust
+  - Исправлены вызовы макросов print!() вместо print()
+  - Исправлены дубликаты функций в tasks.rs
+  - Обновлён interrupts.rs для использования spin::Once вместо Lazy
+  
+[2026-08-11] Архитектурные изменения:
+  - Переход с Multiboot 2 на Limine Boot Protocol
+  - Framebuffer запрашивается напрямую у Limine (не через VESA BIOS)
+  
+[2026-08-11] Статус сборки:
+  ✅ Ядро компилируется успешно (cargo build --target x86_64-unknown-none)
+  ⚠️ Остались предупреждения (dead_code, static_mut_refs)
+  
+[2026-08-11] Следующие шаги:
+  1. Добавить поддержку PS/2 клавиатуры (как в Blog OS - pc-keyboard crate)
+  2. Реализовать вывод текста на framebuffer
+  3. Исправить предупреждения компилятора
+
+[2026-08-11] Сессия исправления кода (по bug_report.log):
+  - src/boot.asm: Полностью переписан entry point — Limine уже переводит CPU в 64-бит.
+    Убран 32-битный _start (вызывал 64-битный код из 32-бит режима → triple fault).
+    RSP теперь указывает на вершину BSS-стека (stack_top, 16 КБ). Очищаются все регистры.
+  - linker.ld: Добавлена секция .requests (Limine), точка входа ENTRY(_start), база 2M.
+  - src/interrupts.rs: Добавлен double_fault_handler (IDT #DF). IDT через spin::Once.
+    Буфер клавиатуры увеличен 16→256 (heapless::Vec). init_idt() создаёт и загружает IDT.
+    init_pic() ремапит PIC. Убраны лишние unsafe.
+  - src/shell.rs: print() → print!(), FIFO через first()/remove(0) вместо pop() (LIFO).
+    TERMINAL.clear() удалён (не определён), оставлены help/echo.
+  - src/scheduler.rs: TASKS переведён на Mutex<[Option<Task>;4]> (static mut → защита).
+  - src/tasks.rs: COUNTER уже AtomicUsize (исправлено ранее) — подтверждено.
+  - src/gdt.rs: Переписан под API x86_64 0.15.5 (Descriptor::kernel_code_segment(),
+    append(), load()). static mut GDT.
+  - src/limine_fb.rs: Возвращает адрес framebuffer + width + height + pitch.
+  - src/main.rs: Убран #![feature(abi_x86_interrupt)] и возвращён (нужен для nightly —
+    LSP показал, что флаг всё ещё требуется для данной версии компилятора).
+  - Cargo.toml: Добавлен volatile = "0.6.1" (в итоге не используется — заменён на
+    heapless::Vec; оставлен на будущее).
+  
+[2026-08-11] Статус сборки (cargo check):
+  ✅ Ядро компилируется БЕЗ ошибок (cargo check успешен)
+  ⚠️ Осталось 14 warning'ов:
+     - interrupts.rs: unused (KEYBOARD_BUFFER, PIC1, PIC1_DATA, init_pic, outb,
+       keyboard_handler, scancode_to_char) — код написан, но не подключён к IDT
+     - scheduler.rs: поля id/name не читаются
+     - gdt.rs: static_mut_refs (mutable reference to static), DOUBLE_FAULT_IST_INDEX unused
+  
+[2026-08-11] Следующий шаг (незавершён):
+  - Подключить keyboard_handler к IDT (через idt.interrupt[0x21]) — в 0.15.5 поле
+    называется interrupts[0x21] (проверить). Тогда уйдут unused-warnings.
+  - Убрать static_mut_refs в gdt.rs (перейти на static + Mutex/Once или Box::leak).
+   - Проверить поле interrupts в InterruptDescriptorTable (0.15.5).
+
+[2026-08-11] Очистка каталога проекта от мусора:
+  - Анализ целостности: main.rs объявляет модули vga, interrupts, scheduler,
+    tasks, limine_fb, gdt — все файлы присутствуют, согласованы.
+  - Удалён явный некодовый мусор (не часть проекта ядра):
+    * qemu-8.2.0/ (2.7 ГБ исходники QEMU) + qemu-8.2.0.tar.xz (124 МБ архив)
+    * _tmp_book.docx, _tmp_book_raw.txt, _tmp_extract/ — временные файлы извлечения
+    * _ch15*.txt, _ch1617*.txt (10 файлов) — извлечённый текст книги
+    * _extract.py — вспомогательный скрипт извлечения
+    * qemu.log, qemu_log.txt, qemu_output.txt — логи QEMU
+    * bug_report.log — лог баг-репорта
+    * boot.o — артефакт сборки в корне (build.rs собирает в OUT_DIR)
+    * kernel.img — устаревший образ (2.6 МБ)
+    * boot.iso — артефакт (пересобирается make_iso.sh)
+  - НЕ удалено (требует решения по .kodaruls — неиспользуемый код/бэкапы):
+    * src/vesa.rs (565 строк) — не объявлен как модуль в main.rs
+    * src/shell.rs (39 строк) — не объявлен как модуль в main.rs
+    * src/interrupts.rs.bak, src/main_old.rs.bak — бэкапы
+    * i686-unknown-none.json — неиспользуемая цель (проект на x86_64-unknown-none)
