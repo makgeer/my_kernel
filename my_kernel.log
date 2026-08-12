@@ -269,6 +269,16 @@
   - СЛЕДУЮЩИЙ ШАГ: разобраться с DOUBLE FAULT (вероятно стек задач
     или планировщик).
 
+[2026-08-12] Коммит 310b510 (ветка «разработка»):
+  - 12 файлов изменено, 1503 вставок, 27 удалений.
+  - Новые файлы: .vscode/settings.json, iso/limine.conf, src/serial.rs,
+    «Пустой документ» (документация Limine CONFIG.md).
+  - Изменённые: .gitignore, iso/kernel.elf, linker.ld, make_iso.sh,
+    my_kernel.log, src/limine_fb.rs, src/main.rs, src/vga.rs.
+  - Push НЕ выполнен (нет авторизации GitHub — нужен токен или SSH-ключ).
+  - План на завтра: добавить полноценный терминал (раскладка клавиатуры,
+    shell с историей и автодополнением, команды), исправить DOUBLE FAULT.
+
 [2026-08-12] Публикация проекта на GitHub (ветка «разработка»):
   - Проверен git status: неотслеживаемые .cargo/, .kodaruls, .gitignore, iso/, limine-binary/, my_kernel/, src/
   - Remote не настроен, gh CLI отсутствует
