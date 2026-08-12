@@ -127,3 +127,154 @@
     * src/shell.rs (39 строк) — не объявлен как модуль в main.rs
     * src/interrupts.rs.bak, src/main_old.rs.bak — бэкапы
     * i686-unknown-none.json — неиспользуемая цель (проект на x86_64-unknown-none)
+
+[2026-08-12] Диагностика ошибки "can't find crate for 'test'" (E0463):
+  - Воспроизведена: cargo check ✅ 0 ошибок; cargo test ❌ E0463
+  - Причина: цель x86_64-unknown-none (bare-metal) не имеет libtest —
+    стандартный тестовый харнесс недоступен для no_std целей
+  - В проекте нет #[test]/mod tests — cargo test здесь не применяется
+  - Решение: НЕ исправлять #![no_std] (это не поможет и сломает ядро).
+    Варианты: A) игнорировать cargo test (сборка через build/check),
+    B) кастомный test_runner (custom_test_frameworks) для запуска тестов в QEMU.
+  - Ожидание решения пользователя: A или B.
+  - Пользователь выбрал: A (не использовать cargo test) + C (настроить rust-analyzer).
+  - Вариант A: документировано — сборка только через cargo build / cargo check.
+  - Вариант C: создан .vscode/settings.json с двумя настройками:
+    * rust-analyzer.cargo.allTargets = false — rust-analyzer не проверяет
+      тестовые таргеты (устраняет подсветку E0463 в IDE).
+    * rust-analyzer.cargo.path = /home/makgeer/.cargo/bin/cargo — явный путь,
+      т.к. в Flatpak VSCode PATH не содержит ~/.cargo/bin.
+  - Рекомендация пользователю: перезагрузить окно VSCode (Ctrl+Shift+P →
+    "Developer: Reload Window") или перезапустить rust-analyzer, чтобы
+    новые настройки вступили в силу.
+
+[2026-08-12] Подготовка к запуску ядра:
+  - cargo build --release: найдена ошибка линковки
+    "linker.ld:44: unknown directive: .rodata"
+  - Причина: в linker.ld после закрывающей "}" блока SECTIONS находился
+    ВТОРОЙ невалидный блок с секциями .rodata/.data/.bss//DISCARD (строки 43-65),
+    являвшийся остатком слияния версий скрипта.
+  - Проверка зависимостей (правило 3): все секции дубликата уже присутствуют
+    в первом блоке SECTIONS (строки 4-42), поэтому дубликат не содержал
+    уникального кода.
+  - С разрешения пользователя удалён дубликат (linker.ld теперь 43 строки).
+  - cargo build --release: ✅ УСПЕШНО (0 ошибок).
+  - Обновлён iso/kernel.elf свежим бинарником (25 152 байта).
+  - make_iso.sh: добавлен export PATH="$HOME/.cargo/bin:$PATH" в начало —
+    cargo не находится в PATH в Flatpak-VSCode.
+  - make_iso.sh отработал: boot.iso создан (1,0 МБ, bootable, 4 файла:
+    limine.cfg, kernel.elf, limine-bios-cd.bin, limine-bios.sys).
+  - Замеченные неисправности скрипта (НЕ исправлены, требуют решения):
+    * строка 14: cp в iso/boot/my_kernel.bin — каталога iso/boot нет,
+      копирование падает (не влияет на итог, реальный путь — iso/kernel.elf)
+    * строка 21: xorriso без полного пути — первая попытка падает,
+      работает вторая (строка 39, /run/host/usr/local/bin/xorriso)
+    * строка 65: isoinfo не установлен — финальный вывод обрезается
+  - ЗАПУСК ЯДРА ПЕРЕДАН ПОЛЬЗОВАТЕЛЮ (правило .kodaruls):
+    qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -serial mon:stdio
+
+[2026-08-12] Попытка запуска пользователем:
+  - user: qemu ... -display gtk → "Parameter 'type' does not accept value 'gtk'"
+  - user: qemu ... -display sdl → "Parameter 'type' does not accept value 'sdl'"
+  - Диагностика: сборка QEMU (в т.ч. /run/host/usr/local/bin/qemu-system-x86_64)
+    скомпилирована БЕЗ бэкендов gtk/sdl. Доступные: none, curses, dbus.
+  - Решение: использовать -display curses (отображает VGA-текстовый режим
+    прямо в терминале) — прямой запуск без VNC.
+  - Команда для пользователя:
+    qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -display curses
+  - При GRAPHICS=no в iso/limine.cfg Limine не предоставит framebuffer —
+    ядро выведет "No Limine framebuffer response" (ожидаемое поведение).
+
+[2026-08-12] Вариант A — отключение запроса framebuffer для текстового режима:
+  - Причина: Limine включает графический режим 1280x800 из-за FRAMEBUFFER_REQUEST
+    в limine_fb.rs (атрибуты #[used] + #[link_section = ".requests"]).
+    Ядро выводит текст через VGA-буфер 0xB8000, который не отображается
+    в графическом режиме → экран пустой.
+  - Решение: закомментированы #[used] и #[link_section = ".requests"]
+    в src/limine_fb.rs. Код НЕ удалён — статика остаётся, атрибуты
+    будут возвращены после реализации вывода на framebuffer (вариант B).
+  - cargo build --release: ✅ без ошибок.
+  - iso/kernel.elf обновлён, boot.iso пересобран (1,0 МБ, bootable).
+  - Команда для запуска:
+    qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -display curses
+  - Ожидаемый результат: текстовый режим, видны строки ядра:
+    === KERNEL START ===, No Limine framebuffer response, Interrupts enabled,
+    === KERNEL READY ===
+
+[2026-08-12] Выяснено (после теста варианта A):
+  - "1280 x 800 Graphic mode" печатает САМ QEMU (строка найдена в бинарнике
+    qemu-system-x86_64: "%i x %i Graphic mode") — curses-бэкенд сообщает,
+    что гость (Limine) переключил VGA в графический режим.
+  - Limine ВСЕГДА включает графический framebuffer для своей консоли,
+    независимо от запроса ядра. Поэтому отключение FRAMEBUFFER_REQUEST
+    не вернуло текстовый режим.
+  - В графическом режиме VGA-буфер 0xB8000 не отображается → текст ядра
+    не виден (ядро при этом, вероятно, работает).
+  - qemu.log не создавался: команда запускалась без флага -D.
+  - Пользователь выбрал вариант C: вывод через последовательный порт.
+
+[2026-08-12] Вариант C — serial-вывод (COM1):
+  - Создан src/serial.rs: драйвер UART 16550 (COM1, 0x3F8).
+    * init() — стандартная инициализация (38400 бод, 8N1, FIFO)
+    * write_str() — с переводом \n в CRLF
+    * SerialWriter + SERIAL (spin::Mutex) для fmt::Write в макросах
+  - src/main.rs: добавлен mod serial; и serial::init() до первого println!.
+  - src/vga.rs: макросы print!/println! теперь дублируют вывод в serial
+    (VGA + COM1 одновременно) — весь лог ядра попадает в qemu.log
+    независимо от видеорежима.
+  - cargo build --release: ✅ без ошибок.
+  - iso/kernel.elf обновлён, boot.iso пересобран.
+  - Команда запуска с serial-логом:
+    qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot
+    -display curses -serial file:qemu.log
+
+[2026-08-12] Диагностика через Limine verbose + serial (SERIAL=yes, VERBOSE=yes):
+  - Включены опции SERIAL=yes и VERBOSE=yes в iso/limine.conf.
+  - QEMU запускался с -serial file:qemu_serial_test.log -display none.
+  - Первый результат: Limine паниковал "Failed to open executable
+    with path `/kernel.elf`" — путь без ресурса не резолвился.
+  - Исправлено: KERNEL_PATH: boot():/kernel.elf (с ресурсом boot()).
+  - Второй результат: "elf: Lower half PHDRs are not allowed" —
+    ядро линковалось в нижней половине (2M), Limine требует higher-half.
+  - Исправлено: linker.ld база 0xFFFFFFFF80000000 (higher-half).
+    (Cargo не отслеживает linker.ld — нужен cargo clean для пересборки).
+  - Третий результат: "PHDRs with different permissions sharing same page"
+    — .got (RW) и .rodata (R) делили одну страницу памяти.
+  - Исправлено: добавлен . = ALIGN(4K) между секциями в linker.ld,
+    и *(.got*) явно размещён внутри .data.
+  - ИТОГ: ЯДРО ЗАГРУЗИЛОСЬ И РАБОТАЕТ!
+    Вывод serial:
+      === KERNEL START ===
+      Framebuffer found: 1280x800
+      Interrupts enabled
+      === KERNEL READY ===
+      Commands: help, echo, clear, reboot, hlt
+      Task: Hello from task / Task: Counter = 1..9
+      EXCEPTION: DOUBLE FAULT (в конце — вероятно переполнение стека
+      или проблема планировщика при многократных переключениях задач)
+  - Замечание: GRAPHICS=no в limine.conf не предотвращает графический
+    режим — Limine всё равно включает framebuffer 1280x800.
+    Вывод ядра виден только через serial (VGA-буфер не отображается).
+  - Файлы изменены в этой сессии:
+    * iso/limine.conf — новый синтаксис Limine 12.5.2 (опции через ':',
+      меню-записи через '/', SERIAL=yes, VERBOSE=yes, boot():/kernel.elf)
+    * linker.ld — база 0xFFFFFFFF80000000, ALIGN(4K) между секциями,
+      .got внутри .data
+    * make_iso.sh — /limine.conf вместо /limine.cfg, export PATH для cargo
+    * src/serial.rs — драйвер UART 16550 (COM1)
+    * src/main.rs — mod serial + serial::init() до первого println!
+    * src/vga.rs — макросы print!/println! дублируют вывод в serial
+    * src/limine_fb.rs — FRAMEBUFFER_REQUEST атрибуты закомментированы
+      (вариант A; код не удалён)
+  - СЛЕДУЮЩИЙ ШАГ: разобраться с DOUBLE FAULT (вероятно стек задач
+    или планировщик).
+
+[2026-08-12] Публикация проекта на GitHub (ветка «разработка»):
+  - Проверен git status: неотслеживаемые .cargo/, .kodaruls, .gitignore, iso/, limine-binary/, my_kernel/, src/
+  - Remote не настроен, gh CLI отсутствует
+  - Создана и активирована ветка «разработка» (git checkout -b разработка)
+  - Обнаружен пустой вложенный git-репозиторий my_kernel/.git (ошибочный git init) —
+    блокировал git add -A ("does not have a commit checked out")
+  - С разрешения пользователя удалён my_kernel/.git (папка пустая, кода не содержит)
+  - git add -A выполнен успешно, все файлы проекта проиндексированы в ветку «разработка»
+  - Ожидание: git config user.name/email и URL remote для commit + push

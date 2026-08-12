@@ -3,8 +3,11 @@
 
 use limine::request::FramebufferRequest;
 
-#[used]
-#[link_section = ".requests"]
+// Временно отключены: без этих атрибутов Limine не видит запрос framebuffer
+// и остаётся в текстовом режиме, где VGA-буфер 0xB8000 отображается корректно.
+// Код не удалён — атрибуты будут возвращены после реализации вывода на framebuffer.
+// #[used]
+// #[link_section = ".requests"]
 pub static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
 /// Получаем framebuffer от Limine

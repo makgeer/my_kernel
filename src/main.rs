@@ -7,6 +7,7 @@ mod interrupts;
 mod scheduler;
 mod tasks;
 mod limine_fb;
+mod serial;
 mod gdt;
 
 use core::panic::PanicInfo;
@@ -16,6 +17,10 @@ use crate::limine_fb::FRAMEBUFFER_REQUEST;
 
 #[no_mangle]
 pub extern "C" fn _start_rust() -> ! {
+    // Инициализируем serial (COM1) до первого вывода — чтобы весь лог
+    // ядра попадал в последовательный порт (qemu.log)
+    serial::init();
+
     println!("=== KERNEL START ===");
     
     // Запрашиваем framebuffer от Limine

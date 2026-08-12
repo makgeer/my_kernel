@@ -94,6 +94,9 @@ macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
         let _ = write!($crate::vga::WRITER.lock(), $($arg)*);
+        // Дублируем вывод в COM1 (serial) — для отладки через qemu.log,
+        // т.к. в графическом режиме VGA-буфер 0xB8000 не отображается
+        let _ = write!($crate::serial::SERIAL.lock(), $($arg)*);
     }};
 }
 

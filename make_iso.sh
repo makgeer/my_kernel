@@ -2,6 +2,10 @@
 
 cd /home/makgeer/my_kernel
 
+# Cargo установлен через rustup в ~/.cargo/bin, но в Flatpak-VSCode
+# PATH не содержит этой папки. Явно добавляем её в PATH.
+export PATH="$HOME/.cargo/bin:$PATH"
+
 echo "=== Building kernel ==="
 cargo build --release
 
@@ -43,7 +47,7 @@ $XORRISO_BIN -as mkisofs \
     -c boot.catalog \
     -b limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table \
     -graft-points \
-    /limine.cfg=iso/limine.cfg \
+    /limine.conf=iso/limine.conf \
     /kernel.elf=iso/kernel.elf \
     /limine-bios-cd.bin=iso/limine-bios-cd.bin \
     /limine-bios.sys=iso/limine-bios.sys \

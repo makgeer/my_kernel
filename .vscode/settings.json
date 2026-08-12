@@ -1,0 +1,11 @@
+{
+  // Запрещает rust-analyzer проверять все таргеты (включая тестовые сборки).
+  // Для bare-metal цели x86_64-unknown-none libtest недоступен,
+  // поэтому проверка тестовых таргетов даёт ложную ошибку E0463
+  // "can't find crate for 'test'".
+  "rust-analyzer.cargo.allTargets": false,
+
+  // Явный путь к cargo: в Flatpak-окружении VSCode PATH не содержит ~/.cargo/bin,
+  // и rust-analyzer не смог бы найти компилятор самостоятельно.
+  "rust-analyzer.cargo.path": "/home/makgeer/.cargo/bin/cargo"
+}
