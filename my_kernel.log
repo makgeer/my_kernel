@@ -287,4 +287,448 @@
     блокировал git add -A ("does not have a commit checked out")
   - С разрешения пользователя удалён my_kernel/.git (папка пустая, кода не содержит)
   - git add -A выполнен успешно, все файлы проекта проиндексированы в ветку «разработка»
-  - Ожидание: git config user.name/email и URL remote для commit + push
+   - Ожидание: git config user.name/email и URL remote для commit + push
+
+[2026-08-13] Продолжение работы. План из лога: 1) исправить DOUBLE FAULT,
+   2) полноценный терминал (клавиатура, shell с историей/автодополнением, команды).
+   Текущее состояние: cargo check ✅ без ошибок. Ветка «разработка», 2 коммита
+   опережают origin (не запушены).
+
+[2026-08-13] Исправление DOUBLE FAULT (точечное, src/interrupts.rs):
+   - Причина: init_pic() НЕ записывал маску прерываний (IMR) после
+     последовательности инициализации. После ICW IMR обоих PIC = 0,
+     т.е. все 16 IRQ размаскированы. IRQ8 (RTC) периодически срабатывает
+     (~раз в 500 мс), обработчика в IDT нет → непокрытое прерывание →
+     #GP → #DF (DOUBLE FAULT). Также IRQ7/IRQ15 (spurious) без обработчиков.
+     Это объясняло «double fault в конце» — НЕ баг планировщика.
+   - Исправление: дополнена init_pic() двумя строками маскировки:
+     * outb(PIC1_DATA, 0xFC) — master: разрешены IRQ0 (таймер), IRQ1 (клавиатура),
+       остальные замаскированы.
+     * outb(PIC2_DATA, 0xFF) — slave: все IRQ 8-15 замаскированы (в т.ч. RTC).
+     * Добавлена константа PIC2_DATA = 0xA1.
+   - Проверка зависимостей (правило 3): init_pic() зовётся только из init_idt();
+     IRQ0/IRQ1 имеют обработчики в IDT (timer_handler, keyboard_handler).
+     Других зависимостей нет.
+   - cargo check: ✅ без ошибок.
+   - СЛЕДУЮЩИЙ ШАГ: полноценный терминал (раскладка клавиатуры, shell, команды).
+
+[2026-08-13] Вывод терминала на framebuffer (запрос пользователя «1280 x 800 Graphic
+   mode / Вывод терминала»). Экран был в графическом режиме (Limine), но текст
+   ядра уходил только в serial — VGA-буфер 0xB8000 не отображается в графике.
+   Реализован вывод текста прямо на Limine framebuffer.
+   Изменения (точечные, по .kodaruls):
+   1. src/limine_fb.rs — ВОЗВРАЩЕНЫ атрибуты #[used] + #[link_section = ".requests"]
+      для FRAMEBUFFER_REQUEST (были закомментированы для варианта A). Без них
+      Limine не видел запрос → response() = None → «No Limine framebuffer response».
+   2. src/vesa.rs — добавлены:
+      * vesa_set_framebuffer(addr, pitch, width, height) — устанавливает
+        framebuffer от Limine в те же static'ы, которые используют существующие
+        vesa_draw_char/vesa_print_str (переиспользован готовый шрифт 8x16).
+      * vesa_scroll_screen() — прокрутка экрана вверх на FONT_HEIGHT пикселей
+        (построчное копирование с учётом pitch + заливка нижней полосы чёрным).
+        Без неё текст уходил за нижнюю границу экрана.
+      * Прокрутка в vesa_print_str (while-проверка в конце вызова).
+      * В vesa_draw_char — заливка фона (чёрный) на весь глиф, иначе остаются
+        «хвосты» старых символов при перезаписи ячейки.
+      * VesaWriter + impl fmt::Write — обёртка для макросов print!/println!
+        (рисует фрагменты сразу, без alloc).
+   3. src/main.rs — добавлен mod vesa; в _start_rust после получения framebuffer
+      вызываются vesa_set_framebuffer + vesa_clear_screen(0x000000).
+   4. src/vga.rs — макрос print! теперь дублирует вывод и в VesaWriter.
+      До инициализации framebuffer вывод безопасно игнорируется
+      (при VESA_WIDTH == 0 vesa_draw_char не рисует).
+   Проверка:
+   - cargo check ✅ / cargo build --release ✅ (11 warnings dead_code — старый
+     VESA BIOS код, НЕ удалён по правилу .kodaruls).
+   - readelf: секция .requests присутствует, символ FRAMEBUFFER_REQUEST
+     (48 байт, Limine magic 888b4cdf...) в ней — Limine отдаст framebuffer.
+   - iso/kernel.elf обновлён, boot.iso пересобран (1,0 МБ, bootable).
+   Ожидаемый результат на экране: белый текст на чёрном фоне:
+     Framebuffer found: 1280x800, Framebuffer output enabled, задачи и т.д.
+   Команда запуска (вручную в системном терминале):
+     qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -display curses -serial file:qemu.log
+
+[2026-08-13] После теста пользователя («1280 x 800 Graphic mode») текст всё ещё
+   не виден на экране. Причина найдена: Limine возвращает в fb.address()
+   ФИЗИЧЕСКИЙ адрес framebuffer. Ядро работает в higher-half, физическая память
+   framebuffer НЕ отображена в его виртуальное адресное пространство → запись
+   по физ. адресу → page fault → double/triple fault → экран без текста.
+   Исправление (HHDM — Higher Half Direct Map):
+   - src/limine_fb.rs: добавлен запрос Limine HHDM:
+     * #[used] + #[link_section=".requests"] static HHDM_REQUEST: HhdmRequest
+     * get_hhdm_offset() -> u64 (смещение direct map; 0 если ответа нет)
+     Limine маппит всю физическую память в higher-half со смещением offset,
+     тогда virt = phys + hhdm_offset (работает и для MMIO/VRAM).
+   - src/main.rs: при установке framebuffer адрес преобразуется:
+     fb_virt = (fb.address() as u64 + limine_fb::get_hhdm_offset()) as *mut u32.
+   - Проверка: readelf — в .requests лежат оба запроса
+     (HHDM_REQUEST @0x00, FRAMEBUFFER_REQUEST @0x30, по 48 байт).
+   - iso/kernel.elf обновлён, boot.iso пересобран.
+   Ожидаемый результат: на экране белый текст на чёрном фоне с задачами.
+   Если снова пусто — проверить qemu.log (запрос HHDM response).
+
+[2026-08-13] Тест пользователя: QEMU запущен, но на экране только
+   «1280 x 800 Graphic mode». Анализ qemu.log:
+   - === KERNEL START ===
+   - Framebuffer found: 1280x800
+   - ЛОГ ОБРЫВАЕТСЯ после этой строки → ядро падает (triple fault)
+     между «Framebuffer found» и «Framebuffer output enabled», т.е.
+     в vesa_clear_screen() (запись ~1M пикселей в framebuffer).
+   - Limine: Requests count: 2 (оба запроса найдены), Top of HHDM: 0x10000000000,
+     framebuffer физически на 0xfd000000 (VBE mode 0x17a).
+   - Гипотеза: fb_virt (phys + hhdm_offset) не отображён в page tables ядра
+     ИЛИ hhdm_offset = 0 (response не получен) → page fault при записи.
+   - Добавлена ДИАГНОСТИКА в main.rs (вывод до vesa_clear_screen):
+     * HHDM offset: 0x{:x}
+     * FB phys: 0x{:x}, virt: 0x{:x}, pitch: {}
+     Эти println! безопасны — идут до vesa_set_framebuffer, VesaWriter
+     не рисует при VESA_WIDTH == 0.
+   - Сборка ✅, iso пересобран. Ожидаем от пользователя новый qemu.log
+     для определения значения offset/адреса.
+
+[2026-08-13] Анализ нового qemu.log — РАЗГАДКА:
+   - HHDM offset: 0xffff800000000000
+   - FB phys: 0xffff8000fd000000, virt: 0xffff0000fd000000, pitch: 5120
+   - Оказалось: Limine УЖЕ возвращает в fb.address() ВИРТУАЛЬНЫЙ адрес
+     (phys 0xfd000000 + hhdm offset 0xffff800000000000 = 0xffff8000fd000000).
+     Современный Limine сам применяет HHDM к адресу framebuffer!
+   - Наша ошибка: мы ПОВТОРНО добавляли hhdm offset:
+     0xffff8000fd000000 + 0xffff800000000000 = 0xffff0000fd000000 (переполнение
+     u64) — мусорный адрес, отсутствующий в page tables → page fault при
+     первой записи в vesa_clear_screen → triple fault → лог обрывался.
+   - Исправление (src/main.rs): fb_virt = fb.address() напрямую, БЕЗ сложения
+     с hhdm. HHDM_REQUEST/get_hhdm_offset() остались в коде (не удаляем) —
+     пригодятся для работы с физической памятью/MMIO в будущем.
+   - Сборка ✅ (12 warnings: dead_code, в т.ч. get_hhdm_offset — ожидаемо),
+     iso пересобран.
+   - Ожидаемый результат: НА ЭКРАНЕ видимый текст (белый на чёрном),
+     задачи крутятся, DOUBLE FAULT не возникает.
+
+[2026-08-13] Тест пользователя: экран всё ещё пуст («1280 x 800 Graphic mode»).
+   НО qemu.log показал БОЛЬШОЙ прогресс:
+     === KERNEL START ===
+     Framebuffer found: 1280x800
+     Framebuffer output enabled
+     Interrupts enabled
+     === KERNEL READY ===
+     Commands: help, echo, clear, reboot, hlt
+     Task: Hello / Counter = 1..5
+     EXCEPTION: DOUBLE FAULT  ← всё ещё
+   Выводы:
+   1. Запись в framebuffer РАБОТАЕТ (падает только при неверном адресе,
+      а тут адрес правильный — vesa_clear_screen прошёл).
+   2. Текст не виден НЕ из-за ядра: бэкенд curses QEMU не умеет
+      отображать графический framebuffer (доступны только none, curses,
+      dbus — GTK/SDL нет; VNC скомпилирован, НО не в списке -display,
+      доступен через -vnc). curses показывает лишь «1280 x 800 Graphic mode».
+   3. DOUBLE FAULT остался (Counter=5) → маскирование RTC не было причиной
+      (или не единственной). Ожидается обновление ядра:
+      * double_fault_handler теперь выводит RIP (instruction_pointer) и код
+        ошибки — по адресу определим функцию падения.
+      * init_pic() дополнен ПОЛНОЙ инициализацией PIC2 (slave):
+        ICW1 для обоих, ICW2 0x20/0x28, ICW3 0x04/0x02, ICW4, маски, EOI.
+        Ранее slave не инициализировался — каскад был в неопределённом
+        состоянии.
+   Проверено: VNC доступен (qemu -vnc help работает).
+   ОТОБРАЖЕНИЕ (варианты для пользователя):
+     A. VNC: qemu ... -display none -vnc :0 -serial file:qemu.log
+        + подключение VNC-клиентом (порт 5900) → виден framebuffer.
+     B. serial в терминал: qemu ... -display none -serial stdio
+        → весь вывод ядра прямо в консоль (терминал виден текстом).
+   Сборка ✅, iso пересобран.
+
+[2026-08-13] ПОЛОЖИТЕЛЬНЫЙ ТЕСТ пользователя (-display none -serial stdio):
+   - Ядро загрузилось полностью, задачи крутятся БЕЗ DOUBLE FAULT:
+     Task: Hello / Counter = 1..26+ (вывод продолжался, пользователь
+     остановил вручную). Раньше DOUBLE FAULT возникал на Counter=5.
+   - ИТОГ: полная инициализация PIC2 (slave) в init_pic() УСТРАНИЛА
+     DOUBLE FAULT. Маскировка RTC + инициализация каскада master/slave
+     решили проблему полностью.
+   - qemu.log в файле остался СТАРЫМ (последний запуск был с -serial stdio,
+     вывод шёл в терминал, а не в файл) — на актуальность не влияет.
+   - Осталось (по плану): видимый терминал на framebuffer. curses не
+     отображает графику — варианты: VNC (-vnc :0) или serial stdio.
+     Framebuffer-вывод (vesa) уже работает (Framebuffer output enabled,
+     запись в framebuffer проходит без сбоев).
+
+[2026-08-13] DOUBLE FAULT возобновился с диагностикой RIP:
+   - Запуск: -display none -serial stdio. Tasks работали до Counter=26,
+     затем: EXCEPTION: DOUBLE FAULT (RIP: 0xffffffff800017fc, err: 0x0).
+   - Дизассемблирование RELEASE: 0xffffffff800017fc = iretq в timer_handler!
+   - ВАЖНАЯ КОРРЕКЦИЯ анализа: компактный пролог timer_handler (push rdx/rax,
+     out, pop, iretq) — НЕ баг. x86-interrupt ABI сохраняет ТОЛЬКО
+     используемые регистры; функция использует лишь rax/rdx для outb —
+     это корректная оптимизация компилятора. Первоначальный вывод
+     «не сохраняет регистры» был ошибочным, правка отменена.
+   - Падение на iretq означает: структура IRET-фрейма (RIP/CS/RFLAGS/RSP/SS)
+     на стеке повреждена ИЛИ стековая страница не отображена.
+   - Добавлена расширенная диагностика в double_fault_handler:
+     * TIMER_TICKS — счётчик тиков таймера (static, инкремент в timer_handler)
+     * RIP — прерванный код (уже был)
+     * RSP — стек прерванного контекста (покажет переполнение стека)
+     * err — код ошибки
+     * CR2 — адрес при page fault (если причиной был #PF, а не #GP от iretq)
+   -    Сборка ✅, iso пересобран. Ожидаем новый запуск пользователя.
+
+[2026-08-13] Тест TSS/IST — DOUBLE FAULT на 1-м тике таймера:
+   Запуск: -display none -serial stdio. Задачи дошли до Counter=13, затем:
+     EXCEPTION: DOUBLE FAULT (ticks=1, RIP: 0xffffffff80001804,
+     RSP: 0xffffffff80008fd8, err: 0x0, CR2: 0x1836e)
+   Анализ:
+   - Адреса после пересборки сместились: 0x1804 теперь = iretq в timer_handler
+     (раньше там был keyboard_handler) → падение ВСЕГДА на выходе из обработчика
+     IRQ0 при ПЕРВОМ тике (ticks=1).
+   - RSP 0x8fd8 = TIMER_STACK_top (0x9000) − 40 байт — ровно начало IRET-фрейма
+     таймера на его IST-стеке. IST-механизм РАБОТАЕТ (фрейм запушен на
+     TIMER_STACK, #DF перехвачен на DOUBLE_FAULT_STACK через IST1).
+   - CR2 0x1836e — низкий «мусорный» адрес (не из higher-half). Скорее всего
+     iretq вытолкнул повреждённый/неверный RIP из фрейма → #PF → #DF.
+   - ВЫВОД: IRET-фрейм таймера на TIMER_STACK повреждён к моменту iretq,
+     либо в нём изначально неверное значение (RIP/RFLAGS/CS).
+   - Добавлена ДИАГНОСТИКА в double_fault_handler:
+     * Дамп 6 qword'ов стека по RSP прерванного контекста (IRET frame[0..5])
+       — покажет фактические значения RIP/CS/RFLAGS/RSP/SS, которые iretq
+       пытался вытолкнуть (и промежуточные фреймы #GP→#NP при цепочке).
+     * Дамп CS/RFLAGS/SS самого #DF-фрейма (stack_frame).
+   Сборка ✅, iso пересобран. Ожидаем запуск: дамп покажет повреждённое поле.
+   Команда запуска (вручную в системном терминале):
+     qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -display none -serial file:qemu_new.log
+   (или -serial stdio для вывода в терминал).
+
+[2026-08-13] Первый дамп IRET-фрейма — НАЙДЕНА АНОМАЛИЯ SS=0x30:
+   Запуск: -display none -serial stdio. Tasks дошли до Counter=23, затем:
+     EXCEPTION: DOUBLE FAULT (ticks=1, RIP: 0xffffffff80001804,
+     RSP: 0xffffffff80008fd8, err: 0x0, CR2: 0x310)
+     IRET frame[0] = 0xffffffff80002859  (RIP таймера: vesa write_str)
+     IRET frame[1] = 0x0000000000000008  (CS = 0x8 kernel code ✅)
+     IRET frame[2] = 0x0000000000000287  (RFLAGS = 0x287: IF, нет NT ✅)
+     IRET frame[3] = 0xffffffff80014040  (RSP — главный стек ядра boot.asm ✅)
+     IRET frame[4] = 0x0000000000000030  (SS = 0x30 — АНОМАЛИЯ!)
+     IRET frame[5] = 0x0000000000000000  (мусор)
+     DF frame: CS: 0x8, RFLAGS: 0x3, SS: 0x0
+   Расшифровка:
+   - Дамп читает RSP фрейма #DF = 0x8fd8 → это ВЕРХ фрейма таймера на
+     TIMER_STACK. frame[0..5] = фрейм таймера: RIP=0x2859 (vesa write_str,
+     задача рисовала на framebuffer в момент прерывания), CS=0x8, RFLAGS=0x287,
+     RSP=0x14040 (главный стек ядра), SS=0x30.
+   - SS=0x30 — НЕСУЩЕСТВУЮЩИЙ селектор (в GDT: 0x8 code, 0x10 data, 0x18 TSS).
+     При iretq CPU по SS=0x30 не находит дескриптор → #GP → #DF.
+   - Вопрос: почему CPU сохранил в фрейм SS=0x30, если должен быть 0x10?
+     Возможно: SS регистр был 0x30 в момент входа в таймер (кто-то записал),
+     либо фрейм повреждён записью. ВНЕШНЕГО перекрытия стеков/framebuffer нет.
+   - Добавлена ДИАГНОСТИКА: timer_handler теперь сохраняет ФАКТИЧЕСКИЙ
+     SS/CS в момент входа (asm mov %ss / mov %cs) в LAST_TIMER_SS/CS,
+     double_fault_handler их выводит. Это покажет: SS=0x30 был УЖЕ при входе
+     (проблема в прерванном коде) или стал 0x30 позже (повреждение фрейма).
+   Сборка ✅, iso пересобран. Ожидаем запуск с диагностикой SS/CS на входе.
+
+[2026-08-13] ВТОРОЙ дамп — и РАЗГАДКА SS=0x30:
+   Запуск: -display none -serial stdio. Tasks дошли до Counter=23, затем:
+     EXCEPTION: DOUBLE FAULT (ticks=0, RIP: 0xffffffff800017f4,
+     RSP: 0xffffffff80008fc0, err: 0x0, CR2: 0xffff8000fd07f800)
+     IRET frame[0..5] = мусор (0xffff8000fd07f800, 0x220, 0x1400,
+     0xffffffff80004beb, 0x8, 0x286) — НЕ похоже на IRET-фрейм
+     DF frame: CS: 0x8, RFLAGS: 0x86, SS: 0x0
+     timer entry: SS=0x0, CS=0x0   ← КЛЮЧ!
+   Анализ:
+   - ticks=0 и timer entry SS=0, CS=0 → timer_handler НЕ выполнился:
+     упал ПРЯМО в начале на моей же asm-диагностике!
+   - ОШИБКА В ДИАГНОСТИКЕ: в AT&T синтаксисе `mov {ss:x}, %ss` — это
+     ЗАПИСЬ в сегментный регистр SS (а не чтение из него), а
+     `mov {cs:x}, %cs` — вообще недопустимо (в CS нельзя писать через mov)
+     → #UD → #DF. Диагностика сама роняла ядро!
+   - ИСПРАВЛЕНО: чтение SS/CS через API крейта (Segment::get_reg()).
+   - ГЛАВНЫЙ ВЫВОД из предыдущего дампа (SS=0x30 в IRET-фрейме):
+     SS регистр при прерывании = 0x30 — Limine оставляет СВОЙ селектор
+     стека (в GDT Limine SS = 0x30). Мы загружаем СВОЮ GDT (0x8 code,
+     0x10 data, 0x18 TSS), ставим CS=0x8 и DS=0x10, но НЕ ставим SS!
+     При прерывании CPU кладёт SS=0x30 в IRET-фрейм, а при iretq ищет
+     селектор 0x30 в НАШЕЙ GDT → его нет → #GP → #DF.
+   - ИСПРАВЛЕНИЕ (src/gdt.rs): после GDT.load() добавлен SS::set_reg(data_sel)
+     — SS теперь указывает на наш сегмент данных (0x10), как CS и DS.
+   Сборка ✅, iso пересобран. ОЖИДАЕМ: DOUBLE FAULT должен исчезнуть
+   (SS в IRET-фрейме станет 0x10, iretq найдёт селектор в GDT).
+
+[2026-08-13] ✅✅✅ DOUBLE FAULT ПОЛНОСТЬЮ УСТРАНЁН!
+   Запуск: -display none -serial file:qemu_new.log
+   - Лог: 11855 строк, задачи крутятся до Counter=11204 и продолжают!
+   - НИ ОДНОГО EXCEPTION / DOUBLE FAULT / PANIC в логе.
+   - Причина: SS::set_reg(data_sel) в gdt::init_gdt() — SS теперь указывает
+     на наш сегмент данных (0x10) вместо Limine'овского 0x30.
+   - TSS/IST работает: обработчики таймера и клавиатуры на отдельных стеках,
+     iretq корректно возвращается (SS=0x10 найден в GDT).
+   - Пользователь запускал с -serial file:qemu_new.log (вывод в файл),
+     поэтому терминал был пуст — QEMU работал без отображения.
+   ТЕКУЩЕЕ СОСТОЯНИЕ ЯДРА:
+   - Загрузка через Limine ✅
+   - Framebuffer вывод ✅ (vesa)
+   - Serial вывод ✅
+   - GDT + TSS + IST ✅
+   - IDT: breakpoint, double_fault, timer (IRQ0), keyboard (IRQ1) ✅
+   - PIC: master+slave, маски (только IRQ0+IRQ1) ✅
+   - Прерывания работают стабильно ✅
+   - Кооперативный планировщик крутит задачи бесконечно ✅
+   СЛЕДУЮЩИЙ ШАГ: полноценный shell (чтение клавиатуры, команды).
+
+[2026-08-13] Реализация интерактивного shell:
+   1. src/interrupts.rs — полная US-раскладка клавиатуры:
+      * Управляющие: Enter (0x1C) → '\n', Backspace (0x0E) → '\u{8}',
+        Escape (0x01) → '\u{1b}', Tab (0x0F) → '\u{9}'.
+      * Буквы a-z (scancodes 0x1E..0x2C), цифры 0-9 (0x02..0x0B),
+        знаки препинания (без Shift), пробел (0x39).
+      * Shift/регистр пока не поддерживаются (только нижний регистр).
+   2. src/shell.rs — переписан в полноценную оболочку:
+      * getchar() — блокирующее чтение символа из KEYBOARD_BUFFER
+        (с NOP-паузой, чтобы не раскручивать CPU).
+      * read_line() — чтение строки до Enter с поддержкой Backspace
+        (стирание символа + откат курсора).
+      * Команды: help, about, tasks (одна итерация планировщика),
+        clear (очистка framebuffer + VGA), echo <текст>, пустая строка.
+      * Неизвестные команды → "Unknown command: <cmd>".
+   3. src/scheduler.rs — вынесен run_scheduler_once() (один проход всех
+      задач); run_scheduler() теперь цикл из вызовов once + пауза.
+      Команда "tasks" в shell вызывает once — задачи и shell работают
+      кооперативно в одном потоке.
+   4. src/main.rs — mod shell; добавлен, вызов shell::shell() вместо
+      бесконечного run_scheduler(). Импорт run_scheduler убран из use
+      (функция осталась в scheduler.rs, не удалена).
+   Сборка ✅, iso пересобран (1,0 МБ, bootable).
+   Команда запуска (вручную в системном терминале):
+     qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -display none -serial stdio
+   Ожидаемый результат: приглашение "> ", ввод команд с клавиатуры,
+   help/echo/tasks/clear работают.
+
+[2026-08-13] Проблема: shell запустился (приглашение "> " выводится),
+   но клавиатура НЕ работает при запуске с -serial stdio.
+   Причина: в QEMU с -serial stdio нажатия клавиш терминала попадают в
+   COM1 (последовательный порт), а НЕ в эмулируемую PS/2 клавиатуру.
+   keyboard_handler читает только порт 0x60 (PS/2) → буфер пуст → ввод не виден.
+   Исправление:
+   1. src/serial.rs — добавлены функции чтения COM1:
+      * serial_has_data() — LSR (0x3FD) бит 0 (Data Ready)
+      * serial_read() — чтение байта из COM1 (0x3F8)
+   2. src/shell.rs — getchar() теперь читает ОБА источника:
+      1) PS/2 клавиатура (KEYBOARD_BUFFER, IRQ1) — для графики/curses/VNC
+      2) COM1 (serial) — для -serial stdio
+      Возвращает (char, bool from_serial):
+      * serial-ввод НЕ эхо-ситится (терминал сам показывает символы),
+      * PS/2-ввод эхо-ситится (иначе не виден).
+   3. read_line() обрабатывает '\r' (Enter из serial) и 0x7F (DEL) как
+      backspace наряду с 0x08.
+   Сборка ✅, iso пересобран (1,0 МБ, bootable).
+   Команда запуска (вручную в системном терминале):
+     qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -display none -serial stdio
+   Ожидаемый результат: ввод команд работает через терминал (serial),
+   help/echo/tasks/clear реагируют.
+
+[2026-08-13] Диагностика serial-ввода: РАБОТАЕТ, но нет эха.
+   - Пользователь набрал команду запуска QEMU, и она отразилась как
+     [rx:0x67]='g', [rx:0x68]='h', ... "qemu-system-x86_64 -cdrom boot.iso..."
+   - Вывод: serial-ввод ИДЁТ в COM1, getchar() его читает.
+   - Причина "ввод не работает": QEMU -serial stdio переводит терминал
+     в RAW MODE — нет локального эха. Раньше мы НЕ печатали символы
+     обратно для serial-ввода (думали, терминал сам эхо-сит) → ввод
+     был невидим → казалось, что не работает.
+   - ИСПРАВЛЕНО (src/shell.rs):
+     1. Убрана диагностика [rx:0x..].
+     2. read_line() печатает эхо ВСЕГДА (и для serial, и для PS/2):
+        печатные символы → print!("{}", c), Backspace → "\x08 \x08".
+   Сборка ✅, iso пересобран (1,0 МБ, bootable).
+   Команда запуска (вручную в системном терминале):
+     qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -display none -serial stdio
+   Ожидаемый результат: видимый ввод, реагируют на help/echo/tasks/clear.
+
+[2026-08-13] ✅ SHELL ПОЛНОСТЬЮ РАБОТАЕТ!
+   Тест пользователя (-serial stdio, свежий ISO):
+     > help           → список команд ✅
+     > echo hello     → hello ✅
+     > about          → MyKernel v0.1.0 / x86_64 OS kernel / Limine ✅
+     > task           → Unknown command: task (нужен синоним)
+   Добавлен синоним: "task" | "tasks" → run_scheduler_once().
+   Сборка ✅, iso пересобран.
+   ТЕКУЩЕЕ СОСТОЯНИЕ ЯДРА:
+   - Загрузка Limine ✅
+   - Framebuffer + serial вывод ✅
+   - GDT + TSS + IST ✅ (прерывания на отдельных стеках)
+   - PIC (master+slave, маски IRQ0+IRQ1) ✅
+   - Прерывания стабильны (DOUBLE FAULT устранён) ✅
+   - PS/2 клавиатура (IRQ1) + serial-ввод (COM1) ✅
+   - Кооперативный планировщик (команда tasks) ✅
+   - Интерактивный shell: help, echo, about, tasks, clear ✅
+   Команды в shell:
+     help, echo <text>, about, tasks (task), clear
+
+[2026-08-13] Анализ последнего запуска:
+   EXCEPTION: DOUBLE FAULT (ticks=1, RIP: 0xffffffff80001804, RSP: 0xffffffff8000c008,
+   err: 0x0, CR2: 0xffff8000fd24b800)
+   - RIP 0x1804 — в keyboard_handler (push %r11) → стек переполнен при
+     прерывании клавиатуры!
+   - RSP 0xffffffff8000c008 — ВЫШЕ stack_top (стек 16КБ из boot.asm = 0x4000).
+     RSP указывает за пределы стека → переполнение/повреждение стека.
+   - CR2 0xffff8000fd24b800 — адрес в framebuffer (отложенный #PF от записи
+     в vesa, либо сохранённый CR2). Не первопричина — первопричина переполнение.
+   - ВЫВОД: общий стек ядра 16КБ переполняется при прерывании во время
+     глубокого вывода задачи. Нужен TSS с IST (отдельные стеки для обработчиков).
+
+[2026-08-13] Реализация TSS/IST (устранение DOUBLE FAULT через отдельные стеки):
+   1. src/gdt.rs — переписана инициализация GDT:
+      * Добавлены IST-индексы: DOUBLE_FAULT_IST_INDEX=1, TIMER_IST_INDEX=2,
+        KEYBOARD_IST_INDEX=3.
+      * Добавлены 3 статических стека в .bss: DOUBLE_FAULT_STACK (16КБ),
+        TIMER_STACK (8КБ), KEYBOARD_STACK (8КБ).
+      * Добавлен static mut TSS: TaskStateSegment; interrupt_stack_table
+        заполняется вершинами стеков (RSP = верх, стек растёт вниз).
+      * GDT теперь содержит: kernel_code_segment, kernel_data_segment,
+        tss_segment(&TSS).
+      * После GDT.load() устанавливаются CS и DS (Segment::set_reg) и
+        вызывается load_tss(tss_sel) — активирует IST.
+      * DOUBLE_FAULT_IST_INDEX убран из #[allow(dead_code)] — теперь используется.
+   2. src/interrupts.rs — обработчикам назначены IST:
+      * double_fault → IST 1 (критично: #DF при переполнении стека использует
+        свежий стек, иначе → triple fault)
+      * timer_handler (IRQ0) → IST 2
+      * keyboard_handler (IRQ1) → IST 3
+      * set_stack_index — unsafe в x86_64 0.15 (не проверяет диапазон),
+        обёрнут в unsafe-блоки. Индексы 1..=3 гарантированы константами TSS.
+   Принцип: при прерывании CPU переключает RSP на IST-стек, обработчик
+   работает на нём, при iretq RSP возвращается к прерванному контексту.
+   Прерывания больше не зависят от глубины стека задач/ядра.
+   Сборка ✅ (12 warnings dead_code — старый VESA BIOS код, не удаляем).
+   iso/kernel.elf обновлён, boot.iso пересобран (1,0 МБ, bootable).
+   Команда запуска (вручную в системном терминале):
+      qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -display none -serial stdio
+    Ожидаемый результат: задачи крутятся без DOUBLE FAULT неограниченно долго.
+
+[2026-08-13] Добавление модуля terminal.rs — ПЕРВОЕ ПРИЛОЖЕНИЕ ОС (полноценный терминал).
+   Цель: единый источник правды для вывода — offscreen-буфер 80x25 с цветами,
+   курсором и ANSI, рендер во все три устройства (VGA + Serial + Framebuffer).
+   Шаг 1 (создание модуля, без интеграции в print!):
+   1. src/terminal.rs [НОВЫЙ КОД] — создан модуль терминала:
+      * Cell { ch, fg, bg } — ячейка буфера; Terminal — буфер [[Cell;80];25],
+        курсор (row,col), цвета fg/bg (0..15), видимость курсора.
+      * ANSI-парсер (мини-VT100): состояния Normal/Esc/Csi; CSI-команды:
+        SGR (m) — сброс, bold(1), 30-37/40-47, 90-97/100-107, 38;5;n/48;5;n;
+        CUP (H/f), CHA (G), движение A/B/C/D, ED (J), EL (K), ?25h/l (курсор).
+      * Управляющие символы: \n (CRLF+прокрутка), \r, \b (backspace), 	 (tab→8).
+      * Прокрутка: сдвиг массива строк вверх при достижении низа.
+      * Рендер:
+        - draw_vga: прямая запись u16 в 0xB8000 (attr = bg<<4 | fg),
+          курсор — инверсия ячейки;
+        - draw_serial: ANSI-перерисовка экрана (SGR-цвета + позиция курсора),
+          числа пишутся поразрядно через serial_write_num (без alloc);
+        - draw_fb: vesa_draw_char_ex для каждой ячейки (шрифт 8x16, шаг 9px),
+          курсор — инверсия fg/bg.
+      * Мигание курсора: static BLINK_COUNTER (фаза меняется каждые 5 flush).
+      * pub static TERMINAL: Mutex<Terminal>; impl fmt::Write для write!.
+   2. src/serial.rs [НОВЫЙ КОД] — точечно добавлены публичные функции:
+      * serial_write_byte(byte) — сырая запись байта (ESC и пр.);
+      * serial_write_num(n: u16) — десятичная запись числа поразрядно (0..=999),
+        для ANSI SGR/позиции курсора без аллокаций. (приведение u16→u8 исправлено).
+   3. src/vesa.rs [НОВЫЙ КОД] — точечно добавлена vesa_draw_char_ex(c,x,y,fg,bg):
+      рисует глиф с произвольными цветами fg/bg (заливка всей ячейки фоном),
+      в отличие от vesa_draw_char (фиксированный чёрный фон). Старая функция НЕ
+      удалена — используется vesa_print_str.
+   4. src/main.rs — добавлено `mod terminal;`.
+   Сборка ✅ (cargo check): ошибок нет, 27 warnings — dead_code терминала и
+   старого VESA-кода (не удаляем). Терминал пока НЕ подключён к макросам print!.
+   Следующий шаг: интеграция — перенаправить print!/println! на TERMINAL.

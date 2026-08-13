@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 #[allow(unused_imports)]
 use core::ptr;
+use core::fmt;
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -259,6 +260,44 @@ pub fn vesa_init() -> bool {
     true
 }
 
+/// Устанавливает framebuffer, полученный от Limine (не через VBE BIOS).
+/// Заполняет те же глобальные static'ы, которые используют vesa_draw_char
+/// и vesa_print_str — переиспользуем существующий код рисования и шрифт.
+/// pitch/width/height передаются как u32 (из Limine они u64).
+pub fn vesa_set_framebuffer(addr: *mut u32, pitch: u32, width: u32, height: u32) {
+    unsafe {
+        VESA_FRAMEBUFFER = addr;
+        VESA_PITCH = pitch as u16;
+        VESA_WIDTH = width as u16;
+        VESA_HEIGHT = height as u16;
+    }
+}
+
+/// Прокрутка экрана на одну строку шрифта (FONT_HEIGHT пикселей) вверх.
+/// Копируем строки пикселей со сдвигом и очищаем нижнюю полосу чёрным.
+/// Без прокрутки VESA_TEXT_Y уходил бы за границу экрана (текст обрезался).
+fn vesa_scroll_screen() {
+    unsafe {
+        let width = VESA_WIDTH as usize;
+        let height = VESA_HEIGHT as usize;
+        let pitch = VESA_PITCH as usize / 4; // pitch в байтах → в u32
+        if width == 0 || height == 0 {
+            return;
+        }
+        // Построчно сдвигаем содержимое вверх на FONT_HEIGHT пикселей.
+        // Копируем построчно (с учётом pitch), а не сплошным блоком —
+        // чтобы не захватывать padding между строками при pitch > width.
+        for y in 0..(height - FONT_HEIGHT) {
+            let src = VESA_FRAMEBUFFER.offset(((y + FONT_HEIGHT) * pitch) as isize);
+            let dst = VESA_FRAMEBUFFER.offset((y * pitch) as isize);
+            core::ptr::copy(src, dst, width);
+        }
+        // Очищаем освободившуюся нижнюю полосу (FONT_HEIGHT строк)
+        let last = VESA_FRAMEBUFFER.offset(((height - FONT_HEIGHT) * pitch) as isize);
+        core::ptr::write_bytes(last, 0, width * FONT_HEIGHT);
+    }
+}
+
 #[allow(dead_code)]
 pub fn vesa_put_pixel(x: u32, y: u32, color: u32) {
     unsafe {
@@ -515,13 +554,40 @@ pub fn vesa_draw_char(c: char, x: usize, y: usize) {
         for row in 0..FONT_HEIGHT {
             let byte = font_row[row];
             for col in 0..FONT_WIDTH {
-                if (byte & (1 << (7 - col))) != 0 {
-                    let px = x + col;
-                    let py = y + row;
-                    if px < VESA_WIDTH as usize && py < VESA_HEIGHT as usize {
-                        let offset = (py * (VESA_PITCH as usize / 4)) + px;
-                        *VESA_FRAMEBUFFER.offset(offset as isize) = color;
-                    }
+                let px = x + col;
+                let py = y + row;
+                if px < VESA_WIDTH as usize && py < VESA_HEIGHT as usize {
+                    let offset = (py * (VESA_PITCH as usize / 4)) + px;
+                    // Заливаем фон (чёрный 0) на весь глиф, иначе при
+                    // перезаписи ячейки остаются остатки предыдущего символа
+                    let fg = (byte & (1 << (7 - col))) != 0;
+                    *VESA_FRAMEBUFFER.offset(offset as isize) = if fg { color } else { 0 };
+                }
+            }
+        }
+    }
+}
+
+/// Рисует символ с заданными цветами текста (fg) и фона (bg) в формате RGB.
+/// В отличие от vesa_draw_char, заливает ВСЮ ячейку фоном bg, а точки
+/// глифа — цветом fg. Используется терминалом (terminal.rs) для отрисовки
+/// цветных ячеек экранного буфера с произвольным фоном.
+pub fn vesa_draw_char_ex(c: char, x: usize, y: usize, fg: u32, bg: u32) {
+    unsafe {
+        if x >= VESA_WIDTH as usize || y >= VESA_HEIGHT as usize {
+            return;
+        }
+        let char_idx = (c as usize).saturating_sub(32).min(94);
+        let font_row = &FONT_DATA[char_idx];
+        for row in 0..FONT_HEIGHT {
+            let byte = font_row[row];
+            for col in 0..FONT_WIDTH {
+                let px = x + col;
+                let py = y + row;
+                if px < VESA_WIDTH as usize && py < VESA_HEIGHT as usize {
+                    let offset = (py * (VESA_PITCH as usize / 4)) + px;
+                    let is_fg = (byte & (1 << (7 - col))) != 0;
+                    *VESA_FRAMEBUFFER.offset(offset as isize) = if is_fg { fg } else { bg };
                 }
             }
         }
@@ -548,6 +614,12 @@ pub fn vesa_print_str(s: &str) {
                 }
             }
         }
+        // Прокрутка, если текст вышел за нижнюю границу экрана.
+        // while вместо if: за один вызов Y может вырасти на несколько строк.
+        while VESA_TEXT_Y + FONT_HEIGHT > VESA_HEIGHT as usize {
+            vesa_scroll_screen();
+            VESA_TEXT_Y = VESA_HEIGHT as usize - FONT_HEIGHT;
+        }
     }
 }
 
@@ -561,5 +633,17 @@ pub fn vesa_clear_screen(color: u32) {
         }
         VESA_TEXT_X = 0;
         VESA_TEXT_Y = 0;
+    }
+}
+
+/// Обёртка для использования в макросах print!/println! через fmt::Write.
+/// write_str вызывается фрагментами — каждый фрагмент сразу рисуется
+/// на framebuffer (без промежуточного буфера, не требует alloc).
+pub struct VesaWriter;
+
+impl fmt::Write for VesaWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        vesa_print_str(s);
+        Ok(())
     }
 }

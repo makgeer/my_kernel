@@ -37,6 +37,22 @@ fn write_byte(byte: u8) {
     }
 }
 
+/// Есть ли принятый байт в COM1?
+/// LSR (порт 0x3FD) бит 0 = Data Ready — в буфере есть непрочитанный байт.
+pub fn serial_has_data() -> bool {
+    unsafe {
+        let lsr = Port::<u8>::new(COM1 + 5).read();
+        (lsr & 0x01) != 0
+    }
+}
+
+/// Читает один байт из COM1. Перед вызовом проверять serial_has_data()!
+pub fn serial_read() -> u8 {
+    unsafe {
+        Port::<u8>::new(COM1).read()
+    }
+}
+
 /// Запись строки в COM1 (переводит '\n' в CRLF для корректного отображения)
 pub fn write_str(s: &str) {
     for b in s.bytes() {
@@ -48,6 +64,33 @@ pub fn write_str(s: &str) {
             _ => write_byte(b),
         }
     }
+}
+
+/// Запись одного «сырого» байта в COM1 без преобразования.
+/// Нужна терминалу для отправки ESC (0x1B) и произвольных байтов напрямую.
+pub fn serial_write_byte(byte: u8) {
+    write_byte(byte);
+}
+
+/// Запись неотрицательного числа (0..=999) в десятичном виде поразрядно.
+/// Используется терминалом для ANSI SGR-цветов и позиции курсора,
+/// где нельзя форматировать строки (нет alloc).
+pub fn serial_write_num(n: u16) {
+    if n == 0 {
+        write_byte(b'0');
+        return;
+    }
+    // Число <= 999 — не более трёх цифр. Пишем старший разряд первым.
+    let hundreds = (n / 100) % 10;
+    let tens = (n / 10) % 10;
+    let ones = n % 10;
+    if hundreds != 0 {
+        write_byte(b'0' + hundreds as u8);
+        write_byte(b'0' + tens as u8);
+    } else if tens != 0 {
+        write_byte(b'0' + tens as u8);
+    }
+    write_byte(b'0' + ones as u8);
 }
 
 /// Обёртка для использования в макросах через fmt::Write

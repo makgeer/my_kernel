@@ -97,6 +97,11 @@ macro_rules! print {
         // Дублируем вывод в COM1 (serial) — для отладки через qemu.log,
         // т.к. в графическом режиме VGA-буфер 0xB8000 не отображается
         let _ = write!($crate::serial::SERIAL.lock(), $($arg)*);
+        // Дублируем вывод на framebuffer — видимый терминал в графическом
+        // режиме (VesaWriter рисует каждый фрагмент сразу на экран).
+        // До инициализации framebuffer вызов безопасно игнорируется
+        // (vesa_draw_char не рисует при VESA_WIDTH == 0).
+        let _ = write!($crate::vesa::VesaWriter, $($arg)*);
     }};
 }
 

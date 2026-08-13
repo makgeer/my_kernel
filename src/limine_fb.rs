@@ -1,14 +1,28 @@
 // Limine Framebuffer Protocol
 // Получаем framebuffer напрямую из Limine Bootloader
 
-use limine::request::FramebufferRequest;
+use limine::request::{FramebufferRequest, HhdmRequest};
 
-// Временно отключены: без этих атрибутов Limine не видит запрос framebuffer
-// и остаётся в текстовом режиме, где VGA-буфер 0xB8000 отображается корректно.
-// Код не удалён — атрибуты будут возвращены после реализации вывода на framebuffer.
-// #[used]
-// #[link_section = ".requests"]
+// Возвращены атрибуты #[used] и #[link_section = ".requests"]:
+// Limine сканирует секцию .requests и предоставляет ядру framebuffer.
+// (Изначально отключались для текстового режима варианта A — VGA-буфер.
+//  Теперь реализуется вывод на framebuffer — атрибуты снова нужны.)
+#[used]
+#[link_section = ".requests"]
 pub static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+// HHDM (Higher Half Direct Map): Limine отображает всю физическую память
+// в higher-half со смещением offset. Это нужно, чтобы преобразовать
+// ФИЗИЧЕСКИЙ адрес framebuffer (fb.address()) в ВИРТУАЛЬНЫЙ, по которому
+// ядро может писать: virt = phys + hhdm_offset.
+#[used]
+#[link_section = ".requests"]
+pub static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+/// Смещение direct map: физ. адрес + offset = вирт. адрес
+pub fn get_hhdm_offset() -> u64 {
+    HHDM_REQUEST.response().map(|r| r.offset).unwrap_or(0)
+}
 
 /// Получаем framebuffer от Limine
 #[allow(dead_code)]

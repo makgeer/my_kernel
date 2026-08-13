@@ -9,9 +9,12 @@ mod tasks;
 mod limine_fb;
 mod serial;
 mod gdt;
+mod vesa;
+mod shell;
+mod terminal;
 
 use core::panic::PanicInfo;
-use crate::scheduler::{add_task, run_scheduler};
+use crate::scheduler::{add_task};
 use crate::tasks::{task_hello, task_counter};
 use crate::limine_fb::FRAMEBUFFER_REQUEST;
 
@@ -32,6 +35,27 @@ pub extern "C" fn _start_rust() -> ! {
             let width = fb.width;
             let height = fb.height;
             println!("Framebuffer found: {}x{}", width, height);
+            // Передаём framebuffer в vesa-подсистему (переиспользуем шрифт
+            // и функции рисования) и очищаем экран чёрным.
+            // fb.address() — ФИЗИЧЕСКИЙ адрес; Limine не отображает его
+            // в higher-half сам. Преобразуем через HHDM offset:
+            //   виртуальный = физический + hhdm_offset
+            // Без этого запись по физ. адресу → page fault → triple fault.
+            // fb.address() из Limine УЖЕ возвращает виртуальный (higher-half)
+            // адрес framebuffer: Limine сам применяет HHDM offset
+            // (физический 0xfd000000 → виртуальный 0xffff8000fd000000).
+            // Повторно добавлять offset НЕЛЬЗЯ — получится переполнение
+            // (0xffff8000fd000000 + 0xffff800000000000 = 0xffff0000fd000000)
+            // и запись по несуществующему адресу → page fault → triple fault.
+            let fb_virt = fb.address() as *mut u32;
+            vesa::vesa_set_framebuffer(
+                fb_virt,
+                fb.pitch as u32,
+                width as u32,
+                height as u32,
+            );
+            vesa::vesa_clear_screen(0x000000);
+            println!("Framebuffer output enabled");
         } else {
             println!("No framebuffer available");
         }
@@ -52,8 +76,11 @@ pub extern "C" fn _start_rust() -> ! {
     println!("=== KERNEL READY ===");
     println!("Commands: help, echo, clear, reboot, hlt");
     
-    // Запускаем планировщик
-    run_scheduler();
+    // Запускаем shell (читает клавиатуру через IRQ1).
+    // run_scheduler() вызывается из команды "tasks" — по одной итерации,
+    // чтобы shell оставался отзывчивым. Бесконечный цикл планировщика
+    // убран: задачи и shell живут в одном потоке кооперативно.
+    shell::shell();
     
     loop {}
 }
