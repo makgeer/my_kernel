@@ -93,15 +93,13 @@ pub static WRITER: Mutex<VgaWriter> = Mutex::new(VgaWriter::new());
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        let _ = write!($crate::vga::WRITER.lock(), $($arg)*);
-        // Дублируем вывод в COM1 (serial) — для отладки через qemu.log,
-        // т.к. в графическом режиме VGA-буфер 0xB8000 не отображается
-        let _ = write!($crate::serial::SERIAL.lock(), $($arg)*);
-        // Дублируем вывод на framebuffer — видимый терминал в графическом
-        // режиме (VesaWriter рисует каждый фрагмент сразу на экран).
-        // До инициализации framebuffer вызов безопасно игнорируется
-        // (vesa_draw_char не рисует при VESA_WIDTH == 0).
-        let _ = write!($crate::vesa::VesaWriter, $($arg)*);
+        // Интеграция терминала: единый вывод через terminal::TERMINAL
+        // вместо трёх независимых write!. Терминал сам разбирает ANSI-коды
+        // (цвета, курсор, прокрутка) и рендерит во все три устройства
+        // (VGA + Serial + Framebuffer) через flush(). Старые цели (WRITER,
+        // SERIAL, VesaWriter) остаются в коде — не удаляются, но больше
+        // не вызываются из print!.
+        let _ = write!($crate::terminal::TERMINAL.lock(), $($arg)*);
     }};
 }
 

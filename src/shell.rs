@@ -93,6 +93,7 @@ pub fn shell() {
                 println!("  hlt     - halt the CPU");
                 println!("  about   - about this kernel");
                 println!("  tasks   - run the task scheduler demo");
+                println!("  cursor  - show terminal cursor position");
             }
             "about" => {
                 println!("MyKernel v0.1.0");
@@ -103,9 +104,20 @@ pub fn shell() {
                 // Запускаем одну итерацию планировщика как демонстрацию
                 crate::scheduler::run_scheduler_once();
             }
+            "cursor" => {
+                // Диагностика: выводим логическую позицию курсора терминала.
+                // Сравниваем с визуальным положением — если не совпадает,
+                // проблема в рендере (draw_serial/draw_vga/draw_fb).
+                let (r, c) = crate::terminal::TERMINAL.lock().position();
+                println!("cursor: row={}, col={}", r, c);
+            }
             "clear" => {
                 crate::vesa::vesa_clear_screen(0x000000);
                 crate::vga::WRITER.lock().clear();
+                // Очистка буфера терминала — с момента интеграции терминала
+                // весь вывод идёт через TERMINAL, и без очистки его буфера
+                // следующая перерисовка вернёт старый текст.
+                crate::terminal::TERMINAL.lock().clear_screen();
             }
             "" => {
                 // Пустая команда — просто перенос строки
