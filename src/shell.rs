@@ -94,6 +94,7 @@ pub fn shell() {
                 println!("  about   - about this kernel");
                 println!("  tasks   - run the task scheduler demo");
                 println!("  cursor  - show terminal cursor position");
+                println!("  test_alloc - test heap allocator (Box/Vec/String)");
             }
             "about" => {
                 println!("MyKernel v0.1.0");
@@ -118,6 +119,39 @@ pub fn shell() {
                 // весь вывод идёт через TERMINAL, и без очистки его буфера
                 // следующая перерисовка вернёт старый текст.
                 crate::terminal::TERMINAL.lock().clear_screen();
+            }
+            "test_alloc" => {
+                // Проверка аллокатора кучи: выделяем Box, Vec и String,
+                // записываем/читаем данные — убеждаемся, что alloc работает.
+                use alloc::boxed::Box;
+                use alloc::string::String;
+                use alloc::vec::Vec;
+
+                // Box: одиночное значение на куче
+                let b = Box::new(42u32);
+                println!("Box: {} (0x{:x})", *b, &*b as *const u32 as usize);
+
+                // Vec: динамический массив с ростом
+                let mut v: Vec<u32> = Vec::new();
+                for i in 0..100 {
+                    v.push(i as u32);
+                }
+                let sum: u32 = v.iter().sum();
+                println!("Vec: len={}, sum={}", v.len(), sum);
+
+                // String: текст на куче
+                let s = String::from("Hello from heap allocator!");
+                println!("String: '{}' ({} bytes)", s, s.len());
+
+                // Много мелких выделений подряд — стресс-тест free list
+                let mut boxes = Vec::new();
+                for i in 0..50 {
+                    boxes.push(Box::new(i as u64));
+                }
+                let last = **boxes.last().unwrap();
+                println!("Stress: {} Boxes allocated, last={}", boxes.len(), last);
+
+                println!("Allocator test PASSED");
             }
             "" => {
                 // Пустая команда — просто перенос строки

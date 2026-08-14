@@ -1,0 +1,11 @@
+# SmartTerm — обычное std-приложение для host-системы.
+# Переопределяем цель сборки: наследуемый от корня ядра конфиг
+# (x86_64-unknown-none) не подходит — SmartTerm использует std.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+# Отключаем build-std, унаследованный от корня ядра:
+# build-std = ["core", "compiler_builtins"] собирает core из исходников
+# и конфликтует со стандартным std (duplicate lang item `sized`).
+[unstable]
+build-std = []

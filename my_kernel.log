@@ -854,3 +854,121 @@
    - Сборка ✅ (0 ошибок), iso/kernel.elf + boot.iso пересобраны.
    - Проверка: пользователь запускает вручную и смотрит, встал ли курсор
      на строку приглашения.
+
+[2026-08-14] Результат теста и КОММИТ:
+   - Пользователь сообщил: «Нет изменения» (курсор по-прежнему на строку
+     ниже приглашения). Причина не устранена, требует дальнейшего анализа
+     (вероятно, проблема не в автопереносе, а в чём-то ещё — например,
+     в самом позиционировании \x1b[{row+1};{col+1}H после перерисовки,
+     либо пользователь видит аппаратный VGA-курсор в curses).
+   - С разрешения пользователя создан КОММИТ ba500dd (ветка «разработка»):
+     «Интеграция терминала в вывод, фикс аппаратного курсора, команда cursor,
+     KODA.md» — 6 файлов, 372 вставки, 10 удалений.
+     Файлы: iso/kernel.elf, my_kernel.log, src/shell.rs, src/terminal.rs,
+     src/vga.rs, KODA.md (новый).
+   - СЛЕДУЮЩИЙ ШАГ: продолжить диагностику смещения курсора:
+     1. Уточнить у пользователя точную команду запуска QEMU
+        (-display curses или -serial stdio) — от этого зависит, какой
+        рендер он видит (VGA-буфер или ANSI-serial).
+     2. Если curses — проверить позиционирование аппаратного VGA-курсора
+        и логику инверсии в draw_vga.
+     3. Если serial stdio — проверить \x1b[{row+1};{col+1}H после
+        перерисовки и корректность row/col.
+      4. Рассмотреть задачу 4 (план): dirty-флаг / перерисовка только
+         изменённых строк вместо полного экрана.
+
+[2026-08-14] Добавление проекта SmartTerm в репозиторий (концепция: ядро отдельно, софт отдельно).
+   Пользователь: «терминалом будет смарт, все наработки интегрируем в него.
+   Концепция ОС — ядро отдельно, софт отдельно. Ядро предоставляет минимум
+   для работы софта. Всё остальное — внешние исполняемые программы, вплоть
+   до драйверов устройств.»
+   - Клонирован репозиторий https://github.com/makgeer/smart_term в /tmp.
+   - SmartTerm — кросс-платформенное std-приложение на Rust (терминал с
+     псевдографикой, историей, git-интеграцией, редактором, справкой).
+     Зависимости: crossterm, dirs, better-panic, whoami, serde_json,
+     chrono, libc, winapi (Windows).
+   - Cargo.toml отсутствовал в git (в .gitignore). Восстановлен из истории
+     (978dba2) и дополнен недостающими зависимостями.
+   - Проект скопирован в my_kernel/smart_term/ (без .git — чтобы не создать
+     вложенный git-репозиторий, как уже было с my_kernel/.git ранее).
+   - Создан smart_term/.cargo/config.toml: target=x86_64-unknown-linux-gnu
+     (переопределяет наследуемый от ядра x86_64-unknown-none) и
+     rust-toolchain не нужен — сборка через `cargo +stable`.
+   - Восстановлены и исправлены синтаксические ошибки в коде SmartTerm
+     (код не удалялся — точечные исправления по .kodaruls):
+     1. src/terminal/executor.rs — поле структуры git: было выражение
+        GitManager::new(Path::new(".")).expect(...) → тип GitManager;
+        добавлен use std::path::Path.
+     2. src/ui/keybindings.rs — лишние закрывающие скобки в KeyBinding::new
+        (6 строк); KeyPress::Key(KeyEvent) → Key(KeyCode) (код использует
+        KeyCode, не KeyEvent); Shift(KeyPress) → Shift(Box<KeyPress>)
+        (рекурсивный тип бесконечного размера); добавлен
+        use crossterm::event::KeyCode as Key; to_string дополнен ветками
+        для собственных вариантов KeyPress (Char/Up/Down/...).
+     3. src/ui/panels.rs — код автоскроллинга выпал из метода refresh_files
+        (non-item in item list) → оформлен как метод update_scroll_position;
+        добавлена закрывающая скобка impl Panel.
+     4. src/ui/git_widget.rs — тип GitStatus не существует → draw_status
+        принимает &str (результат get_visual_status()); GitManager::new()
+        без аргументов → Option<GitManager> (new(Path::new(".")).ok()).
+     5. src/ui/mod.rs — добавлен метод to_ansi_fg() (использовался в
+        git_widget, но отсутствовал); to_ansi_bg дополнен веткой Gray.
+     6. src/editor/syntax.rs — добавлен use std::path::Path.
+     7. src/terminal/executor.rs — execute_git_command: несоответствие API
+        GitManager (status/add/log/diff/branch не существуют; реальные:
+        get_visual_status/add_files/get_log/get_file_diff/get_branches);
+        execute_editor_command: result.saved на типе () → упрощено
+        (run возвращает EditorResult<()>).
+     8. src/terminal/history.rs — moved value `home` → PathBuf::from(&home).
+     9. Cargo.toml — добавлены chrono и libc (используются в коде, но
+        отсутствовали в зависимостях).
+   - Сборка SmartTerm: cargo +stable build --release --target
+     x86_64-unknown-linux-gnu → ✅ 0 ошибок, 96 warnings (неиспользуемые
+     импорты и мёртвый код — не удаляем по .kodaruls).
+   - Бинарник: smart_term/target/x86_64-unknown-linux-gnu/release/smart-term
+     (1 092 008 байт).
+   - Сборка ядра из корня: cargo build --release → ✅ 0 ошибок, 20 warnings.
+   - ВАЖНО: сборка SmartTerm — `cargo +stable build` из директории
+     smart_term/ (не из корня my_kernel — унаследует build-std от ядра).
+   - СЛЕДУЮЩИЙ ШАГ (по концепции): разработать минимальный API ядра
+     (syscalls, аллокатор, ELF-загрузчик, ring 3) для запуска SmartTerm
+     как внешней программы. Наработки terminal.rs/shell.rs вольются в
+     SmartTerm, когда ядро сможет его загрузить.
+
+[2026-08-14] smart_term — финальные штрихи:
+   - Добавлен smart_term/.gitignore с /target — иначе корневой .gitignore
+     (/target) не распространяется на вложенную директорию, и артефакты
+     сборки SmartTerm попадали бы в git.
+   - Проверено: вложенный .git в smart_term отсутствует (клонирован без .git).
+   - Оба проекта собираются независимо:
+     * ядро: cargo build --release (из корня my_kernel) ✅
+     * smart_term: cargo +stable build --release (из smart_term/) ✅
+
+[2026-08-14] ШАГ 1 к концепции «ядро отдельно, софт отдельно»: АЛЛОКАТОР КУЧИ.
+   Пользователь подтвердил продолжение: «да».
+   - РАЦИОНАЛЬНОСТЬ: без аллокатора невозможно загрузить ELF-программы,
+     создать структуры процессов и syscall-буферы. Куча — фундамент, с
+     которого начинается пользовательский режим.
+   - Изменения:
+     1. .cargo/config.toml: build-std расширен до ["core","compiler_builtins",
+        "alloc"] — без alloc-крейта недоступны Box/Vec/String.
+     2. Cargo.toml: добавлена зависимость linked_list_allocator = "0.10"
+        (классический free-list аллокатор из blog_os; позже можно заменить
+        собственным).
+     3. src/allocator.rs [НОВЫЙ]: HEAP_SIZE = 8 МБ, статический буфер HEAP
+        в BSS (higher-half адрес гарантирован линкером), #[global_allocator]
+        ALLOCATOR: LockedHeap, init_heap(), #[alloc_error_handler].
+     4. src/main.rs: extern crate alloc, mod allocator,
+        #![feature(alloc_error_handler)], вызов allocator::init_heap() сразу
+        после serial::init() — до первой аллокации.
+     5. src/shell.rs: команда "test_alloc" — выделяет Box/Vec/String + 50
+        мелких Box подряд (стресс-тест free list) и выводит результат.
+        Исправление: *boxes.last() → **boxes.last() (move out of shared ref).
+   - Сборка: debug + release ✅ 0 ошибок (21 warning: статические и
+     неиспользуемый код — не удаляем по .kodaruls).
+   - iso/kernel.elf обновлён, boot.iso пересобран (xorriso + dd Limine MBR).
+   - ПРОВЕРКА (вручную в системном терминале!): в shell набрать
+     test_alloc — ожидается вывод Box/Vec/String/Stress/Allocator test PASSED.
+   - СЛЕДУЮЩИЙ ШАГ: пейджинг (мапинг страниц для пользовательских
+     программ) + менеджер физической памяти. Куча 8 МБ в BSS временная,
+     перенесём на страницы после появления физического аллокатора.

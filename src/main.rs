@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
 
 mod vga;
 mod interrupts;
@@ -12,6 +15,7 @@ mod gdt;
 mod vesa;
 mod shell;
 mod terminal;
+mod allocator;
 
 use core::panic::PanicInfo;
 use crate::scheduler::{add_task};
@@ -23,6 +27,10 @@ pub extern "C" fn _start_rust() -> ! {
     // Инициализируем serial (COM1) до первого вывода — чтобы весь лог
     // ядра попадал в последовательный порт (qemu.log)
     serial::init();
+
+    // Инициализируем кучу (8 МБ) — до первой аллокации.
+    // Нужно для загрузки ELF, структур процессов, Box/Vec/String.
+    allocator::init_heap();
 
     println!("=== KERNEL START ===");
     
