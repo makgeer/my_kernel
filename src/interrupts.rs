@@ -5,6 +5,10 @@ use x86_64::instructions::port::Port;
 use x86_64::instructions::segmentation::{CS, SS, Segment};
 use x86_64::instructions::interrupts;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::structures::paging::PhysFrame;
+use x86_64::structures::gdt::SegmentSelector;
+use x86_64::{PhysAddr, PrivilegeLevel, VirtAddr};
+use x86_64::registers::control::{Cr3, Cr3Flags};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Счётчик тиков таймера — диагностика DOUBLE FAULT
@@ -29,6 +33,11 @@ pub fn init_idt() {
         // IRQ1 — клавиатура (вектор 0x21, PIC offset), свой стек IST 3
         let k = idt[0x21].set_handler_fn(keyboard_handler);
         unsafe { k.set_stack_index(crate::gdt::KEYBOARD_IST_INDEX) };
+        // int 0x80 — syscall из user mode (ring 3). DPL=3 разрешает
+        // вызов int 0x80 из ring 3. Без DPL=3 → #GP при int 0x80 из user.
+        // IST не используется — CPU переключается на TSS.rsp0 (kernel stack).
+        let sys = idt[0x80].set_handler_fn(syscall_handler);
+        sys.set_privilege_level(PrivilegeLevel::Ring3);
         idt
     });
 
@@ -172,6 +181,72 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     }
     
     outb(PIC1, 0x20);
+}
+
+/// Обработчик int 0x80 — системный вызов из user mode (ring 3).
+///
+/// При входе из ring 3 CPU переключается на TSS.rsp0 (KERNEL_RETURN_STACK),
+/// сохраняет user SS:RSP, RFLAGS, CS:RIP в IRET-фрейме.
+///
+/// Для возврата в kernel mode (вместо возврата в user) мы:
+/// 1. Восстанавливаем kernel CR3 (адресное пространство ядра)
+/// 2. Модифицируем IRET-фрейм: CS/SS → kernel selectors,
+///    RIP → kernel_return_to_shell, RSP → KERNEL_RETURN_STACK top
+/// 3. iretq (компилятор генерирует автоматически) возвращает в kernel mode
+extern "x86-interrupt" fn syscall_handler(mut stack_frame: InterruptStackFrame) {
+    crate::println!(
+        "SYSCALL from ring 3! (user RIP: 0x{:x}, RSP: 0x{:x}, CS: 0x{:x})",
+        stack_frame.instruction_pointer,
+        stack_frame.stack_pointer,
+        stack_frame.code_segment.0
+    );
+
+    // 1. Восстанавливаем kernel CR3
+    let kernel_p4 = crate::paging::kernel_p4_phys();
+    if kernel_p4 != 0 {
+        unsafe {
+            let frame = PhysFrame::containing_address(PhysAddr::new(kernel_p4));
+            Cr3::write(frame, Cr3Flags::empty());
+        }
+    }
+
+    // 2. Модифицируем IRET-фрейм для возврата в kernel mode
+    unsafe {
+        let mut m = stack_frame.as_mut();
+        m.update(|f| {
+            // RIP → kernel_return_to_shell (возвращаемся в shell)
+            f.instruction_pointer = VirtAddr::new(kernel_return_to_shell as *const () as u64);
+            // CS → kernel code selector (RPL=0, ring 0)
+            f.code_segment = SegmentSelector::new(
+                crate::gdt::KERNEL_CODE_SELECTOR >> 3,
+                PrivilegeLevel::Ring0,
+            );
+            // SS → kernel data selector (RPL=0)
+            f.stack_segment = SegmentSelector::new(
+                crate::gdt::KERNEL_DATA_SELECTOR >> 3,
+                PrivilegeLevel::Ring0,
+            );
+            // RSP → вершина KERNEL_RETURN_STACK (валидный kernel стек)
+            // Используем addr_of! для избежания static_mut_refs warning
+            let stack_ptr = core::ptr::addr_of!(crate::gdt::KERNEL_RETURN_STACK) as *const u8;
+            f.stack_pointer = VirtAddr::new(
+                stack_ptr as u64 + crate::gdt::KERNEL_RETURN_STACK.len() as u64
+            );
+        });
+    }
+
+    // После возврата из обработчика iretq использует модифицированный фрейм:
+    // CPU переходит в ring 0 на kernel_return_to_shell с kernel стеком.
+}
+
+/// Точка возврата из user mode в kernel.
+/// Вызывается после iretq из syscall_handler (через модифицированный IRET-фрейм).
+/// Перезапускает shell — пользователь может продолжить работу.
+#[inline(never)]
+fn kernel_return_to_shell() -> ! {
+    crate::println!("Returned from user mode to kernel");
+    crate::shell::shell();
+    loop {}
 }
 
 fn scancode_to_char(scancode: u8) -> Option<char> {

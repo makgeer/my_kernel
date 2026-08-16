@@ -8,45 +8,34 @@
 - Ядро загружается через Limine (x86_64, higher-half).
 - Прерывания стабильны: PIC, TSS/IST (Double Fault устранён).
 - Вывод: VGA 0xB8000 + Serial COM1 + Framebuffer (vesa.rs, шрифт 8x16).
-- Интерактивный shell: getchar (PS/2 + COM1), read_line, команды
-  help/echo/about/tasks/clear.
-- Модуль terminal.rs СОЗДАН и компилируется, но НЕ подключён к print!.
+- Интерактивный shell: команды help/echo/about/tasks/clear/cursor/
+  test_alloc/test_pmm/test_paging/test_process/run_user.
+- Аллокатор кучи: 8 МБ (linked_list_allocator).
+- PMM: bitmap 128 KB, alloc_frame/dealloc_frame.
+- Пейджинг: map_page/unmap_page/translate, create_user_p4, map_page_in_p4.
+- Процессы: create_process, enter_ring3 (IRETQ → ring 3).
+- Syscall: int 0x80 (DPL=3), syscall_handler, возврат в kernel mode.
 
-ЗАДАЧИ НА ЗАВТРА (по приоритету)
---------------------------------
+ЗАДАЧИ НА СЛЕДУЮЩУЮ ИТЕРАЦИЮ (по приоритету)
+------------------------------------------
 
-1. ИНТЕГРАЦИЯ ТЕРМИНАЛА В ВЫВОД (главная задача)
-   - В src/vga.rs изменить макрос print!:
-     вместо трёх независимых write! (VGA + Serial + VesaWriter)
-     → единый write!(terminal::TERMINAL.lock(), ...).
-   - Терминал сам распределяет вывод по VGA/Serial/Framebuffer.
-   - Убрать дублирующую логику (vesa_print_str больше не вызывается
-     напрямую из print!, но НЕ удалять — используется в vesa.rs).
-   - Проверить: вывод ядра и shell идут через терминал, курсор мигает,
-     цвета работают, прокрутка работает.
-   - Сборка: cargo check → 0 ошибок.
+1. ЧТЕНИЕ РЕГИСТРОВ В SYSCALL (главная задача)
+   - InterruptStackFrame не содержит GPR (rax, rdi, rsi...).
+   - Нужна asm-обёртка: сохраняет регистры на стек, вызывает Rust-обработчик.
+   - Тогда: eax = номер syscall, rdi/rsi/rdx = аргументы.
 
-2. ТЕСТИРОВАНИЕ ТЕРМИНАЛА В QEMU
-   - Пересобрать: cargo build → iso/kernel.elf → boot.iso.
-   - Запуск (вручную в системном терминале):
-     qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max \
-       -no-reboot -display none -serial stdio
-   - Проверить:
-     * Вывод ядра виден в serial (ANSI-цвета).
-     * Shell работает: ввод команд, эхо, backspace.
-     * Команда clear очищает экран терминала.
-     * Курсор мигает/позиционируется.
-     * Нет DOUBLE FAULT / triple fault.
+2. SYSCALL WRITE/EXIT
+   - write(fd, buf, len) — вывод строки из user space (копирование через HHDM)
+   - exit(code) — завершение процесса, возврат в shell
 
-3. КОМАНДА COLOR В SHELL (демо ANSI-цветов)
-   - В src/shell.rs добавить команду "color":
-     выводит все 16 цветов палитры (цветной текст).
-   - Демонстрирует работу SGR-парсера терминала.
+3. ELF-ЗАГРУЗЧИК
+   - Парсинг ELF64 header
+   - Загрузка сегментов в адресное пространство процесса
+   - Передача управления на entry point
 
-4. (ЕСЛИ ОСТАНЕТСЯ ВРЕМЯ) ОПТИМИЗАЦИЯ РЕНДЕРА
-   - Сейчас flush() перерисовывает весь экран 80x25 на каждое write!.
-   - В будущем: dirty-флаг — перерисовывать только при изменении.
-   - Пока не критично, но учитывать при росте вывода.
+4. (ЕСЛИ ОСТАНЕТСЯ ВРЕМЯ) МНОГОПРОЦЕССНОСТЬ
+   - Список процессов, планировщик round-robin
+   - Переключение контекста (сохранение/восстановление регистров)
 
 ПРАВИЛА (.kodaruls)
 ------------------

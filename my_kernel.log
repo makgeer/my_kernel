@@ -972,3 +972,208 @@
    - СЛЕДУЮЩИЙ ШАГ: пейджинг (мапинг страниц для пользовательских
      программ) + менеджер физической памяти. Куча 8 МБ в BSS временная,
      перенесём на страницы после появления физического аллокатора.
+
+[2026-08-14] КОММИТ 423a463 (ветка «разработка»):
+   - «Аллокатор кучи (8 МБ, linked_list_allocator), команда test_alloc,
+     добавление SmartTerm и plan.txt» — 54 файла, 7974 вставки.
+   - Содержимое: src/allocator.rs (новый), правки main.rs/shell.rs,
+     .cargo/config.toml (build-std + alloc), Cargo.toml (+linked_list_allocator),
+     iso/kernel.elf, my_kernel.log, plan.txt, весь проект smart_term/.
+   - НЕ включено в коммит: test_alloc (пустой артефакт 0 байт),
+     smart_term/scripts/.install.sh.swp (swap-файл Vim, убран из индекса).
+   - Ветка опережает origin/разработка на 5 коммитов (push не выполнен).
+    - СЛЕДУЮЩИЙ ШАГ: пейджинг + менеджер физической памяти.
+
+[2026-08-16] ШАГ к концепции «ядро отдельно, софт отдельно»: ФИЗИЧЕСКИЙ МЕНЕДЖЕР ПАМЯТИ (PMM).
+    - РАЦИОНАЛЬНОСТЬ: без физического аллокатора невозможно создавать новые
+      page tables для пользовательских процессов. PMM — фундамент пейджинга
+      и загрузки ELF-программ. Limine уже предоставляет HHDM (direct map всей
+      физической памяти), поэтому обращение к физическим адресам возможно
+      через phys + hhdm_offset.
+    - Изменения:
+      1. src/pmm.rs [НОВЫЙ]: bitmap-аллокатор физических фреймов 4K.
+         - MemmapRequest (limine) — запрос карты памяти у загрузчика.
+         - BITMAP: статический массив 128 KB в BSS → поддержка до 4 GB RAM.
+           1 бит на фрейм: 1 = занят, 0 = свободен.
+         - init(): разбирает карту Limine, помечает usable-регионы как свободные.
+         - alloc_frame() -> Option<u64>: линейный поиск свободного фрейма.
+         - dealloc_frame(addr): освобождает фрейм.
+         - free_count() / total_count(): статистика для диагностики.
+         - Доступ к BITMAP через addr_of!/addr_of_mut! (без static_mut_refs).
+         - BITMAP_LOCK (Mutex<()>) для защиты от конкурентного доступа.
+      2. src/main.rs: mod pmm, вызов pmm::init() после allocator::init_heap().
+      3. src/shell.rs: команда "test_pmm" — выделяет 10 фреймов, выводит адреса,
+         освобождает, проверяет что free_count вернулся к исходному значению.
+    - Сборка: debug + release ✅ 0 ошибок (23 warning: dead_code + static_mut_refs
+      в allocator.rs — не удаляем по .kodaruls).
+    - iso/kernel.elf обновлён, boot.iso пересобран (xorriso + dd Limine MBR).
+    - ПРОВЕРКА (вручную в системном терминале!): в shell набрать test_pmm —
+      ожидается вывод 10 физических адресов и "PMM test PASSED".
+    - СЛЕДУЮЩИЙ ШАГ: пейджинг — функции map_page/unmap_page для создания
+      таблиц страниц пользовательских процессов (P4→P3→P2→P1).
+
+[2026-08-16] ШАГ к концепции «ядро отдельно, софт отдельно»: ПЕЙДЖИНГ.
+    - РАЦИОНАЛЬНОСТЬ: пейджинг — механизм изоляции адресных пространств.
+      Без него все процессы делят общую память. map_page/unmap_page
+      позволяют создавать независимые таблицы страниц для каждого
+      процесса, что необходимо для загрузки ELF-программ в ring 3.
+    - Изменения:
+      1. src/paging.rs [НОВЫЙ]: управление 4-level page tables x86_64.
+         - init(): запоминает HHDM offset от Limine (физ→вирт преобразование).
+         - phys_to_virt(phys): phys + HHDM offset → указатель на PageTable.
+         - virt_to_indices(virt): разбор виртуального адреса на P4/P3/P2/P1.
+         - map_page(virt, phys, flags): мапит виртуальную страницу 4K на
+           физический фрейм. Создаёт P3/P2/P1 таблицы по мере необходимости,
+           выделяя фреймы через pmm::alloc_frame(). TLB flush после записи.
+         - unmap_page(virt): очищает запись P1 (set_unused), flush TLB.
+           Таблицы P1/P2/P3 не освобождаются (упрощение для учебного ядра).
+         - translate(virt) -> Option<u64>: перевод виртуального адреса в
+           физический проходом по иерархии P4→P3→P2→P1.
+         - PAGING_LOCK (Mutex<()>) для защиты от конкурентного доступа.
+         - Использует x86_64 crate: PageTable, PageTableFlags, PhysAddr,
+           VirtAddr, Cr3::read(), tlb::flush().
+      2. src/main.rs: mod paging, вызов paging::init() после pmm::init().
+      3. src/shell.rs: команда "test_paging" — мапит тестовую страницу
+         (virt 0x0000_4000_0000_0000), проверяет translate, пишет/читает
+         маркерное значение 0xDEAD_BEEF_CAFE_BABE, анмапит, проверяет.
+    - Сборка: debug + release ✅ 0 ошибок (22 warning: dead_code + 1 static_mut_refs
+      в allocator.rs — не удаляем по .kodaruls).
+    - iso/kernel.elf обновлён, boot.iso пересобран.
+    - ПРОВЕРКА (вручную в системном терминале!): в shell набрать test_paging —
+      ожидается: map → translate → write/read → unmap → "Paging test PASSED".
+    - РЕЗУЛЬТАТ ТЕСТИРОВАНИЯ (проверено пользователем в QEMU):
+      ✅ Paging test PASSED — все этапы работают:
+      * page not mapped before map_page
+      * map_page succeeded (phys frame 0x6c000)
+      * translate matches (0x6c000)
+      * write/read test passed (0xdeadbeefcafebabe)
+      * unmap_page succeeded
+      * page not mapped after unmap_page
+    - Пейджинг подтверждён: map/unmap/translate работают корректно.
+    - СЛЕДУЮЩИЙ ШАГ: виртуальное адресное пространство пользователя —
+      создание изолированной P4 таблицы для процесса, копирование
+      kernel-маппингов (HHDM, ядро), затем ring 0 → ring 3 переход.
+
+[2026-08-16] ШАГ к концепции: АДРЕСНОЕ ПРОСТРАНСТВО ПОЛЬЗОВАТЕЛЯ (process.rs).
+    - РАЦИОНАЛЬНОСТЬ: для запуска внешних программ каждый процесс должен
+      иметь изолированное адресное пространство. Создание новой P4 с
+      копированием kernel-маппингов (higher-half) даёт изоляцию: user-код
+      в lower-half не виден другим процессам, ядро в higher-half — shared.
+    - Изменения:
+      1. src/paging.rs [+] новые функции:
+         - translate_in_p4(p4_phys, virt) — translate для произвольной P4.
+         - map_page_in_p4(p4_phys, virt, phys, flags) — мапит страницу в
+           указанной P4 (не активной). Таблицы создаются с USER_ACCESSIBLE.
+         - create_user_p4() -> Result<u64, &str> — создаёт новую P4,
+           копирует entries 256-511 (kernel/HHDM/framebuffer) из текущей.
+           Entries 0-255 (user space) — пустые (изоляция).
+         - hhdm_offset() — публичный доступ к HHDM offset (для process.rs).
+         - translate() переписан через translate_in_p4 (DRY).
+      2. src/gdt.rs [+] user-сегменты для ring 3:
+         - USER_DATA_SELECTOR (0x23), USER_CODE_SELECTOR (0x2B)
+         - GDT: добавлены user_data_segment + user_code_segment (index 4,5)
+         - KERNEL_CODE/DATA_SELECTOR константы (для будущего возврата из ring3)
+      3. src/process.rs [НОВЫЙ]: структура и запуск пользовательских процессов.
+         - Process { p4_phys, entry_point, stack_top }
+         - USER_CODE_BASE (0x400000000000), USER_STACK_TOP (0x400000010000)
+         - create_process(code, entry_offset) — создаёт P4, мапит код
+           (PRESENT|USER_ACCESSIBLE) и стек (PRESENT|WRITABLE|USER_ACCESSIBLE),
+           копирует код в физические фреймы через HHDM.
+         - enter_ring3(entry, stack) — переход в ring 3 через IRETQ:
+           формирует IRETQ-фрейм (SS:RSP:RFLAGS:CS:RIP) с RPL=3, iretq.
+         - run_process(&proc) — переключает CR3, вызывает enter_ring3.
+         - restore_kernel_cr3() — заглушка для возврата (следующий шаг).
+      4. src/shell.rs [+] команда "test_process":
+         - Создаёт процесс с тестовым кодом (mov eax,0x42; int 0x80; jmp $)
+         - Проверяет translate_in_p4 для кода и стека
+         - Проверяет копирование кода (первый байт 0xB8)
+         - Проверяет изоляцию: kernel visible, user code isolated
+         - НЕ запускает в ring 3 (нужен int 0x80 handler — следующий шаг)
+      5. src/main.rs: mod process
+    - Сборка: debug + release ✅ 0 ошибок (29 warning: dead_code — не удаляем).
+    - iso/kernel.elf обновлён, boot.iso пересобран.
+    - ПРОВЕРКА (вручную): test_process — ожидается:
+      * P4 phys, entry, stack адреса
+      * translate_in_p4 OK для кода и стека
+      * code verified (0xB8)
+      * kernel space mapped (shared)
+      * user code isolated from kernel P4
+      * "Process creation test PASSED"
+    - СЛЕДУЮЩИЙ ШАГ: обработчик int 0x80 (syscall) в IDT + запуск ring 3.
+
+[2026-08-16] ШАГ к концепции: SYSCALL (int 0x80) + ЗАПУСК RING 3.
+    - РАЦИОНАЛЬНОСТЬ: для запуска пользовательских программ нужен механизм
+      перехода ring 0 → ring 3 (enter_ring3 через IRETQ) и возврата
+      ring 3 → ring 0 (int 0x80 — syscall). Без DPL=3 на gate вектора 0x80
+      int 0x80 из ring 3 вызовет #GP. Без TSS.rsp0 CPU не сможет
+      переключить стек при входе в ring 0. Без восстановления CR3 после
+      возврата ядро потеряет своё адресное пространство.
+    - Изменения:
+      1. src/gdt.rs [+]:
+         - KERNEL_RETURN_STACK (16 KB) — стек для возврата из user mode.
+         - TSS.privilege_stack_table[0] (= RSP0) указывает на вершину
+           KERNEL_RETURN_STACK. При int из ring 3 CPU переключается на него.
+      2. src/paging.rs [+]:
+         - KERNEL_P4_PHYS — сохраняется в init() из Cr3::read().
+         - kernel_p4_phys() — публичный доступ для syscall_handler.
+      3. src/interrupts.rs [+] syscall_handler для вектора 0x80:
+         - IDT gate 0x80 с DPL=3 (set_privilege_level(Ring3)) — разрешает
+           int 0x80 из user mode. Без IST — CPU использует TSS.rsp0.
+         - В обработчике: выводит user RIP/RSP/CS, восстанавливает kernel
+           CR3 (Cr3::write), модифицирует IRET-фрейм через as_mut().update():
+           CS/SS → kernel selectors (Ring0), RIP → kernel_return_to_shell,
+           RSP → KERNEL_RETURN_STACK top. iretq возвращает в ring 0.
+         - kernel_return_to_shell() — перезапускает shell::shell().
+      4. src/process.rs [+] restore_kernel_cr3() — реализован через
+         paging::kernel_p4_phys() + Cr3::write.
+      5. src/shell.rs [+] команда "run_user":
+         - Создаёт процесс (mov eax,0x42; int 0x80; jmp $)
+         - Вызывает run_process → enter_ring3 → user code → int 0x80 →
+           syscall_handler → kernel_return_to_shell → shell.
+    - Сборка: debug + release ✅ 0 ошибок (24 warning: dead_code +
+      static_mut_refs — не удаляем по .kodaruls).
+    - iso/kernel.elf обновлён, boot.iso пересобран.
+    - ПРОВЕРКА (вручную): run_user — ожидается:
+      * "Launching ring 3..."
+      * "SYSCALL from ring 3! (user RIP, RSP, CS=0x2b)"
+      * "Returned from user mode to kernel"
+      * Shell снова доступен для ввода
+    - СЛЕДУЮЩИЙ ШАГ: чтение регистра eax в syscall_handler (номер syscall),
+      реализация syscall write/exit, ELF-загрузчик.
+
+[2026-08-16] ПЕРЕХОД НА BOCHS + ИСПРАВЛЕНИЯ:
+    - РАЦИОНАЛЬНОСТЬ: пользователь решил перейти с QEMU на Bochs для всей
+      отладки и запуска. Bochs собран из исходников (bochs-2.8) с поддержкой
+      x86_64 (стандартный пакет был без неё: "x86-64 support: no").
+    - Bochs собран локально: bochs-bin/bin/bochs
+      (--enable-x86-64 --enable-cpu-level=6 --with-nogui --with-term --prefix=bochs-bin)
+    - Создан bochsrc.bxrc:
+      * megs: 512, boot: cdrom, vga: extension=vbe
+      * romimage/vgaromimage из bochs-bin/share/bochs/
+      * com1: mode=file, dev=bochs_serial.log
+      * display_library: nogui (headless)
+      * cpu: model=bx_generic, reset_on_triple_fault=0
+      * cpuid: x86_64=1, mmx=1, sep=1, simd=sse4_2, apic=xapic, aes=1, movbe=1, xsave=1
+    - ПРОБЛЕМА: Bochs не загрузил ядро через Limine BIOS (El Torito CD boot).
+      В serial-логе видны только VBE/Limine-сообщения загрузчика, вывод ядра
+      отсутствует. Bochs.log показывает "Booting from 07c0:0000" — BIOS
+      загрузился, но Limine не передал управление ядру.
+      Возможные причины: несовместимость Limine BIOS boot с Bochs CD emulation,
+      или проблема в конфигурации Bochs (ATA/CD-ROM settings).
+    - РЕШЕНИЕ (на завтра): изучить документацию Limine для Bochs — возможно
+      нужен другой формат ISO или другие настройки ATA в bochsrc.
+    - ИСПРАВЛЕНИЕ terminal.rs: оптимизация перерисовки serial-вывода.
+      Раньше flush() вызывался на каждый write_str (3-4 раза на один println!),
+      что создавало лавину ANSI-данных (~8 КБ на строку). Теперь flush
+      выполняется только при '\n' — конец строки. Сокращение объёма serial
+      в десятки раз. Фрагменты без '\n' (например, "> ") копятся в буфере.
+    - ИСПРАВЛЕНИЕ process.rs: убран println! после Cr3::write в run_process.
+      Причина: VGA буфер (0xB8000) в lower-half, не скопирован в user P4.
+      Любой println! после переключения CR3 → page fault → triple fault.
+      Вместо extern "C" enter_ring3 — inline asm напрямую в run_process.
+    - Сборка: debug + release ✅ 0 ошибок (27 warning: dead_code — не удаляем).
+    - iso/kernel.elf обновлён, boot.iso пересобран.
+    - СОСТОЯНИЕ: ядро работает в QEMU (подтверждено test_paging PASSED).
+      В Bochs — не загружается (проблема с Limine BIOS boot, изучить завтра).
+    - ЗАВТРА: 1) документация Limine для Bochs, 2) запуск ядра в Bochs,
+      3) тест run_user (ring 3) в Bochs, 4) чтение регистров в syscall.

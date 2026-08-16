@@ -16,6 +16,9 @@ mod vesa;
 mod shell;
 mod terminal;
 mod allocator;
+mod pmm;
+mod paging;
+mod process;
 
 use core::panic::PanicInfo;
 use crate::scheduler::{add_task};
@@ -31,6 +34,14 @@ pub extern "C" fn _start_rust() -> ! {
     // Инициализируем кучу (8 МБ) — до первой аллокации.
     // Нужно для загрузки ELF, структур процессов, Box/Vec/String.
     allocator::init_heap();
+
+    // Инициализируем физический менеджер памяти (bitmap-аллокатор фреймов 4K).
+    // Нужно для создания page tables пользовательских процессов.
+    pmm::init();
+
+    // Инициализируем пейджинг — запоминаем HHDM offset для доступа к page tables.
+    // map_page/unmap_page используют HHDM для модификации таблиц страниц.
+    paging::init();
 
     println!("=== KERNEL START ===");
     

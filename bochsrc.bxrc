@@ -1,0 +1,35 @@
+# Bochs configuration for my_kernel
+# Запуск: bochs -q -f bochsrc.bxrc
+# Отладка: bochs -q -f bochsrc.bxrc -dbglog bochs_debug.log
+
+# Память 512 MB
+megs: 512
+
+# Boot с CD-ROM
+boot: cdrom
+
+# VGA — стандартный VBE для framebuffer
+vga: extension=vbe
+
+# ROM images — стандартные BIOS Bochs
+romimage: file=/usr/local/share/bochs/BIOS-bochs-latest
+vgaromimage: file=/usr/local/share/bochs/VGABIOS-lgpl-latest
+
+# CD-ROM на ATA канале 0
+ata0: enabled=1, ioaddr1=0x1f0, ioaddr2=0x3f0, irq=14
+ata0-master: type=cdrom, path="boot.iso", status=inserted
+
+# Serial COM1 → файл (вывод ядра через serial)
+com1: enabled=1, mode=file, dev="bochs_serial.log"
+
+# Display library — nogui (headless, без X11)
+display_library: nogui
+
+# CPU — bx_generic с x86_64
+cpu: count=1, ips=40000000, model=bx_generic, reset_on_triple_fault=0
+
+# CPUID — включаем x86_64 и необходимые расширения
+cpuid: x86_64=1, mmx=1, sep=1, simd=sse4_2, apic=xapic, aes=1, movbe=1, xsave=1
+
+# Лог Bochs
+log: bochs.log
