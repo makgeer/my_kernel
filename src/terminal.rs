@@ -1,5 +1,5 @@
 // ============================================================================
-// src/terminal.rs — ПЕРВОЕ ПРИЛОЖЕНИЕ ОС MyKernel: полноценный терминал.
+// src/terminal.rs — ПЕРВОЕ ПРИЛОЖЕНИЕ ОС Malinka: полноценный терминал.
 //
 // НОВЫЙ КОД (до внесения в коммит) — по правилу 6 .kodaruls.
 //
@@ -120,15 +120,40 @@ impl Terminal {
     }
 
     /// Обрабатывает один символ: управляющие коды, ANSI, печать.
+    ///
+    /// ОПТИМИЗАЦИЯ (2026-08-17): каждый символ СРАЗУ пишется в serial (COM1)
+    /// потоковым выводом. Раньше serial перерисовывался целиком (draw_serial:
+    /// 2000 ячеек x ANSI-SGR на каждый '\n') — в Bochs это тормозило запуск
+    /// ядра на минуты. Теперь serial получает обычный текст, а полная ANSI-
+    /// перерисовка нужна только VGA/framebuffer (они пишут в память — быстро).
     pub fn put_char(&mut self, c: char) {
         match self.ansi {
             AnsiState::Normal => match c {
                 '\u{1b}' => self.ansi = AnsiState::Esc,
-                '\n' => self.crlf(),
-                '\r' => self.col = 0,
-                '\u{8}' => self.backspace(),
-                '\t' => self.tab(),
-                c => self.print_char(c),
+                '\n' => {
+                    self.crlf();
+                    // write_str сам переводит '\n' в CRLF для терминала.
+                    crate::serial::write_str("\n");
+                }
+                '\r' => {
+                    self.col = 0;
+                    crate::serial::serial_write_byte(b'\r');
+                }
+                '\u{8}' => {
+                    self.backspace();
+                    crate::serial::serial_write_byte(b'\x08');
+                }
+                                '\x09' => {
+                    self.tab();
+                    crate::serial::serial_write_byte(b'\x09');
+                }
+                c => {
+                    self.print_char(c);
+                    // Печатный символ — сразу в serial (потоковый вывод).
+                    if c.is_ascii() && c >= '\u{20}' && c <= '\u{7e}' {
+                        crate::serial::serial_write_byte(c as u8);
+                    }
+                }
             },
             AnsiState::Esc => {
                 // После ESC ждём '[' (CSI). Остальные 2-символьные
@@ -211,6 +236,12 @@ impl Terminal {
         self.cells = [[Cell::blank(); COLS]; ROWS];
         self.row = 0;
         self.col = 0;
+        // Serial теперь не перерисовывается целиком — очищаем его явно
+        // ANSI-кодами (ED 2J + CUP H), иначе старый текст останется.
+        crate::serial::serial_write_byte(0x1b);
+        crate::serial::write_str("[2J");
+        crate::serial::serial_write_byte(0x1b);
+        crate::serial::write_str("[H");
     }
 
     /// Диагностика: текущая позиция курсора терминала (строка, колонка).
@@ -402,11 +433,13 @@ impl Terminal {
     // Рендер во все устройства
     // ------------------------------------------------------------------
 
-    /// Полная перерисовка экрана терминала во все три устройства:
-    /// VGA-буфер, Serial (COM1) и Framebuffer.
+    /// Полная перерисовка экрана терминала во все устройства.
+    ///
+    /// ОПТИМИЗАЦИЯ: Serial (COM1) больше НЕ перерисовывается целиком —
+    /// он получает символы потоково в put_char (см. комментарий там).
+    /// Остаются только VGA-буфер и Framebuffer (запись в память — быстро).
     pub fn flush(&mut self) {
         self.draw_vga();
-        self.draw_serial();
         self.draw_fb();
         self.advance_blink();
     }
@@ -471,6 +504,11 @@ impl Terminal {
     /// Рисует экран в Serial (COM1) ANSI-последовательностями:
     /// очищаем экран, выводим каждую ячейку с её цветом SGR,
     /// затем возвращаем терминальный курсор на текущую позицию.
+    ///
+    /// ОПТИМИЗАЦИЯ 2026-08-17: функция ВРЕМЕННО не вызывается (flush не
+    /// делает полную serial-перерисовку — символы пишутся потоково в
+    /// put_char). Код сохранён: пригодится для отладки терминала/цветов.
+    #[allow(dead_code)]
     fn draw_serial(&self) {
         use crate::serial::{serial_write_byte, serial_write_num, write_str};
         // Отключаем автоперенос строк (DECAWM ?7l) на время перерисовки.

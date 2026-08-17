@@ -36,8 +36,20 @@ pub fn init_idt() {
         // int 0x80 — syscall из user mode (ring 3). DPL=3 разрешает
         // вызов int 0x80 из ring 3. Без DPL=3 → #GP при int 0x80 из user.
         // IST не используется — CPU переключается на TSS.rsp0 (kernel stack).
-        let sys = idt[0x80].set_handler_fn(syscall_handler);
-        sys.set_privilege_level(PrivilegeLevel::Ring3);
+        //
+        // Обработчик — asm-обёртка syscall_entry (naked): она сохраняет
+        // ВСЕ регистры общего назначения на стек и вызывает Rust-обработчик
+        // syscall_handler_rust с указателем на SyscallRegisters. Это нужно,
+        // потому что InterruptStackFrame содержит только RIP/CS/RFLAGS/RSP/SS,
+        // а номер syscall (eax) и аргументы (rdi/rsi/rdx) живут в GPR.
+        //
+        // set_handler_addr принимает сырой адрес функции — CPU переходит на
+        // неё напрямую (без пролога), а корректный стек-фрейм она строит сама.
+        unsafe {
+            idt[0x80]
+                .set_handler_addr(VirtAddr::new(syscall_entry as u64))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
         idt
     });
 
@@ -183,23 +195,138 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     outb(PIC1, 0x20);
 }
 
-/// Обработчик int 0x80 — системный вызов из user mode (ring 3).
+/// Сохранённые регистры общего назначения при входе в int 0x80.
 ///
-/// При входе из ring 3 CPU переключается на TSS.rsp0 (KERNEL_RETURN_STACK),
-/// сохраняет user SS:RSP, RFLAGS, CS:RIP в IRET-фрейме.
+/// Порядок полей = порядок на стеке после push в syscall_entry:
+/// последний push (r15) оказывается по наименьшему адресу → первое поле.
+/// Структура точно повторяет layout стека, поэтому syscall_handler_rust
+/// читает регистры как обычные поля структуры.
+#[repr(C)]
+pub struct SyscallRegisters {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rax: u64,
+}
+
+/// asm-обёртка системного вызова int 0x80.
+///
+/// Порядок действий:
+///   1. Сохраняет ВСЕ GPR на стек (push в порядке, обратном полям
+///      SyscallRegisters — чтобы сохранённые регистры были одним блоком);
+///   2. Передаёт указатель на них в Rust-обработчик syscall_handler_rust
+///      (первый аргумент по SysV ABI — rdi);
+///   3. После возврата восстанавливает регистры из стека (модифицированные
+///      значения возвращаются на свои места — так syscall может передать
+///      результат в user space через rax);
+///   4. iretq — по (возможно, модифицированному) IRET-фрейму. Для возврата
+///      в kernel mode обработчик меняет фрейм, и iretq переводит CPU в ring 0.
+#[unsafe(naked)]
+unsafe extern "C" fn syscall_entry() -> ! {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // rdi = указатель на SyscallRegisters (первый аргумент Rust-функции)
+        "mov rdi, rsp",
+        "call {handler}",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym syscall_handler_rust,
+    );
+}
+
+/// Rust-обработчик системного вызова. Вызывается из asm-обёртки
+/// syscall_entry, когда все регистры уже сохранены.
+///
+/// `regs` — указатель на сохранённые GPR в момент входа в int 0x80.
+/// Сразу после структуры SyscallRegisters на стеке лежит
+/// InterruptStackFrame (SS, RSP, RFLAGS, CS, RIP), вытолкнутый CPU
+/// при входе в обработчик.
 ///
 /// Для возврата в kernel mode (вместо возврата в user) мы:
 /// 1. Восстанавливаем kernel CR3 (адресное пространство ядра)
 /// 2. Модифицируем IRET-фрейм: CS/SS → kernel selectors,
 ///    RIP → kernel_return_to_shell, RSP → KERNEL_RETURN_STACK top
-/// 3. iretq (компилятор генерирует автоматически) возвращает в kernel mode
-extern "x86-interrupt" fn syscall_handler(mut stack_frame: InterruptStackFrame) {
+/// 3. iretq в syscall_entry возвращает в kernel mode
+fn syscall_handler_rust(regs: &mut SyscallRegisters) {
+    // InterruptStackFrame расположен сразу за SyscallRegisters на стеке.
+    // unsafe: фрейм реально лежит там (его положил CPU перед push в
+    // syscall_entry), выравнивание 8 байт у обеих структур совпадает.
+    let frame = unsafe {
+        let ptr = (regs as *mut SyscallRegisters as *mut u8)
+            .add(core::mem::size_of::<SyscallRegisters>());
+        &mut *(ptr as *mut InterruptStackFrame)
+    };
+
+    // Номер системного вызова — в eax/rax (как в Linux: eax = номер syscall).
+    let syscall_num = (regs.rax & 0xFFFF_FFFF) as u32;
+    // Аргументы syscall — в rdi/rsi/rdx (SysV ABI).
+    let arg1 = regs.rdi;
+    let arg2 = regs.rsi;
+    let arg3 = regs.rdx;
+
     crate::println!(
-        "SYSCALL from ring 3! (user RIP: 0x{:x}, RSP: 0x{:x}, CS: 0x{:x})",
-        stack_frame.instruction_pointer,
-        stack_frame.stack_pointer,
-        stack_frame.code_segment.0
+        "SYSCALL #{} from ring 3! (arg1=0x{:016x}, arg2=0x{:016x}, arg3=0x{:016x})",
+        syscall_num, arg1, arg2, arg3
     );
+    crate::println!(
+        "  user RIP: 0x{:x}, RSP: 0x{:x}, CS: 0x{:x}, RFLAGS: 0x{:x}",
+        frame.instruction_pointer,
+        frame.stack_pointer,
+        frame.code_segment.0,
+        frame.cpu_flags.bits()
+    );
+
+    // Диспетчер системных вызовов по номеру (eax).
+    // Заглушки — следующие шаги плана (write/exit) будут реализованы здесь.
+    match syscall_num {
+        0 => {
+            // Номер 0 пока не используется: возвращаем -2 (ENOSYS-стиль).
+            regs.rax = 0xFFFF_FFFF_FFFF_FFFE;
+        }
+        _ => {
+            crate::println!("  Unknown syscall number: {}", syscall_num);
+            regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: неверный номер
+        }
+    }
 
     // 1. Восстанавливаем kernel CR3
     let kernel_p4 = crate::paging::kernel_p4_phys();
@@ -212,7 +339,7 @@ extern "x86-interrupt" fn syscall_handler(mut stack_frame: InterruptStackFrame) 
 
     // 2. Модифицируем IRET-фрейм для возврата в kernel mode
     unsafe {
-        let mut m = stack_frame.as_mut();
+        let mut m = frame.as_mut();
         m.update(|f| {
             // RIP → kernel_return_to_shell (возвращаемся в shell)
             f.instruction_pointer = VirtAddr::new(kernel_return_to_shell as *const () as u64);
@@ -235,8 +362,10 @@ extern "x86-interrupt" fn syscall_handler(mut stack_frame: InterruptStackFrame) 
         });
     }
 
-    // После возврата из обработчика iretq использует модифицированный фрейм:
-    // CPU переходит в ring 0 на kernel_return_to_shell с kernel стеком.
+    // После возврата в syscall_entry pop'ы восстановят регистры
+    // (в т.ч. модифицированный regs.rax — код возврата syscall),
+    // затем iretq использует модифицированный фрейм: CPU переходит
+    // в ring 0 на kernel_return_to_shell с kernel стеком.
 }
 
 /// Точка возврата из user mode в kernel.

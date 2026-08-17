@@ -1177,3 +1177,138 @@
       В Bochs — не загружается (проблема с Limine BIOS boot, изучить завтра).
     - ЗАВТРА: 1) документация Limine для Bochs, 2) запуск ядра в Bochs,
       3) тест run_user (ring 3) в Bochs, 4) чтение регистров в syscall.
+
+[2026-08-17] ASM-ОБЁРТКА SYSCALL (чтение регистров) + ПЕРЕСБОРКА ISO:
+    - РАЦИОНАЛЬНОСТЬ: по плану главная задача — чтение регистров в syscall.
+      InterruptStackFrame не содержит GPR (rax/rdi/rsi/rdx), поэтому нужна
+      asm-обёртка, сохраняющая все регистры на стек.
+    - ВАЖНОЕ ОТКРЫТИЕ: Bochs ЗАГРУЖАЕТ ядро! В bochs_serial.log (от 16.08)
+      виден вывод Limine и ядра: "[kernel] _start_rust reached", Heap initialized,
+      PMM initialized. Раньше считалось, что Bochs не грузит Limine — это не так.
+      Ядро останавливается на PMM initialized из-за медленной перерисовки
+      терминала в serial (2000 ячеек x ANSI-SGR на каждый '\n') — вывода
+      "Paging initialized" не дождались. Это не блокер задач, но узкое место
+      для отладки в Bochs.
+    - src/main.rs: НОВЫЙ КОД — комментарий о причинах (убрал неактуальный
+      feature naked_functions — он стабилен с Rust 1.88).
+    - src/interrupts.rs: НОВЫЙ КОД — структура SyscallRegisters (15 полей GPR,
+      порядок = layout стека после push), naked-функция syscall_entry:
+      push всех GPR → call syscall_handler_rust(rdi=rsp) → pop → iretq.
+      Rust-обработчик syscall_handler_rust (без extern "x86-interrupt"):
+      читает eax (номер syscall) и rdi/rsi/rdx (аргументы), получает
+      InterruptStackFrame как смещение от конца SyscallRegisters на стеке.
+      Вся логика старого syscall_handler (восстановление CR3, модификация
+      IRET-фрейма) сохранена без изменений. Диспетчер syscall: #0 → -2,
+      неизвестный номер → -1. Регистрация в IDT через set_handler_addr + DPL=3.
+    - src/shell.rs: user-код run_user теперь передаёт аргументы:
+      mov eax,0x42; mov rdi,0x1234; mov rsi,0x5678; mov rdx,0x9ABC; int 0x80
+      — для проверки чтения регистров.
+    - Сборка: debug + release ✅ 0 ошибок (28 warning: dead_code/static_mut_refs — не удаляем).
+    - iso/kernel.elf обновлён, boot.iso пересобран (xorriso, 1.0M).
+    - ТЕСТИРОВАНИЕ: запуск в Bochs строго вручную в системном терминале!
+      Команда: bochs -q -f bochsrc.bxrc
+      В shell: ввести run_user → ожидаем SYSCALL #66 (0x42) с аргументами.
+    - СЛЕДУЮЩИЙ ШАГ: после проверки в Bochs — реализация syscall write/exit,
+      ELF-загрузчик.
+
+[2026-08-17] ЗАПУСК BOCHS — ОШИБКА DISPLAY LIBRARY:
+    - ПРОБЛЕМА: ручной запуск "bochs -q -f bochsrc.bxrc" → PANIC
+      "display library 'nogui' not available".
+    - ПРИЧИНА: в PATH подхватился системный /usr/local/bin/bochs,
+      собранный БЕЗ поддержки nogui. Локальная сборка с --with-nogui
+      лежит в bochs-bin/bin/bochs (проверено strings: символы
+      bx_nogui_gui_c присутствуют).
+    - РЕШЕНИЕ: запускать строго локальный бинарник:
+        ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+      ROM-образы системной (/usr/local/share/bochs) и локальной
+      (bochs-bin/share/bochs) сборок идентичны — bochsrc.bxrc
+      менять не нужно.
+
+[2026-08-17] ПЕРЕИМЕНОВАНИЕ ПРОЕКТА В MALINKA:
+    - РАЦИОНАЛЬНОСТЬ: пользователь выбрал название "malinka" для проекта.
+    - Cargo.toml: name = "malinka" (пакет и бинарник).
+    - make_iso.sh / debug_kernel.sh: путь к бинарнику target/.../malinka.
+    - src/shell.rs: приветствие "Welcome to Malinka shell!", "Malinka v0.1.0".
+    - src/terminal.rs: комментарий "ПРИЛОЖЕНИЕ ОС Malinka".
+    - KODA.md / plan.txt / bochsrc.bxrc: обновлены упоминания названия.
+    - НЕ ТРОГАЛИ: my_kernel.log (исторический файл лога — имя закреплено
+      правилом 5 .kodaruls), физический путь /home/makgeer/my_kernel
+      (директория не переименована — переименование по желанию пользователя).
+    - Сборка: release ✅ 0 ошибок. iso/kernel.elf обновлён, boot.iso пересобран.
+    - СЛЕДУЮЩИЙ ШАГ: тест run_user в Bochs, затем syscall write/exit.
+
+[2026-08-17] BOCHS ЗАГРУЗИЛ ЯДРО + ПЕРЕХОД НА com1 mode=term:
+    - УСПЕХ: Bochs полностью загружает Malinka! В bochs_serial.log видно:
+      Limine стартует, ядро проходит KERNEL START, Framebuffer found,
+      Interrupts enabled, KERNEL READY, "Welcome to Malinka shell!".
+      Долгое ожидание (~10 мин) — плата за полную перерисовку экрана
+      80x25 в serial на каждый '\n' (2000 ячеек x ANSI-SGR).
+    - ВАЖНО: переименование проекта проверено — в логе приветствие
+      "Welcome to Malinka shell!" (работает новый Cargo name).
+    - ПРОБЛЕМА: com1 mode=file не принимает ввод — shell не заполнить.
+      PS/2-клавиатура в nogui недоступна (нет GUI).
+    - РЕШЕНИЕ: bochsrc.bxrc — com1: mode=term (интерактивный терминал:
+      вывод в терминал Bochs, ввод с клавиатуры терминала через serial).
+    - СЛЕДУЮЩИЙ ШАГ: перезапуск Bochs, ввод run_user, проверка
+      SYSCALL #66 (0x42) с аргументами 0x1234/0x5678/0x9ABC.
+
+[2026-08-17] ОПТИМИЗАЦИЯ ВЫВОДА В SERIAL (УСКОРЕНИЕ ЗАПУСКА В BOCHS):
+    - РАЦИОНАЛЬНОСТЬ: пользователь попросил ускорить запуск. Главный тормоз —
+      полная перерисовка экрана 80x25 в serial (2000 ячеек x ANSI-SGR) на каждый
+      '\n'. В Bochs это минуты простоя. VGA/framebuffer пишут в память (быстро),
+      serial — через порт (I/O, медленно).
+    - src/terminal.rs put_char: НОВЫЙ КОД — каждый печатный символ СРАЗУ
+      пишется в serial потоково (serial_write_byte). '\n' → write_str("\n")
+      (CRLF сам), '\r' → 0x0D, backspace → 0x08, tab → 0x09. Полная
+      ANSI-перерисовка serial больше не нужна.
+    - src/terminal.rs flush: убран вызов draw_serial (serial уже получил строку).
+      Остаются draw_vga + draw_fb + advance_blink.
+    - src/terminal.rs clear_screen: добавлена явная ANSI-очистка serial
+      (ESC[2J + ESC[H) — иначе старый текст в терминале останется.
+    - src/terminal.rs draw_serial: #[allow(dead_code)] — функция СОХРАНЕНА
+      (по правилу 2/запрету удаления кода), временно не вызывается.
+      Пригодится для отладки терминала/цветов.
+    - Результат: serial-вывод уменьшился с ~8000 байт/строка (перерисовка)
+      до ~80 байт/строка (простой текст) — в ~100 раз быстрее.
+    - Сборка: check + release ✅ 0 ошибок (28 warning: dead_code/static_mut_refs).
+    - iso/kernel.elf обновлён, boot.iso пересобран.
+    - СЛЕДУЮЩИЙ ШАГ: перезапуск Bochs (com1 mode=term) — запуск должен быть
+      быстрым, ввод run_user → проверка SYSCALL #66 (0x42).
+
+[2026-08-17] BOCHS: NOGUI + COM1 TERM НЕ РАБОТАЮТ → display_library: term:
+    - ПРОБЛЕМА: при display_library: nogui COM1 mode=term не выводит ничего
+      в терминал — nogui не открывает терминальный интерфейс, serial-выводу
+      некуда идти. Bochs просто крутился на 99.9% CPU без вывода.
+    - РЕШЕНИЕ: bochsrc.bxrc:
+      * display_library: term — текстовый терминал (VGA-вывод ядра + PS/2
+        клавиатура из терминала; Bochs собран с --with-term).
+      * com1: mode=file, dev=bochs_serial.log — serial-вывод в лог-файл
+        (для диагностики). Ввод идёт через PS/2-клавиатуру от term-дисплея.
+    - ПРОВЕРЕНО: процесс Bochs остановлен (kill), конфиг изменён.
+    - ЗАПУСК: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc — в терминале должен
+      появиться VGA-текст ядра, клавиатура терминала передаёт PS/2-ввод.
+    - СЛЕДУЮЩИЙ ШАГ: подтверждение от пользователя, что term-дисплей
+      работает, затем тест run_user.
+
+[2026-08-17] РЕШЕНИЕ ПРОБЛЕМЫ TERM-ДИСПЛЕЯ: FEATURE no-fb (СБОРКА БЕЗ FRAMEBUFFER):
+    - ПРОБЛЕМА: term-дисплей Bochs (ncurses) падал с "32 bpp graphics mode
+      not supported" — Limine запрашивал графический framebuffer 32bpp
+      (1920x1200 в EDID Bochs, режим 0x144), который term не поддерживает.
+    - КЛЮЧЕВОЕ ОТКРЫТИЕ ПОЛЬЗОВАТЕЛЯ: экран "определяется" как 1920x1200 —
+      это НЕ реальный монитор, а EDID-эмуляция Bochs. Реальный монитор
+      пользователя имеет другое разрешение — не влияет.
+    - РЕШЕНИЕ: Cargo feature fb/no-fb:
+      * Cargo.toml: [features] default=["fb"], fb=[], no-fb=[]
+      * limine_fb.rs: FRAMEBUFFER_REQUEST + get_framebuffer — только #[cfg(feature="fb")]
+      * main.rs: блок инициализации framebuffer обёрнут в #[cfg(feature="fb")],
+        при no-fb выводится "Framebuffer disabled (no-fb mode, text VGA only)"
+      * vesa.rs: vesa_clear_screen/vesa_draw_char_ex безопасны при VESA_WIDTH=0
+        (0 итераций / ранний return) — framebuffer не инициализирован.
+      * make_iso.sh: параметр no-fb → cargo build --release --no-default-features
+    - bochsrc.bxrc: display_library: term + com1: mode=file (лог в файл),
+      ввод через PS/2-клавиатуру term-дисплея (IRQ1).
+    - Сборка: fb ✅ 28 warning, no-fb ✅ 30 warning (dead_code — не удаляем).
+    - boot.iso пересобран в режиме no-fb для Bochs term.
+    - ЗАПУСК: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc — term-дисплей должен
+      показать VGA 80x25, клавиатура должна работать.
+    - СЛЕДУЮЩИЙ ШАГ: тест run_user в Bochs term.

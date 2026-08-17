@@ -1,5 +1,5 @@
 [package]
-name = "my_kernel"
+name = "malinka"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,8 +12,19 @@ volatile = "0.6.1"
 linked_list_allocator = "0.10"
 
 [[bin]]
-name = "my_kernel"
+name = "malinka"
 path = "src/main.rs"
+
+# Фичи сборки:
+#   fb   (по умолчанию) — Limine запрашивает framebuffer, вывод на экран
+#   no-fb — сборка БЕЗ framebuffer: только текстовый VGA 80x25 + serial.
+#          Нужен для Bochs term-дисплея (ncurses), который не поддерживает
+#          графический 32bpp-режим ("32 bpp graphics mode not supported").
+#          Запуск: cargo build --release --no-default-features
+[features]
+default = ["fb"]
+fb = []
+no-fb = []
 
 [profile.release]
 lto = true

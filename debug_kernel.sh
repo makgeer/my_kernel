@@ -23,7 +23,7 @@ echo "[3/6] Preparing ISO structure..."
 mkdir -p iso/boot/grub
 
 # Копируем ядро
-cp target/x86_64-unknown-none/release/my_kernel iso/boot/my_kernel.bin
+cp target/x86_64-unknown-none/release/malinka iso/boot/malinka.bin
 echo "[OK] Kernel copied"
 
 # Создаём grub.cfg
@@ -32,7 +32,7 @@ set timeout=0
 set default=0
 
 menuentry "My Rust Kernel" {
-    multiboot2 /boot/my_kernel.bin
+    multiboot2 /boot/malinka.bin
     boot
 }
 EOF

@@ -88,7 +88,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "my_kernel"
+name = "malinka"
 version = "0.1.0"
 dependencies = [
  "heapless",

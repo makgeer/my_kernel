@@ -1,5 +1,5 @@
 ================================================================
-ПЛАН РАЗРАБОТКИ my_kernel — на следующий день
+ПЛАН РАЗРАБОТКИ malinka — на следующий день
 Ветка: разработка | Последний коммит: 3f9a9f6
 ================================================================
 
@@ -66,7 +66,7 @@ src/main.rs       — инициализация терминала (если н
 --------------
 cargo check                          — проверка компиляции
 cargo build                          — сборка
-cp target/x86_64-unknown-none/debug/my_kernel.iso boot.iso  (или make_iso.sh)
+cp target/x86_64-unknown-none/debug/malinka.iso boot.iso  (или make_iso.sh)
 qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max \
   -no-reboot -display none -serial stdio   — запуск (вручную!)
 ================================================================

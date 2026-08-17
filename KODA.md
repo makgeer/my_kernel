@@ -1,8 +1,8 @@
-# KODA.md — Контекст проекта my_kernel
+# KODA.md — Контекст проекта malinka
 
 ## Обзор проекта
 
-**my_kernel** — учебное ядро операционной системы на Rust для архитектуры x86_64 (bare-metal, `no_std` / `no_main`). Загружается через загрузчик **Limine** в higher-half режиме (базовый адрес `0xFFFFFFFF80000000`). Ядро реализует базовую инфраструктуру ОС: вывод на framebuffer/VGA/serial, обработку прерываний (PIC, IDT, GDT/TSS/IST), кооперативный планировщик задач и интерактивный shell.
+**malinka** — учебное ядро операционной системы на Rust для архитектуры x86_64 (bare-metal, `no_std` / `no_main`). Загружается через загрузчик **Limine** в higher-half режиме (базовый адрес `0xFFFFFFFF80000000`). Ядро реализует базовую инфраструктуру ОС: вывод на framebuffer/VGA/serial, обработку прерываний (PIC, IDT, GDT/TSS/IST), кооперативный планировщик задач и интерактивный shell.
 
 ### Текущее состояние
 
@@ -35,7 +35,7 @@
 ## Структура проекта
 
 ```
-my_kernel/
+malinka/
 ├── .cargo/
 │   └── config.toml          — цель сборки x86_64-unknown-none, build-std, флаги линкера
 ├── .kodaruls                 — правила разработки проекта (7 пунктов)
@@ -129,7 +129,7 @@ cargo build --release
 ./make_iso.sh
 # или вручную:
 cargo build --release
-cp target/x86_64-unknown-none/release/my_kernel iso/kernel.elf
+cp target/x86_64-unknown-none/release/malinka iso/kernel.elf
 # затем xorriso для создания boot.iso (см. make_iso.sh)
 ```
 

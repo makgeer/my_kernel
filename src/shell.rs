@@ -72,7 +72,7 @@ pub fn read_line() -> [u8; 64] {
 
 pub fn shell() {
     println!();
-    println!("Welcome to MyKernel shell!");
+    println!("Welcome to Malinka shell!");
     println!("Type 'help' for commands");
 
     loop {
@@ -101,7 +101,7 @@ pub fn shell() {
                 println!("  run_user   - create and run user process in ring 3");
             }
             "about" => {
-                println!("MyKernel v0.1.0");
+                println!("Malinka v0.1.0");
                 println!("x86_64 OS kernel written in Rust");
                 println!("Bootloader: Limine");
             }
@@ -365,12 +365,22 @@ pub fn shell() {
             }
             "run_user" => {
                 // Запуск пользовательского процесса в ring 3.
-                // Код: mov eax,0x42; int 0x80; jmp $
-                // После int 0x80 syscall_handler вернёт нас в shell.
+                // Код: mov eax,0x42; mov rdi,0x1234; mov rsi,0x5678;
+                //      mov rdx,0x9ABC; int 0x80; jmp $
+                // Передаём номер syscall (eax) и три аргумента (rdi/rsi/rdx),
+                // чтобы проверить, что asm-обёртка syscall_entry корректно
+                // читает регистры из user space.
+                // После int 0x80 syscall_handler_rust вернёт нас в shell.
                 let user_code: &[u8] = &[
-                    0xB8, 0x42, 0x00, 0x00, 0x00, // mov eax, 0x42
-                    0xCD, 0x80,                     // int 0x80
-                    0xEB, 0xFE,                     // jmp $ (бесконечный цикл)
+                    0xB8, 0x42, 0x00, 0x00, 0x00,             // mov eax, 0x42
+                    0x48, 0xBF, 0x34, 0x12, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00,                   // mov rdi, 0x1234
+                    0x48, 0xBE, 0x78, 0x56, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00,                   // mov rsi, 0x5678
+                    0x48, 0xBA, 0xBC, 0x9A, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00,                   // mov rdx, 0x9ABC
+                    0xCD, 0x80,                               // int 0x80
+                    0xEB, 0xFE,                               // jmp $ (бесконечный цикл)
                 ];
 
                 println!("Creating and launching user process in ring 3...");

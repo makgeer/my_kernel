@@ -7,7 +7,17 @@ cd /home/makgeer/my_kernel
 export PATH="$HOME/.cargo/bin:$PATH"
 
 echo "=== Building kernel ==="
-cargo build --release
+# Режим сборки: по умолчанию с framebuffer (fb).
+# Для Bochs term (ncurses, нет 32bpp) — без framebuffer:
+#   ./make_iso.sh no-fb
+# Текстовый VGA 80x25 + serial, term-дисплей работает.
+if [ "$1" = "no-fb" ]; then
+    echo "Mode: no-fb (текстовый VGA, для Bochs term)"
+    cargo build --release --no-default-features
+else
+    echo "Mode: fb (по умолчанию, графический framebuffer)"
+    cargo build --release
+fi
 
 if [ $? -ne 0 ]; then
     echo "Build failed!"
@@ -15,7 +25,7 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "=== Copying kernel ==="
-cp target/x86_64-unknown-none/release/my_kernel iso/boot/my_kernel.bin
+cp target/x86_64-unknown-none/release/malinka iso/boot/malinka.bin
 
 echo "=== Copying Limine files ==="
 cp limine-binary/limine-bios.sys iso/
