@@ -316,11 +316,78 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
     );
 
     // Диспетчер системных вызовов по номеру (eax).
-    // Заглушки — следующие шаги плана (write/exit) будут реализованы здесь.
+    // Номера заимствованы у Linux (x86_64):
+    //   1  — write(fd, buf, len) — вывод строки из user space
+    //   60 — exit(code) — завершение процесса (возврат в kernel shell)
+    //
+    // ВАЖНО про контекст: обработчик вызван из int 0x80, а CPU при входе
+    // в обработчик НЕ меняет CR3 — он всё ещё указывает на P4 процесса.
+    // Поэтому user-адреса (buf) валидны, и paging::translate() проверяет
+    // маппинг именно в адресном пространстве процесса.
     match syscall_num {
-        0 => {
-            // Номер 0 пока не используется: возвращаем -2 (ENOSYS-стиль).
-            regs.rax = 0xFFFF_FFFF_FFFF_FFFE;
+        1 => {
+            // write(fd, buf, len)
+            let fd = arg1;
+            let buf = arg2 as *const u8;
+            let len = arg3 as usize;
+
+            if fd != 1 {
+                // Поддерживаем только stdout (fd=1)
+                crate::println!("  write: unsupported fd {}", fd);
+                regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EBADF
+            } else {
+                // Ограничение на длину: не больше 4096 байт (одна страница),
+                // чтобы цикл проверки/вывода не выполнялся бесконечно при
+                // неверном (огромном) len из user space.
+                let len = len.min(4096);
+
+                // Проверяем, что ВЕСЬ буфер замаплен в user space.
+                // Идём по страницам: translate() возвращает Some, только если
+                // все уровни таблиц (P4→P3→P2→P1) содержат PRESENT-записи.
+                let mut valid = true;
+                let mut i = 0usize;
+                while i < len {
+                    let virt = buf as u64 + i as u64;
+                    if crate::paging::translate(virt).is_none() {
+                        crate::println!(
+                            "  write: unmapped user buffer at 0x{:x}",
+                            virt
+                        );
+                        valid = false;
+                        break;
+                    }
+                    // Перескакиваем на начало следующей страницы:
+                    // остаток текущей страницы заведомо замаплен целиком.
+                    let page_off = (virt & 0xFFF) as usize;
+                    i += (4096 - page_off).min(len - i);
+                }
+
+                if valid {
+                    // Выводим байты посимвольно прямо из user space.
+                    // Печать (println!/print!) пишет в higher-half (VGA,
+                    // framebuffer, serial) — этот диапазон скопирован в user
+                    // P4 (entries 256-511), поэтому вывод безопасен.
+                    for i in 0..len {
+                        let c = unsafe { *buf.add(i) };
+                        crate::print!("{}", c as char);
+                    }
+                    regs.rax = len as u64; // возвращаем число записанных байт
+                } else {
+                    regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
+                }
+            }
+        }
+        60 => {
+            // exit(code) — завершение процесса.
+            // Возврат в kernel mode уже настроен ниже (IRET-фрейм →
+            // kernel_return_to_shell), поэтому здесь просто логируем код
+            // выхода и возвращаем его в rax.
+            let code = arg1;
+            crate::println!(
+                "  exit({}) — процесс завершён, возврат в kernel shell",
+                code
+            );
+            regs.rax = 0; // успешное завершение syscall
         }
         _ => {
             crate::println!("  Unknown syscall number: {}", syscall_num);

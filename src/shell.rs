@@ -18,7 +18,7 @@ pub fn getchar() -> (char, bool) {
             }
         }
         // Источник 2: serial (COM1) — ввод через -serial stdio.
-        // QEMU переводит терминал в raw mode (нет локального эха),
+        // Bochs переводит терминал в raw mode (нет локального эха),
         // поэтому символы выводим сами в read_line().
         if crate::serial::serial_has_data() {
             let byte = crate::serial::serial_read();
@@ -33,7 +33,7 @@ pub fn getchar() -> (char, bool) {
 
 /// Читает строку до Enter. Возвращает набранные символы.
 /// Поддерживает Backspace (стирание последнего символа).
-/// Эхо печатается ВСЕГДА (и для serial, и для PS/2): QEMU с
+/// Эхо печатается ВСЕГДА (и для serial, и для PS/2): Bochs с
 /// -serial stdio переводит терминал в raw mode, где нет локального эха,
 /// поэтому символы выводим сами через print! (VGA+serial+framebuffer).
 pub fn read_line() -> [u8; 64] {
@@ -365,22 +365,45 @@ pub fn shell() {
             }
             "run_user" => {
                 // Запуск пользовательского процесса в ring 3.
-                // Код: mov eax,0x42; mov rdi,0x1234; mov rsi,0x5678;
-                //      mov rdx,0x9ABC; int 0x80; jmp $
-                // Передаём номер syscall (eax) и три аргумента (rdi/rsi/rdx),
-                // чтобы проверить, что asm-обёртка syscall_entry корректно
-                // читает регистры из user space.
-                // После int 0x80 syscall_handler_rust вернёт нас в shell.
+                // Код демонстрирует системные вызовы write и exit:
+                //   write(1, msg, 22)  — вывод строки из user space
+                //   exit(0)            — завершение процесса, возврат в shell
+                //
+                // Смещения байт-кода (вычислены вручную):
+                //   0:  B8 01 00 00 00           mov eax, 1          (write)
+                //   5:  48 C7 C7 01 00 00 00     mov rdi, 1          (fd=stdout)
+                //   12: 48 BE <8 байт>           mov rsi, msg_addr   (buf)
+                //   22: 48 BA <8 байт>           mov rdx, 22         (len)
+                //   32: CD 80                    int 0x80
+                //   34: B8 3C 00 00 00           mov eax, 60         (exit)
+                //   39: 48 C7 C7 00 00 00 00     mov rdi, 0          (code=0)
+                //   46: CD 80                    int 0x80
+                //   48: EB FE                    jmp $  (страховка)
+                //   50: "Hello from user mode!\n" — строка (22 байта)
+                // msg_addr = USER_CODE_BASE + 50 = 0x0000400000000032
+                let msg_addr: u64 = crate::process::USER_CODE_BASE + 50;
+                println!("User message at: 0x{:x}", msg_addr);
                 let user_code: &[u8] = &[
-                    0xB8, 0x42, 0x00, 0x00, 0x00,             // mov eax, 0x42
-                    0x48, 0xBF, 0x34, 0x12, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00,                   // mov rdi, 0x1234
-                    0x48, 0xBE, 0x78, 0x56, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00,                   // mov rsi, 0x5678
-                    0x48, 0xBA, 0xBC, 0x9A, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00,                   // mov rdx, 0x9ABC
+                    // write(1, msg, 22)
+                    0xB8, 0x01, 0x00, 0x00, 0x00,             // mov eax, 1
+                    0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
+                    // mov rsi, msg_addr (little-endian)
+                    0x48, 0xBE,
+                    0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+                    // mov rdx, 22
+                    0x48, 0xBA,
+                    0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                     0xCD, 0x80,                               // int 0x80
-                    0xEB, 0xFE,                               // jmp $ (бесконечный цикл)
+                    // exit(0)
+                    0xB8, 0x3C, 0x00, 0x00, 0x00,             // mov eax, 60
+                    0x48, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0
+                    0xCD, 0x80,                               // int 0x80
+                    0xEB, 0xFE,                               // jmp $
+                    // Строка для write
+                    b'H', b'e', b'l', b'l', b'o', b' ',
+                    b'f', b'r', b'o', b'm', b' ',
+                    b'u', b's', b'e', b'r', b' ',
+                    b'm', b'o', b'd', b'e', b'!', b'\n',
                 ];
 
                 println!("Creating and launching user process in ring 3...");
@@ -389,7 +412,8 @@ pub fn shell() {
                     Ok(proc) => {
                         println!("Launching ring 3...");
                         // run_process переключает CR3 и вызывает enter_ring3.
-                        // После int 0x80 → syscall_handler → kernel_return_to_shell.
+                        // После int 0x80 → syscall_entry → syscall_handler_rust
+                        // → kernel_return_to_shell.
                         crate::process::run_process(&proc);
                         // Сюда не вернёмся — enter_ring3 noreturn,
                         // возврат идёт через kernel_return_to_shell.

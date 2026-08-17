@@ -29,7 +29,7 @@ use crate::limine_fb::FRAMEBUFFER_REQUEST;
 #[no_mangle]
 pub extern "C" fn _start_rust() -> ! {
     // Инициализируем serial (COM1) до первого вывода — чтобы весь лог
-    // ядра попадал в последовательный порт (qemu.log)
+    // ядра попадал в последовательный порт (bochs_serial.log)
     serial::init();
 
     // Инициализируем кучу (8 МБ) — до первой аллокации.

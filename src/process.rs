@@ -132,6 +132,10 @@ pub fn create_process(code: &[u8], entry_offset: u64) -> Result<Process, &'stati
 /// Обычная extern "C" функция (не naked): по SysV ABI аргументы приходят
 /// в rdi (entry), rsi (stack). Компилятор не трогает эти регистры до asm!.
 ///
+/// ВАЖНО: вызывающая сторона должна передавать `stack` выровненным так,
+/// чтобы `stack mod 16 != 0` (см. комментарий в run_process про #GP при
+/// iretq в ring 3). Передавайте `USER_STACK_TOP - 8`, а не сам `USER_STACK_TOP`.
+///
 /// # Безопасность
 /// После IRETQ код выполняется в ring 3. Возврат в kernel mode
 /// возможен только через прерывание (syscall/int).
@@ -141,7 +145,7 @@ pub unsafe extern "C" fn enter_ring3(entry: u64, stack: u64) -> ! {
     // Порядок (снизу вверх): SS, RSP, RFLAGS, CS, RIP
     core::arch::asm!(
         "push rsi",        // SS = USER_DATA_SELECTOR (передан в rsi)
-        "push rdx",        // RSP = user stack top (передан в rdx)
+        "push rdx",        // RSP = user stack (передан в rdx, должен быть ≡ 8 mod 16)
         "pushfq",          // RFLAGS (IF уже установлен — sti в init_idt)
         "push rcx",        // CS = USER_CODE_SELECTOR (передан в rcx)
         "push rdi",        // RIP = entry point (передан в rdi)
@@ -166,7 +170,7 @@ pub unsafe extern "C" fn enter_ring3(entry: u64, stack: u64) -> ! {
 /// ВАЖНО: после Cr3::write НЕЛЬЗЯ вызывать println! — VGA буфер (0xB8000)
 /// находится в lower-half (P4 index 0), который НЕ скопирован в user P4.
 /// Любая запись в VGA → page fault → нет обработчика → double fault →
-/// double fault handler тоже пишет в VGA → triple fault → QEMU exit.
+/// double fault handler тоже пишет в VGA → triple fault → Bochs reset.
 pub fn run_process(proc: &Process) {
     // Печатаем ДО переключения CR3 — потом VGA будет недоступен.
     println!("Switching CR3 to user P4, entering ring 3...");
@@ -182,6 +186,15 @@ pub fn run_process(proc: &Process) {
         // Формируем IRETQ-фрейм на текущем (kernel) стеке:
         // порядок (снизу вверх): SS, RSP, RFLAGS, CS, RIP
         // Инлайн избегает проблем с prologue extern "C" функции.
+        //
+        // ВАЖНО про RSP (stack_top - 8): iretq в ring 3 требует, чтобы
+        // НОВЫЙ RSP (из фрейма) был выровнен на 16 байт (RSP mod 16 != 0).
+        // USER_STACK_TOP = 0x400000010000 кратен 16 → iretq генерирует
+        // #GP(0) → нет обработчика #GP → DOUBLE FAULT. Bochs строго
+        // следует спецификации (QEMU это пропускал).
+        // stack_top - 8 = 0x...FFF8 ≡ 8 (mod 16) — соответствует SysV ABI
+        // (RSP % 16 == 8 при входе в программу) и лежит в замапленной
+        // странице (верхняя страница стека 0x...F000..0x...FFFF).
         core::arch::asm!(
             "push {ss}",
             "push {sp}",
@@ -190,7 +203,7 @@ pub fn run_process(proc: &Process) {
             "push {rip}",
             "iretq",
             ss = in(reg) USER_DATA_SELECTOR,
-            sp = in(reg) proc.stack_top,
+            sp = in(reg) proc.stack_top - 8,
             cs = in(reg) USER_CODE_SELECTOR,
             rip = in(reg) proc.entry_point,
             options(noreturn)

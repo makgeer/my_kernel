@@ -19,14 +19,17 @@
 ЗАДАЧИ НА СЛЕДУЮЩУЮ ИТЕРАЦИЮ (по приоритету)
 ------------------------------------------
 
-1. ЧТЕНИЕ РЕГИСТРОВ В SYSCALL (главная задача)
-   - InterruptStackFrame не содержит GPR (rax, rdi, rsi...).
-   - Нужна asm-обёртка: сохраняет регистры на стек, вызывает Rust-обработчик.
-   - Тогда: eax = номер syscall, rdi/rsi/rdx = аргументы.
+1. [ВЫПОЛНЕНО] ЧТЕНИЕ РЕГИСТРОВ В SYSCALL
+   - asm-обёртка syscall_entry (naked): сохраняет ВСЕ GPR,
+     SyscallRegisters, syscall_handler_rust читает eax/rdi/rsi/rdx.
+   - Коммит efecd0a.
 
-2. SYSCALL WRITE/EXIT
-   - write(fd, buf, len) — вывод строки из user space (копирование через HHDM)
-   - exit(code) — завершение процесса, возврат в shell
+2. [ВЫПОЛНЕНО] SYSCALL WRITE/EXIT
+   - write(1, buf, len): проверка fd, лимит 4096, проверка буфера через
+     translate (CR3 = user P4), посимвольный вывод, -1 при ошибке.
+   - exit(code): логирование + возврат в kernel shell через IRET-фрейм.
+   - Команда run_user обновлена: write("Hello from user mode!\n") + exit(0).
+   - ОЖИДАЕТ РУЧНОГО ТЕСТА в Bochs term.
 
 3. ELF-ЗАГРУЗЧИК
    - Парсинг ELF64 header
@@ -67,6 +70,5 @@ src/main.rs       — инициализация терминала (если н
 cargo check                          — проверка компиляции
 cargo build                          — сборка
 cp target/x86_64-unknown-none/debug/malinka.iso boot.iso  (или make_iso.sh)
-qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max \
-  -no-reboot -display none -serial stdio   — запуск (вручную!)
+./bochs-bin/bin/bochs -q -f bochsrc.bxrc  — запуск (вручную! только Bochs)
 ================================================================

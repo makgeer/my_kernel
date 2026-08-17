@@ -25,7 +25,9 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "=== Copying kernel ==="
-cp target/x86_64-unknown-none/release/malinka iso/boot/malinka.bin
+# Важно: limine.conf указывает KERNEL_PATH: boot():/kernel.elf,
+# поэтому копируем ядро именно в iso/kernel.elf (не в iso/boot/malinka.bin).
+cp target/x86_64-unknown-none/release/malinka iso/kernel.elf
 
 echo "=== Copying Limine files ==="
 cp limine-binary/limine-bios.sys iso/
@@ -38,7 +40,7 @@ xorriso -as mkisofs -b limine-cd.bin \
 
 echo "=== Done ==="
 echo "ISO created: boot.iso"
-echo "Run manually with your QEMU command"
+echo "Run manually with Bochs: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc"
 # Проверка
 echo "=== ISO Structure ==="
 ls -la iso/

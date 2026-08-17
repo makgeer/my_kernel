@@ -48,23 +48,18 @@ if [ $? -ne 0 ]; then
 fi
 echo "[OK] ISO created: boot.iso"
 
-# 5. Запуск QEMU (без графики, весь вывод в терминал)
-echo "[5/6] Starting QEMU..."
+# 5. Запуск Bochs (устаревший скрипт: использует GRUB, а не Limine)
+#    Скрипт оставлен для истории. Актуальная сборка: make_iso.sh + bochsrc.bxrc.
+echo "[5/6] Starting Bochs..."
 echo "====================================="
 echo "  KERNEL LOG OUTPUT:"
 echo "====================================="
 echo ""
 
-qemu-system-x86_64 \
-    -cdrom boot.iso \
-    -nographic \
-    -no-reboot \
-    -serial mon:stdio \
-    -display none \
-    -cpu max
+./bochs-bin/bin/bochs -q -f bochsrc.bxrc
 
-# 6. После завершения QEMU
+# 6. После завершения Bochs
 echo ""
 echo "====================================="
-echo "[6/6] QEMU exited"
+echo "[6/6] Bochs exited"
 echo "====================================="

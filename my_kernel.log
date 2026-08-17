@@ -1312,3 +1312,169 @@
     - ЗАПУСК: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc — term-дисплей должен
       показать VGA 80x25, клавиатура должна работать.
     - СЛЕДУЮЩИЙ ШАГ: тест run_user в Bochs term.
+
+=== 2026-08-17: КОММИТ efecd0a ===
+    - Выполнен коммит по запросу пользователя: "Продолжи, но сначала коммит".
+    - Содержимое: syscall int 0x80 с asm-обёрткой (naked syscall_entry +
+      SyscallRegisters + диспетчер), фичи fb/no-fb для Bochs term,
+      переименование пакета my_kernel → malinka, оптимизация serial-вывода
+      в terminal.rs, обновление скриптов и документации (15 файлов,
+      +487/-85). Добавлен новый файл bochsrc-gui.bxrc.
+    - Ветка: разработка, опережает origin на 7 коммитов.
+
+=== 2026-08-17: ИСПРАВЛЕНИЕ make_iso.sh ===
+    - Проблема: строка cp копировала ядро в iso/boot/malinka.bin (каталога
+      iso/boot не существует), а limine.conf ожидает boot():/kernel.elf.
+      Из-за этого kernel.elf в ISO оставался старым — изменения кода не
+      попадали в собираемый образ.
+    - Точечное исправление: путь копирования изменён на iso/kernel.elf.
+    - Второй блок xorriso (XORRISO_BIN=/run/host/...) не используется —
+      boot.iso корректно создаётся первым xorriso (директория iso целиком).
+      Блок оставлен (правило: не удалять код).
+    - ISO пересобран в no-fb режиме: kernel.elf обновлён (20:15).
+    - ГОТОВО К ТЕСТУ: run_user в Bochs term (запуск вручную пользователем).
+
+=== 2026-08-17: SYSCALL WRITE/EXIT (задача №2 плана) ===
+    - Реализованы системные вызовы в диспетчере syscall_handler_rust:
+      * write(1, buf, len) — номер 1 (как в Linux x86_64):
+        - fd проверяется на 1 (stdout), иначе -1 (EBADF)
+        - len ограничена 4096 байт (защита от огромных значений из user)
+        - paging::translate проверяет ВЕСЬ буфер постранично (CR3 ещё
+          указывает на P4 процесса, поэтому translate проверяет user-маппинги)
+        - при валидности — посимвольный вывод через print! (higher-half
+          shared, печать безопасна); возврат len в rax
+        - при невалидном буфере — -1 (EFAULT)
+      * exit(code) — номер 60: логирует код, возвращает 0 в rax.
+        Возврат в kernel mode уже настроен ниже (IRET-фрейм →
+        kernel_return_to_shell), поэтому exit просто завершается.
+    - Контекст при int 0x80: CPU НЕ меняет CR3 при входе в обработчик,
+      поэтому user-адреса валидны. Это ключевой момент для write.
+    - Обновлена команда run_user в shell.rs:
+      * Старый тестовый код (mov eax,0x42; mov rdi,0x1234; ...) заменён
+        на реальный: write(1, msg, 22) + exit(0).
+      * Строка "Hello from user mode!\n" (22 байта) размещена в user space
+        на смещении 50 от USER_CODE_BASE (после инструкций).
+      * msg_addr = 0x0000400000000032 закодирован в mov rsi, imm64.
+      * Байт-код и смещения рассчитаны вручную (см. комментарий в коде).
+      * Добавлена диагностика: println!("User message at: 0x{:x}", msg_addr).
+    - Сборка: release ✅ 28 warnings (известный dead_code, static_mut_refs).
+    - ISO пересобран в no-fb: kernel.elf 220552 байт (20:20).
+    - ЗАДАЧА №2 ВЫПОЛНЕНА. СЛЕДУЮЩИЙ ШАГ: ручной тест run_user в Bochs/QEMU —
+      ожидается вывод "Hello from user mode!" и возврат в shell через exit.
+
+=== 2026-08-17: ПРАВИЛО 8 — ТОЛЬКО BOCHS, QEMU ИСКЛЮЧЁН ===
+    - Пользователь: "Стоп мы работаем с bochs добавь это в правило,
+      qemu мы выкидываем из проекта полностью!!"
+    - .kodaruls: добавлено правило 8 — эмулятор СТРОГО Bochs
+      (bochs-bin/bin/bochs), QEMU полностью исключён.
+    - KODA.md: таблица зависимостей (QEMU → Bochs), раздел "Запуск ядра"
+      (варианты QEMU удалены, остался один: Bochs), тестирование,
+      правила (8 пунктов), план развития.
+    - make_iso.sh: "Run manually with your QEMU command" → Bochs.
+    - plan.txt: команда запуска → ./bochs-bin/bin/bochs, убрано QEMU.
+    - debug_kernel.sh: блок запуска QEMU заменён на Bochs (скрипт
+      устарел — GRUB вместо Limine, оставлен для истории).
+    - Исходники (комментарии): serial.rs (qemu.log→bochs_serial.log),
+      main.rs (qemu.log→bochs_serial.log), process.rs (QEMU exit→Bochs reset),
+      terminal.rs (2 места), shell.rs (2 места).
+    - my_kernel.log: ИСТОРИЧЕСКИЕ записи с QEMU НЕ трогаем (правило 5:
+      файл только дописывается; прошлые записи отражают прошлые решения).
+    - Сборка: release ✅ 28 warnings (известный dead_code/static_mut_refs).
+    - СЛЕДУЮЩИЙ ШАГ: пользователь должен сообщить ТЕКСТ паники ядра
+      ("через пару минут ушло в панику и крашнулось") — для диагностики.
+
+=== 2026-08-17: ДИАГНОСТИКА ПАНИКИ — LIMINE VBE CRASH ===
+    - Пользователь: "а в истории его нет?" — проверены лог-файлы Bochs.
+    - bochs_serial.log (17:47) содержит:
+        vbe: Initialising...
+        PANIC: Bound range exceeded exception at 0x1ffd001f. Error code: 0x0
+        Stacktrace: panic → except → init_idt → fdt_node_end_offset_ ...
+    - Это ПАНИКА LIMINE (загрузчика), НЕ ядра. Стектрейс содержит
+      fdt_node_end_offset_ — внутренняя функция Limine.
+    - ПРИЧИНА: bochsrc.bxrc имел vga: extension=vbe + ISO собран с fb →
+      Limine запрашивал графический 32bpp режим → term-дисплей (ncurses)
+      не поддерживает 32bpp → Limine паниковал.
+    - bochs.log (17:48) подтверждает: "VGA extension support: vbe" (строка 35),
+      CPU остался в real mode (halted) — ядро не загрузилось.
+      "Через пару минут" = время попыток Limine инициализировать VBE.
+    - СТАТУС: УЖЕ ИСПРАВЛЕНО в предыдущих итерациях:
+      * bochsrc.bxrc: vga: extension=none (VBE отключён)
+      * Сборка: --no-default-features (no-fb, Limine не запрашивает framebuffer)
+      * iso/kernel.elf (20:20): содержит "Framebuffer disabled (no-fb mode)"
+      * boot.iso (20:20): пересобран с no-fb ядром
+    - ЗАКЛЮЧЕНИЕ: перезапуск Bochs с текущими ISO+конфигом должен работать
+      без паники. Логи bochs_serial.log/bochs.log — от старого запуска (17:47).
+
+=== 2026-08-17: ВОЗВРАТ К СТАБИЛЬНОЙ КОНФИГУРАЦИИ (nogui + VBE + socket) ===
+    - Пользователь: "Да, пробуем. Мне нужно стабильное ядро!"
+    - Анализ истории (my_kernel.log строка 1240): ЕДИНСТВЕННЫЙ стабильный
+      запуск Bochs был с конфигурацией:
+      * display_library: nogui
+      * vga: extension=vbe
+      * ISO собран с fb (FramebufferRequest)
+      * com1: mode=file (только вывод, без ввода)
+      Ядро полностью загрузилось: KERNEL START → Framebuffer found →
+      Interrupts enabled → KERNEL READY → "Welcome to Malinka shell!"
+    - Проблема ввода решена через com1: mode=socket-server:
+      * Bochs слушает TCP-порт 8888
+      * Подключение из другого терминала: nc localhost 8888
+      * Двунаправленный канал: вывод ядра → nc, ввод клавиатуры → COM1
+    - bochsrc.bxrc полностью переписан:
+      * display_library: nogui (стабильный headless)
+      * vga: extension=vbe (VBE для Limine framebuffer)
+      * com1: enabled=1, mode=socket-server, dev=localhost:8888
+    - ISO пересобран в fb-режиме (make_iso.sh без no-fb):
+      * kernel.elf 220936 байт (22:45), содержит FRAMEBUFFER_REQUEST
+    - ЗАПУСК (два терминала):
+      Т1: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+      Т2: nc localhost 8888
+    - ОЖИДАНИЕ: стабильная загрузка как 17.08 + интерактивный ввод через nc.
+
+=== 2026-08-17: BOCHS РАБОТАЕТ! (nogui + VBE + socket) ===
+    - Пользователь запустил стабильную конфигурацию — РЕЗУЛЬТАТ:
+      * VBE инициализирован, framebuffer 1024x768
+      * Ядро загрузилось: KERNEL START → Framebuffer found →
+        Interrupts enabled → KERNEL READY → "Welcome to Malinka shell!"
+      * shell работает интерактивно через nc (help выполнен!)
+      * test_alloc/test_pmm/test_paging — не проверены, но команды доступны
+    - ПРОБЛЕМА: run_user → DOUBLE FAULT (ticks=2266, RIP: 0xffffffff80002ab3,
+      RSP: 0xffffffff80843028, CR2: 0x400000000000 = USER_CODE_BASE)
+    - ДИАГНОЗ (objdump run_process):
+      * RIP 0x2ab3 = инструкция iretq в run_process
+      * USER_STACK_TOP = 0x400000010000 КРАТЕН 16 → при iretq в ring 3 CPU
+        проверяет выравнивание нового RSP (Intel SDM: RSP mod 16 == 0 → #GP)
+      * #GP → нет обработчика → DOUBLE FAULT
+      * Bochs строго следует спецификации; QEMU пропускал эту проверку —
+        поэтому баг не проявлялся раньше
+    - ИСПРАВЛЕНИЕ (src/process.rs):
+      * run_process: sp = proc.stack_top - 8 (0x...FFF8 ≡ 8 mod 16,
+        соответствует SysV ABI: RSP % 16 == 8 при входе в программу)
+      * enter_ring3: комментарий — вызывающий должен передавать
+        stack ≡ 8 (mod 16)
+    - Сборка: release ✅ 28 warnings. ISO пересобран (kernel.elf 23:23).
+    - ОЖИДАНИЕ: run_user должен войти в ring 3, выполнить write + exit,
+      вернуться в shell через kernel_return_to_shell.
+    - РЕАЛЬНЫЙ РЕЗУЛЬТАТ ТЕСТА: DOUBLE FAULT ОСТАЛСЯ!
+      * RIP: 0xffffffff80002ab7 (iretq после пересборки — адрес сместился
+        на 4 байта из-за изменения кода)
+      * RSP: 0xffffffff80843028 (kernel стек, на котором выполнялся iretq)
+      * CR2: 0x400000000000 (USER_CODE_BASE — адрес новой RIP в user space)
+      * Фикс RSP (stack_top - 8) НЕ решил проблему — iretq всё ещё падает.
+    - ГИПОТЕЗА ДЛЯ ЗАВТРА (не проверена):
+      CR2 = USER_CODE_BASE → возможно #PF при попытке исполнения
+      user-кода. Причины:
+        1) P4 процесса неверно мапит user-страницы (map_page_in_p4 баг)
+        2) pmm::alloc_frame выдаёт фрейм в занятой области (P4=0x6c000
+           = 432KB — низкая память, может конфликтовать с BIOS/Limine)
+        3) NX бит выставлен (CPU Bochs поддерживает NX, но code_flags
+           не выставляет NX — должно быть ок, но проверить)
+        4) #GP от iretq (не #PF), а CR2 остался от предыдущего #PF
+      Нужно: добавить обработчик #GP и #PF в IDT для точной диагностики.
+    - СТАТУС ДНЯ:
+      ✅ Стабильная конфигурация Bochs (nogui + VBE + socket) работает
+      ✅ Ядро загружается, shell интерактивен через nc
+      ✅ syscall write/exit реализованы (но не тестированы — run_user падает)
+      ❌ run_user: DOUBLE FAULT при iretq в ring 3 (не исправлен)
+    - СЛЕДУЮЩИЙ ШАГ (завтра): диагностика #PF/#GP при iretq → ring 3.
+      Добавить обработчики #GP (вектор 13) и #PF (вектор 14) в IDT
+      с выводом CR2, RIP, error code — точная причина падения.

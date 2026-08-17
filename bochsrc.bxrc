@@ -1,10 +1,16 @@
-# Bochs configuration for malinka (режим term-дисплея)
-# Ядро собрано без framebuffer (no-fb): Limine не запрашивает 32bpp
-# графический режим, term-дисплей (ncurses) не падает.
-# Ввод: PS/2-клавиатура от term-дисплея (IRQ1).
-# Вывод: VGA text buffer 80x25 на term-дисплей + serial в файл.
-# Запуск: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
-# (iso должен быть собран: make_iso.sh no-fb или cargo build --release --no-default-features)
+# Bochs configuration for malinka (стабильный режим nogui + VBE + socket)
+# Это ГАРАНТИРОВАННО РАБОЧАЯ конфигурация (подтверждено 2026-08-17):
+#   - nogui: нет графического дисплея, нет падений term/VBE
+#   - extension=vbe: Limine корректно инициализирует framebuffer
+#   - ISO собран с fb (FramebufferRequest включён)
+#   - com1: mode=socket-server — интерактивный ввод/вывод через nc
+#
+# Запуск (два терминала):
+#   Терминал 1: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+#   Терминал 2: nc localhost 8888
+#
+# В nc виден весь serial-вывод ядра, ввод с клавиатуры → COM1 → shell.
+# Дополнительно лог пишется в bochs_serial.log (через log-опцию com1).
 
 # Память 512 MB
 megs: 512
@@ -12,12 +18,8 @@ megs: 512
 # Boot с CD-ROM
 boot: cdrom
 
-# VGA — стандартный текстовый режим (без VBE!)
-# extension=vbe включает VBE BIOS: Limine при загрузке переключает
-# в графический 32bpp режим даже без FramebufferRequest от ядра.
-# term-дисплей (ncurses) поддерживает только текстовый 80x25.
-# Без extension=vbe Bochs остаётся в текстовом режиме — term работает.
-vga: extension=none
+# VGA — VBE включён (Limine требует VBE для framebuffer)
+vga: extension=vbe
 
 # ROM images — стандартные BIOS Bochs
 romimage: file=/usr/local/share/bochs/BIOS-bochs-latest
@@ -27,13 +29,16 @@ vgaromimage: file=/usr/local/share/bochs/VGABIOS-lgpl-latest
 ata0: enabled=1, ioaddr1=0x1f0, ioaddr2=0x3f0, irq=14
 ata0-master: type=cdrom, path="boot.iso", status=inserted
 
-# Serial COM1 → файл (лог ядра через serial)
-# Ввод идёт через PS/2-клавиатуру от term-дисплея.
-com1: enabled=1, mode=file, dev="bochs_serial.log"
+# Serial COM1 — socket-server для интерактивного ввода/вывода.
+# Bochs слушает порт 8888, подключение через: nc localhost 8888
+# Вывод ядра (serial) идёт в сокет → виден в nc.
+# Ввод с клавиатуры в nc → COM1 → ядро (shell read_line через getchar).
+com1: enabled=1, mode=socket-server, dev=localhost:8888
 
-# Display library — term (ncurses-терминал)
-# Показывает VGA text buffer 80x25, клавиатура → PS/2 скан-коды.
-display_library: term
+# Display library — nogui (headless, без дисплея).
+# Стабильный режим: не падает, не требует X11/ncurses.
+# Весь ввод/вывод — через serial (socket-server).
+display_library: nogui
 
 # CPU — bx_generic с x86_64
 cpu: count=1, ips=40000000, model=bx_generic, reset_on_triple_fault=0
