@@ -1,6 +1,6 @@
 ================================================================
 ПЛАН РАЗРАБОТКИ malinka — на следующий день
-Ветка: разработка | Последний коммит: 3f9a9f6
+Ветка: разработка
 ================================================================
 
 ТЕКУЩЕЕ СОСТОЯНИЕ
@@ -8,39 +8,42 @@
 - Ядро загружается через Limine (x86_64, higher-half).
 - Прерывания стабильны: PIC, TSS/IST (Double Fault устранён).
 - Вывод: VGA 0xB8000 + Serial COM1 + Framebuffer (vesa.rs, шрифт 8x16).
-- Интерактивный shell: команды help/echo/about/tasks/clear/cursor/
-  test_alloc/test_pmm/test_paging/test_process/run_user.
+- Интерактивный shell: help/echo/about/tasks/clear/cursor/color/reboot/hlt
+  + test_alloc/test_pmm/test_paging/test_process/run_user/run_elf.
 - Аллокатор кучи: 8 МБ (linked_list_allocator).
 - PMM: bitmap 128 KB, alloc_frame/dealloc_frame.
-- Пейджинг: map_page/unmap_page/translate, create_user_p4, map_page_in_p4.
-- Процессы: create_process, enter_ring3 (IRETQ → ring 3).
-- Syscall: int 0x80 (DPL=3), syscall_handler, возврат в kernel mode.
+- Пейджинг: map_page/unmap_page/translate, create_user_p4 (higher-half),
+  map_page_in_p4, check_mapping_in_p4.
+- Процессы: create_process, create_elf_process, run_process, user_mode_entry.
+- Syscall: int 0x80 (DPL=3), syscall_entry → syscall_handler_rust (write/exit).
+- ELF-загрузчик: src/elf.rs (ET_EXEC, PT_LOAD, флаги из p_flags).
 
 ЗАДАЧИ НА СЛЕДУЮЩУЮ ИТЕРАЦИЮ (по приоритету)
 ------------------------------------------
 
-1. [ВЫПОЛНЕНО] ЧТЕНИЕ РЕГИСТРОВ В SYSCALL
-   - asm-обёртка syscall_entry (naked): сохраняет ВСЕ GPR,
-     SyscallRegisters, syscall_handler_rust читает eax/rdi/rsi/rdx.
-   - Коммит efecd0a.
+1. [ОТКРЫТО] DOUBLE FAULT ПРИ ВХОДЕ В RING 3 (run_user/run_elf)
+   - Симптом: после iretq в ring 3 → #PF (CR2=0x400000000000) → #DF.
+   - Маппинги ПРОВЕРЕНЫ: check_map кода/vga/стека = Some (замаплены верно).
+   - Значит причина НЕ в отсутствии маппинга. Гипотезы:
+     a) USER_CODE_BASE=0x400000000000 → P4[0]. После фикса create_user_p4
+        копирует только higher-half, lower-half чистый → user-код должен
+        мапиться в СОБСТВЕННЫЕ P3/P2/P1 с USER_ACCESSIBLE.
+     b) Возможно CR3 не переключён на user P4, и fetch идёт по kernel P4,
+        где 0x400000000000 НЕ замаплен → #PF (CR2=0x400000000000).
+     c) IRET frame: RIP=0x400000000000, CS=0x2b, RSP=0x40000000fff8,
+        SS=0x23, RFLAGS=0x203 — ВАЛИДНЫЙ user-фрейм.
+   - План: добавить вывод CR3 перед iretq в user_mode_entry; проверить,
+     что user_mode_entry вообще выполняется (println-маркер).
 
-2. [ВЫПОЛНЕНО] SYSCALL WRITE/EXIT
-   - write(1, buf, len): проверка fd, лимит 4096, проверка буфера через
-     translate (CR3 = user P4), посимвольный вывод, -1 при ошибке.
-   - exit(code): логирование + возврат в kernel shell через IRET-фрейм.
-   - Команда run_user обновлена: write("Hello from user mode!\n") + exit(0).
-   - ОЖИДАЕТ РУЧНОГО ТЕСТА в Bochs term.
+2. (после ring 3) ИНТЕГРАЦИЯ ТЕРМИНАЛА — print!/println! на terminal::TERMINAL
 
-3. ELF-ЗАГРУЗЧИК
-   - Парсинг ELF64 header
-   - Загрузка сегментов в адресное пространство процесса
-   - Передача управления на entry point
+3. (после ring 3) ОПТИМИЗАЦИЯ РЕНДЕРА — dirty-флаг вместо полной перерисовки
 
 4. (ЕСЛИ ОСТАНЕТСЯ ВРЕМЯ) МНОГОПРОЦЕССНОСТЬ
    - Список процессов, планировщик round-robin
    - Переключение контекста (сохранение/восстановление регистров)
 
-ПРАВИЛА (.kodaruls)
+ПРАВИЛА (.kodaruls — локальный файл, в git НЕ хранится)
 ------------------
 1. Одна операция в один момент времени.
 2. Никогда не переписываем файл — точечные исправления.
@@ -49,26 +52,35 @@
 5. Логировать в my_kernel.log (только дописывать).
 6. Новый код — бирюзовым цветом (до коммита).
 7. Объяснять рациональность предложений.
+8. Эмулятор — СТРОГО Bochs.
 
 ИЗМЕНЁННЫЕ ФАЙЛЫ (текущая сессия)
---------------------------------
-src/terminal.rs   [НОВЫЙ] — терминал 80x25, ANSI, курсор, рендер
-src/serial.rs     [+] serial_write_byte, serial_write_num
-src/vesa.rs       [+] vesa_draw_char_ex
-src/main.rs       [+] mod terminal
-my_kernel.log     [+] запись от 2026-08-13
+-------------------------------
+src/elf.rs       [НОВЫЙ] — парсер ELF64 + загрузчик PT_LOAD
+user_programs/   [НОВЫЕ] — hello.asm, hello.ld, build_user.sh, hello.elf
+src/paging.rs    [*] create_user_p4 (higher-half only), check_mapping_in_p4
+src/process.rs   [+] create_elf_process, VGA_BUFFER_ADDR, VGA-маппинг, check_map
+src/shell.rs     [+] команда run_elf
+src/main.rs      [+] mod elf
+src/interrupts.rs [+] page_fault_handler
+src/gdt.rs       [+] kernel_panic
+KODA.md          [*] обновлена под текущее состояние
+.gitignore       [+] .kodaruls (исключение)
+my_kernel.log    [+] записи от 2026-08-18
+plan.txt         [*] обновлён
 
 ФАЙЛЫ ДЛЯ ЗАВТРАШНЕЙ РАБОТЫ
 --------------------------
-src/vga.rs        — изменить макрос print! (интеграция терминала)
-src/shell.rs      — команда color, проверка работы через терминал
-src/terminal.rs   — возможные правки после тестирования
-src/main.rs       — инициализация терминала (если нужна)
+src/process.rs    — отладка ring 3: вывод CR3 перед iretq, маркер user_mode_entry
+src/paging.rs     — проверить создание P3/P2 для USER_CODE_BASE (P4[0])
+src/interrupts.rs — page_fault_handler: распечатать флаги страницы при #PF
+src/elf.rs        — возможно, добавить WRITABLE для R W сегментов (data)
 
 КОМАНДЫ СБОРКИ
 --------------
 cargo check                          — проверка компиляции
 cargo build                          — сборка
-cp target/x86_64-unknown-none/debug/malinka.iso boot.iso  (или make_iso.sh)
+./make_iso.sh no-fb                  — сборка ISO без framebuffer (Bochs term)
+./build_user.sh                      — сборка user_programs/hello.elf
 ./bochs-bin/bin/bochs -q -f bochsrc.bxrc  — запуск (вручную! только Bochs)
 ================================================================

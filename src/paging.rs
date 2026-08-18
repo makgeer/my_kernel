@@ -258,6 +258,40 @@ pub fn translate_in_p4(p4_phys: u64, virt: u64) -> Option<u64> {
     }
 }
 
+/// Диагностика: проверяет маппинг виртуального адреса в УКАЗАННОЙ P4
+/// таблице (не обязательно активной, без переключения CR3).
+///
+/// Возвращает Some(физический адрес страницы) если страница замаплена,
+/// None если хотя бы на одном уровне иерархии нет PRESENT.
+/// Используется для отладки перед запуском процесса в ring 3.
+pub fn check_mapping_in_p4(p4_phys: u64, virt: u64) -> Option<u64> {
+    let (p4_idx, p3_idx, p2_idx, p1_idx) = virt_to_indices(virt);
+
+    unsafe {
+        let p4: &PageTable = &*phys_to_virt(p4_phys);
+        let p3_entry = &p4[p4_idx];
+        if !p3_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let p3: &PageTable = &*phys_to_virt(p3_entry.addr().as_u64());
+        let p2_entry = &p3[p3_idx];
+        if !p2_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let p2: &PageTable = &*phys_to_virt(p2_entry.addr().as_u64());
+        let p1_entry = &p2[p2_idx];
+        if !p1_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let p1: &PageTable = &*phys_to_virt(p1_entry.addr().as_u64());
+        let p1e = &p1[p1_idx];
+        if !p1e.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        Some(p1e.addr().as_u64())
+    }
+}
+
 /// Мапит виртуальную страницу 4K в указанной P4 таблице (не обязательно активной).
 ///
 /// Используется при создании нового процесса: страницы мапятся в новой P4
@@ -331,10 +365,23 @@ pub fn map_page_in_p4(
 
 /// Создаёт новую P4 таблицу для пользовательского процесса.
 ///
-/// Копирует entries 256-511 из текущей (kernel) P4 — это higher-half:
-/// ядро (0xFFFFFFFF80000000), HHDM, framebuffer. Entries 0-255 (lower-half,
-/// user space) остаются пустыми — процесс получит чистое пользовательское
-/// адресное пространство.
+/// Копирует entries 256-511 (higher-half) из текущей (kernel) P4:
+/// ядро (0xFFFFFFFF80000000), HHDM, framebuffer. Эти записи указывают
+/// на существующие P3 таблицы ядра — они shared.
+///
+/// Entries 0-255 (lower-half) НЕ копируются — это пользовательское
+/// адресное пространство. Это критически важно:
+/// 1. User-код/стек мапятся в ЧИСТЫЕ P3/P2/P1 таблицы с флагом
+///    USER_ACCESSIBLE. Если скопировать kernel P4[0] (где есть VGA,
+///    identity-map и т.д.), то user-маппинги создаются в kernel P3/P2
+///    таблицах БЕЗ USER_ACCESSIBLE на верхних уровнях → ring 3 не
+///    может пройти по иерархии → #PF при первом же fetch кода.
+/// 2. Изоляция: kernel-страницы lower-half (VGA, DMA) не видны user.
+///
+/// Исключение: VGA text buffer (0xB8000) мапится в user P4 отдельно
+/// через map_page_in_p4 с kernel-флагами (U/S=0) — он нужен
+/// обработчикам прерываний (println! из #PF/#DF) при активной user CR3,
+/// но ring 3 получить к нему доступ не сможет (U/S проверяется на P1).
 ///
 /// Возвращает физический адрес новой P4 или ошибку.
 pub fn create_user_p4() -> Result<u64, &'static str> {
@@ -353,10 +400,11 @@ pub fn create_user_p4() -> Result<u64, &'static str> {
         let kernel_p4: &PageTable = &*phys_to_virt(kernel_p4_phys);
         let new_p4: &mut PageTable = &mut *phys_to_virt(new_p4_phys);
 
-        // Копируем entries 256-511 (higher-half: ядро + HHDM + framebuffer).
-        // Эти записи указывают на существующие P3 таблицы ядра — они shared.
-        // Entries 0-255 (user space) остаются нулевыми — изолированное
-        // адресное пространство для пользовательского кода.
+        // Копируем ТОЛЬКО entries 256-511 (higher-half: ядро + HHDM +
+        // framebuffer). Все записи указывают на существующие P3 таблицы
+        // ядра — они shared.
+        // Entries 0-255 (lower-half) остаются нулевыми — user-код мапится
+        // в собственные P3/P2/P1 с USER_ACCESSIBLE (см. doc-комментарий).
         for i in 256..512 {
             new_p4[i] = kernel_p4[i].clone();
         }

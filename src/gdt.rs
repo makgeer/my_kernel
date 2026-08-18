@@ -103,3 +103,29 @@ pub fn init_gdt() {
         load_tss(tss_sel);
     }
 }
+
+/// Аварийный возврат в kernel shell при критической ошибке.
+/// Вызывается из обработчика page fault при возврате из user mode.
+pub fn kernel_panic(msg: &str) -> ! {
+    use x86_64::structures::paging::PhysFrame;
+    use x86_64::registers::control::{Cr3, Cr3Flags};
+    use crate::paging;
+
+    // Восстанавливаем kernel CR3
+    let kernel_p4 = paging::kernel_p4_phys();
+    if kernel_p4 != 0 {
+        unsafe {
+            let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(kernel_p4));
+            Cr3::write(frame, Cr3Flags::empty());
+        }
+    }
+
+    crate::println!("KERNEL PANIC: {}", msg);
+    crate::println!("SS=0x{:x}, CS=0x{:x}", 
+        x86_64::instructions::segmentation::SS::get_reg().0,
+        x86_64::instructions::segmentation::CS::get_reg().0
+    );
+    loop {
+        unsafe { core::arch::asm!("hlt"); }
+    }
+}

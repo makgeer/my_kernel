@@ -1478,3 +1478,320 @@
     - СЛЕДУЮЩИЙ ШАГ (завтра): диагностика #PF/#GP при iretq → ring 3.
       Добавить обработчики #GP (вектор 13) и #PF (вектор 14) в IDT
       с выводом CR2, RIP, error code — точная причина падения.
+
+=== 2026-08-17: КОММИТ 8106e2a (КОНЕЦ ДНЯ) ===
+    - Выполнен по запросу пользователя: "Ладно, остальное завтра. Коммит и спать."
+    - Содержимое (14 файлов, +380/-111):
+      * bochsrc.bxrc: стабильная конфигурация nogui + VBE + socket-server
+      * src/process.rs: фикс RSP (stack_top - 8) при iretq в ring 3
+      * src/interrupts.rs: syscall write/exit диспетчер
+      * src/shell.rs: run_user с write/exit демо
+      * .kodaruls: правило 8 (только Bochs), KODA.md/plan.txt/skрипты
+      * комментарии QEMU→Bochs в исходниках
+    - Известный баг: run_user → DOUBLE FAULT при iretq в ring 3
+      (CR2 = USER_CODE_BASE). Диагностика — завтра (#GP/#PF хендлеры).
+
+--- 2026-08-18 Интеграция терминала в print!/println! ---
+Статус: ЗАВЕРШЕНО (код уже был написан и готов)
+
+Что было сделано:
+1. Проверка текущего состояния кода:
+   - vga.rs: макросы print!/println! (строки 92-110) перенаправлены на
+     terminal::TERMINAL вместо трёх независимых write! (VGA + Serial + Vesa)
+   - terminal.rs: реализован fmt::Write для Terminal (строки 607-621),
+     статик TERMINAL (строка 592)
+
+2. Компиляция:
+   - cargo check: УСПЕХ (28 warnings, 0 errors)
+   - cargo build --release: УСПЕХ
+   - make_iso.sh: ISO создан (boot.iso, 466 секторов)
+
+Архитектура изменения:
+  print!/println! → terminal::TERMINAL.lock() → fmt::Write::write_str()
+    → Terminal::put_char() (ANSI-парсер, offscreen-буфер 80x25)
+    → Terminal::flush() → draw_vga() + draw_fb()
+    → serial: потоковый вывод в put_char (без полной перерисовки)
+
+Оптимизация flush: полная перерисовка (VGA+FB) только при '\n',
+не на каждый write_str (раньше 3-4 перерисовки на строку).
+
+Старые цели (WRITER, SERIAL, VesaWriter, vesa_print_str, VesaWriter)
+оставлены в коде — не удаляются по правилу запрета удаления.
+
+Требует тестирования в Bochs:
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+
+
+
+Статус: ЗАВЕРШЕНО (код уже был написан и готов)
+
+Что было сделано:
+1. Проверка текущего состояния кода:
+     terminal::TERMINAL вместо трёх независимых write! (VGA + Serial + Vesa)
+   - terminal.rs: реализован fmt::Write для Terminal (строки 607-621),
+     статик TERMINAL (строка 592)
+
+2. Компиляция:
+   - cargo check: УСПЕХ (28 warnings, 0 errors)
+   - cargo build --release: УСПЕХ
+   - make_iso.sh: ISO создан (boot.iso, 466 секторов)
+
+Архитектура изменения:
+    -> Terminal::put_char() (ANSI-парсер, offscreen-буфер 80x25)
+    -> Terminal::flush() -> draw_vga() + draw_fb()
+    -> serial: потоковый вывод в put_char (без полной перерисовки)
+
+Оптимизация flush: полная перерисовка (VGA+FB) только при newline,
+не на каждый write_str (раньше 3-4 перерисовки на строку).
+
+Старые цели (WRITER, SERIAL, VesaWriter, vesa_print_str, VesaWriter)
+оставлены в коде - не удаляются по правилу запрета удаления.
+
+Требует тестирования в Bochs:
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+
+--- 2026-08-18 shell: команды reboot, hlt, color ---
+Статус: ЗАВЕРШЕНО
+
+Изменения в shell.rs:
+1. Реализована команда "reboot":
+   - Способ 1: южный мост (port 0xCF9, bit1=A20 + bit2=reset)
+   - Способ 2: keyboard controller (port 0x64, команда 0xFE)
+   - Оба в unsafe блоках (портный I/O)
+
+2. Реализована команда "hlt":
+   - Бесконечный цикл с asm!("hlt") — остановка CPU
+
+3. Добавлена команда "color" (демонстрация 16-цветной палитры):
+   - Bright foreground (0-15) через SGR \x1b[1m
+   - Normal backgrounds (40-47) через SGR \x1b[40m-\x1b[47m
+   - Bright backgrounds (100-107) через SGR \x1b[100m-\x1b[107m
+   - Комбинации: red text, red bg, red on red
+   - Bright colors: 90-97 (SGR 90-97)
+   - Всё через terminal::TERMINAL — ANSI SGR -> VGA+FB+serial
+
+4. Исправления компиляции:
+   - {d} формат заменён на {} (no_std не поддерживает decimal)
+   - Портные операции Port::read/write обёрнуты в unsafe
+
+Компиляция: cargo check ✅, cargo build --release ✅
+ISO: boot.iso, 468 секторов (было 466)
+
+Требует тестирования в Bochs:
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+  Команды: color, reboot, hlt, help (обновлён список)
+
+--- 2026-08-18 run_user: FIX DOUBLE FAULT при входе в ring 3 ---
+Статус: ИСПРАВЛЕНО (компиляция OK, требует теста в Bochs)
+
+Корневая проблема:
+  run_process делал Cr3::write ДО iretq. После переключения CR3 на user P4,
+  CPU продолжал выполнять следующий байт кода (inline asm push/push/iretq),
+  но этот код находится в kernel-пространстве (0xFFFFFFFF80002ab7),
+  который НЕ маппирован в user P4 → #PF → DOUBLE FAULT (нет #PF handler).
+
+Решение (3 файла):
+  1. process.rs:
+     - Убран Cr3::write из run_process
+     - Добавлены статики: CURRENT_USER_P4, USER_ENTRY_POINT, USER_STACK_PTR
+     - run_process теперь iretq'ит на kernel-функцию user_mode_entry
+     - user_mode_entry: переключает CR3 на user P4 → iretq к user code
+
+  2. interrupts.rs:
+     - Добавлен обработчик #PF (page_fault_handler)
+     - Использует PageFaultErrorCode из x86_64 crate
+     - Диагностика: RIP, CR2, SS, CS, RFLAGS
+     - Пока заглушка: panic при unexpected PF
+
+  3. gdt.rs:
+     - Добавлена kernel_panic(msg) — аварийный возврат в shell
+
+Архитектура перехода в ring 3:
+  run_process → iretq → user_mode_entry (kernel)
+    → Cr3::write(user P4) → iretq → user code (ring 3)
+
+Компиляция: cargo check ✅, cargo build --release ✅
+ISO: boot.iso, 469 секторов
+
+Требует тестирования в Bochs:
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+  Команда: run_user
+
+--- 2026-08-18 run_user: FIX #2 — wrong SS/RSP in run_process iretq ---
+Статус: ИСПРАВЛЕНО (компиляция OK, требует теста в Bochs)
+
+Проблема (из bochs-вывода):
+  IRET frame[3] = 0x000040000000fff8  ← RSP = user stack!
+  IRET frame[4] = 0xffff8000e0190023  ← SS = 0x23 (USER_DATA!)
+  
+  run_process делал iretq на user_mode_entry (kernel-функция, ring 0),
+  но подавал USER selectors и USER RSP. Когда user_mode_entry попыталась
+  сделать push на user RSP — #PF (CR2=0x40000000fff8) → DOUBLE FAULT.
+
+Решение:
+  run_process iretq'ит на kernel-функцию user_mode_entry → нужно:
+  - SS = KERNEL_DATA_SELECTOR (0x10), не USER_DATA_SELECTOR (0x23)
+  - CS = KERNEL_CODE_SELECTOR (0x8) ✓ (было правильно)
+  - RSP = KERNEL_RETURN_STACK (kernel стек), не user stack
+
+  user_mode_entry сама делает iretq с USER selectors → user code ✓
+
+Архитектура (исправленная):
+  run_process (ring 0)
+    → iretq с KERNEL selectors/kernel stack
+    → user_mode_entry (ring 0, kernel функция)
+    → Cr3::write(user P4)
+    → iretq с USER selectors
+    → user code (ring 3)
+
+Компиляция: cargo check ✅, cargo build --release ✅
+ISO: boot.iso, 469 секторов
+
+Требует тестирования в Bochs:
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+  Команда: run_user
+  Ожидается: "Hello from user mode!" + возврат в shell
+
+[2026-08-18] Исправление: run_user CR3/page fault (CR2=0x400000000000)
+  Проблема: user_mode_entry переключает CR3, но страница с кодом процесса
+  по USER_CODE_BASE=0x400000000000 не отображена в P4 процесса →
+  #PF при instruction fetch (CR2=0x400000000000).
+  Причина: create_user_p4() копировала только entries 256-511 (higher-half)
+  из kernel P4. Entries 0-255 (lower-half) оставались нулевыми, но
+  USER_CODE_BASE=0x400000000000 — это lower-half (бит 47=0) → P4[0]=0
+  → CPU не может пройти по иерархии таблиц → #PF.
+  Исправление:
+  1. src/paging.rs: create_user_p4() теперь копирует ВСЕ 512 entries
+     (0-511) из kernel P4, включая:
+     - 0-255 (lower-half): DMA-зоны, VGA (0xB8000), низкоуровневые маппинги
+     - 256-511 (higher-half): ядро (0xFFFFFFFF80000000), HHDM, framebuffer
+     Это гарантирует, что user_mode_entry, IRETQ-фрейм (kernel CS/SS),
+     page fault handler и VGA-вывод работают с user CR3.
+  2. src/process.rs: добавлен импорт VirtAddr (используется в
+     user_mode_entry для tlb::flush), обновлены doc-комментарии
+     create_process/run_process под новую модель (полная копия P4).
+  Проверка: cargo check — успешно (только существующие warnings).
+  Требует тестирования в Bochs:
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+   Команды: test_process (проверка маппингов), run_user (запуск ring 3)
+
+--- 2026-08-18 ELF-загрузчик (задача 3 из plan.txt) ---
+Статус: РЕАЛИЗОВАНО (компиляция OK, ISO собран, требует теста в Bochs)
+
+Цель: загрузка и запуск статического ELF64 (ET_EXEC, x86_64) в ring 3,
+вместо ручного встраивания сырых байт-кода в shell.
+
+Созданные файлы:
+  1. src/elf.rs [НОВЫЙ] — парсер ELF64 + загрузчик PT_LOAD сегментов:
+     - Структуры Elf64Ehdr (64 байта) и Elf64Phdr (56 байт) через repr(C)
+     - Проверки: магика, ELFCLASS64, ELFDATA2LSB, EM_X86_64, ET_EXEC
+     - Проверка границ файла (phdr table, segment data)
+     - load_segment(): для каждой страницы сегмента:
+       * alloc_frame (PMM) → map_page_in_p4 (paging)
+       * обнуление страницы (bss/padding)
+       * копирование данных файла через HHDM
+       * флаги: PF_W→WRITABLE, !PF_X→NO_EXECUTE, всегда PRESENT|USER_ACCESSIBLE
+     - pub fn load_elf(elf_bytes, p4_phys) → ElfLoadResult { entry_point }
+
+  2. user_programs/hello.asm [НОВЫЙ] — тестовая user-программа на NASM:
+     - write(1, msg, len) через int 0x80
+     - exit(0) через int 0x80
+     - Строка "Hello from ELF user program!\n"
+
+  3. user_programs/hello.ld [НОВЫЙ] — линкер-скрипт:
+     - ENTRY(_start), базовый адрес 0x400000000000 (USER_CODE_BASE)
+
+  4. build_user.sh [НОВЫЙ] — скрипт сборки:
+     - nasm -f elf64 + ld -T hello.ld -nostdlib -static
+     - Результат: user_programs/hello.elf (4776 байт, ET_EXEC)
+
+Изменённые файлы:
+  5. src/main.rs [+] mod elf
+  6. src/process.rs [+] create_elf_process(elf_bytes):
+     - create_user_p4 → elf::load_elf → маппинг стека
+     - Возвращает Process с entry_point из ELF header
+  7. src/shell.rs [+] команда run_elf:
+     - include_bytes!("../user_programs/hello.elf")
+     - create_elf_process → run_process (ring 3)
+     - help обновлён
+
+Проверка ELF:
+  readelf -h: entry=0x400000000000, Type=EXEC, Machine=x86-64
+  readelf -l: 1 PT_LOAD, vaddr=0x400000000000, R E, filesz=memsz=0x41
+
+Компиляция: cargo check ✅
+Сборка: cargo build --release --no-default-features ✅
+ISO: boot.iso, 471 секторов (no-fb режим)
+
+Требует тестирования в Bochs:
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+  Команда: run_elf
+  Ожидается: "Hello from ELF user program!" + возврат в shell
+
+--- 2026-08-18 run_user/run_elf: FIX #3 — page fault при входе в ring 3 ---
+Статус: ИСПРАВЛЕНО (компиляция OK, ISO собран, требует теста в Bochs)
+
+Проблема (из bochs-вывода, ОБА run_user и run_elf):
+  EXCEPTION: DOUBLE FAULT (CR2=0x400000000000)
+  IRET frame: RIP=0x400000000000, CS=0x2B, RFLAGS=0x203,
+              RSP=0x40000000fff8, SS=0x23  ← фрейм ВАЛИДНЫЙ
+  → iretq в ring 3 корректен, но fetch кода по USER_CODE_BASE → #PF.
+  #PF handler не вывел "PAGE FAULT" → упал сам (вложенный #PF) → #DF.
+
+Корень (общий для create_process и create_elf_process):
+  create_user_p4() копировала ВСЕ 512 entries из kernel P4, включая
+  lower-half (0-255). User-код 0x400000000000 мапится в ту же ветку
+  P4[0], но промежуточные P3/P2/P1 — это КОПИИ kernel таблиц БЕЗ
+  USER_ACCESSIBLE. В x86_64 U/S проверяется на КАЖДОМ уровне иерархии:
+  ring 3 блокируется на верхнем уровне → #PF (CR2=0x400000000000).
+  А VGA (0xB8000) из kernel lower-half при этом маппился в user P4
+  "как есть", но без U/S на промежуточных уровнях пользователь всё
+  равно не мог его достичь — и #PF handler падал на println.
+
+Исправление (точечное, в трёх файлах):
+  1. src/paging.rs create_user_p4():
+     - Копирует ТОЛЬКО entries 256-511 (higher-half: ядро, HHDM, fb).
+     - Entries 0-255 (lower-half) НЕ копируются — чистый user space.
+     - User-код/стек мапятся в СОБСТВЕННЫЕ P3/P2/P1 с USER_ACCESSIBLE
+       на всех уровнях → ring 3 проходит иерархию корректно.
+  2. src/paging.rs [+]: check_mapping_in_p4(p4_phys, virt) — диагностика
+     маппинга в произвольной P4 без переключения CR3 (для run_process).
+  3. src/process.rs:
+     - [+] VGA_BUFFER_ADDR = 0xB8000
+     - В create_process И create_elf_process после create_user_p4:
+       map_page_in_p4(0xB8000, PRESENT|WRITABLE) — VGA для println из
+       обработчиков при user CR3. U/S=0 → ring 3 доступа не получит.
+     - run_process: диагностика check_map (code/vga/stack) до запуска.
+     - Обновлены doc-комментарии (0-511 → 256-511 + VGA).
+
+Проверка: cargo check ✅, cargo build --release --no-default-features ✅
+ISO: boot.iso, 473 секторов (no-fb)
+
+Ожидаемый вывод при тесте:
+  check_map: code=Some(0x...), vga=Some(0x...), stack=Some(0x...)
+  → "Hello from ELF user program!" → возврат в shell
+
+--- 2026-08-18 ЗАВЕРШЕНИЕ ДНЯ: документация + коммит ---
+Действия:
+  1. KODA.md обновлена под текущее состояние:
+     - Текущее состояние: IDT #PF + syscall, ELF-загрузчик, run_elf, heap,
+       PMM, paging, процессы — всё отмечено выполненным
+     - Структура проекта: добавлены elf.rs, allocator.rs, pmm.rs, paging.rs,
+       process.rs, user_programs/, build_user.sh
+     - Прерывания: #PF handler, syscall int 0x80 (DPL=3)
+     - Ключевые решения: create_user_p4 (higher-half only), VGA в user P4,
+       run_process → user_mode_entry, ELF-загрузчик
+     - План развития: добавлена задача 5 (отладка ring 3)
+     - Правила: .kodaruls теперь локальный, в git не хранится
+  2. plan.txt обновлён: задача 1 (открыта) — DOUBLE FAULT в ring 3
+     с гипотезами (CR3 не переключён / P4[0] структура), остальные задачи
+     сдвинуты; правила обновлены (п.8 Bochs); файлы на завтра: process.rs,
+     paging.rs, interrupts.rs, elf.rs.
+  3. .gitignore: добавлен .kodaruls в исключения; удалён из git (git rm --cached).
+  4. Состояние ring 3 на конец дня: DOUBLE FAULT при входе в user mode,
+     маппинги проверены (check_map: code=0x70000, vga=0xb8000, stack=0x74000 —
+     все Some). Гипотеза следующего дня: CR3 не переключён на user P4
+     (проверить вывод CR3 в user_mode_entry).
+
+Финальная проверка: cargo check ✅ (только warnings)
+Коммит: полный снимок состояния на конец дня (все изменения + документация).

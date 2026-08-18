@@ -12,6 +12,7 @@
 use x86_64::structures::paging::page_table::PageTableFlags;
 use x86_64::structures::paging::PhysFrame;
 use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::VirtAddr;
 use crate::pmm;
 use crate::paging;
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
@@ -25,6 +26,24 @@ pub const USER_CODE_BASE: u64 = 0x4000_0000_0000; // 0x0000400000000000
 /// Растёт вниз от вершины.
 pub const USER_STACK_TOP: u64 = 0x4000_0001_0000; // 0x0000400000010000
 pub const USER_STACK_SIZE: usize = 4 * 1024; // 4 страницы = 16 KB
+
+/// VGA text buffer (0xB8000) — kernel-страница, которую нужно замапить
+/// в P4 процесса. При активной user CR3 обработчики прерываний
+/// (#PF, #DF, syscall) выполняются с ЭТОЙ P4 и вызывают println!,
+/// который пишет в VGA. Мапится с U/S=0 — ring 3 доступа не получит
+/// (U/S проверяется на уровне P1, где стоит только PRESENT|WRITABLE).
+pub const VGA_BUFFER_ADDR: u64 = 0xB8000;
+
+/// Глобальный указатель на P4 текущего пользовательского процесса.
+/// Используется page fault handler для переключения CR3 при входе
+/// в user mode (iretq выполняется с kernel CR3, PF handler переключает).
+static mut CURRENT_USER_P4: u64 = 0;
+
+/// Точка входа пользовательского процесса (для user_mode_entry).
+static mut USER_ENTRY_POINT: u64 = 0;
+
+/// Вершина пользовательского стека (для user_mode_entry).
+static mut USER_STACK_PTR: u64 = 0;
 
 /// Структура процесса.
 #[derive(Clone, Copy)]
@@ -47,14 +66,26 @@ pub struct Process {
 /// Структуру Process или сообщение об ошибке.
 ///
 /// # Что делает
-/// 1. Создаёт новую P4 (create_user_p4) с копией kernel-маппингов
-/// 2. Выделяет физические фреймы для кода и стека
-/// 3. Мапит код в USER_CODE_BASE с PRESENT | USER_ACCESSIBLE
-/// 4. Мапит стек ниже USER_STACK_TOP с PRESENT | WRITABLE | USER_ACCESSIBLE
-/// 5. Копирует код в выделенные фреймы через HHDM
+/// 1. Создаёт новую P4 (create_user_p4): копия higher-half kernel
+///    маппингов (256-511), нижняя половина — чистая (user space)
+/// 2. Мапит VGA buffer (0xB8000) с U/S=0 — для println из обработчиков
+/// 3. Выделяет физические фреймы для кода и стека
+/// 4. Мапит код в USER_CODE_BASE с PRESENT | USER_ACCESSIBLE
+/// 5. Мапит стек ниже USER_STACK_TOP с PRESENT | WRITABLE | USER_ACCESSIBLE
+/// 6. Копирует код в выделенные фреймы через HHDM
 pub fn create_process(code: &[u8], entry_offset: u64) -> Result<Process, &'static str> {
     // 1. Создаём изолированную P4 таблицу
     let p4_phys = paging::create_user_p4()?;
+
+    // VGA text buffer: нужен обработчикам прерываний (#PF, #DF, syscall),
+    // которые при активной user P4 вызывают println!. U/S=0 — ring 3
+    // получить доступ к VGA не сможет (U/S проверяется на P1).
+    paging::map_page_in_p4(
+        p4_phys,
+        VGA_BUFFER_ADDR,
+        VGA_BUFFER_ADDR,
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+    )?;
 
     // 2. Выделяем и мапим страницы для кода
     // Сколько страниц нужно для кода
@@ -118,6 +149,61 @@ pub fn create_process(code: &[u8], entry_offset: u64) -> Result<Process, &'stati
     })
 }
 
+/// Создаёт новый процесс из ELF64-файла.
+///
+/// # Аргументы
+/// - `elf_bytes` — сырые байты ELF64 (ET_EXEC, x86_64), например из
+///   `include_bytes!` встроенного в ядро файла.
+///
+/// # Что делает
+/// 1. Создаёт новую P4 (create_user_p4) с копией всех kernel-маппингов
+/// 2. Загружает PT_LOAD сегменты через elf::load_elf (PMM + paging + копия данных)
+/// 3. Выделяет и мапит пользовательский стек (USER_STACK_SIZE страниц)
+/// 4. Возвращает Process с entry_point из ELF header (e_entry)
+///
+/// В отличие от create_process (сырые байты кода по фиксированному
+/// USER_CODE_BASE), здесь виртуальные адреса сегментов берутся из самого
+/// ELF — процесс может загрузиться по любому адресу, заданному линкером.
+pub fn create_elf_process(elf_bytes: &[u8]) -> Result<Process, &'static str> {
+    // 1. Создаём изолированную P4 таблицу
+    let p4_phys = paging::create_user_p4()?;
+
+    // VGA text buffer: нужен обработчикам прерываний при активной user P4
+    // (см. комментарий в create_process). U/S=0 — ring 3 не получит доступ.
+    paging::map_page_in_p4(
+        p4_phys,
+        VGA_BUFFER_ADDR,
+        VGA_BUFFER_ADDR,
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+    )?;
+
+    // 2. Загружаем сегменты ELF в адресное пространство процесса
+    let load_result = crate::elf::load_elf(elf_bytes, p4_phys)?;
+
+    // 3. Выделяем и мапим стек (растёт вниз от USER_STACK_TOP)
+    let stack_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let stack_pages = USER_STACK_SIZE / 4096;
+
+    for i in 0..stack_pages {
+        let phys = pmm::alloc_frame().ok_or("create_elf_process: OOM for stack page")?;
+        // Стек растёт вниз: верхняя страница у USER_STACK_TOP - 4K,
+        // следующая ниже и т.д.
+        let virt = USER_STACK_TOP - ((i + 1) as u64) * 4096;
+        paging::map_page_in_p4(p4_phys, virt, phys, stack_flags)?;
+    }
+
+    println!(
+        "ELF process created: P4=0x{:016x}, entry=0x{:016x}, stack_top=0x{:016x}",
+        p4_phys, load_result.entry_point, USER_STACK_TOP
+    );
+
+    Ok(Process {
+        p4_phys,
+        entry_point: load_result.entry_point,
+        stack_top: USER_STACK_TOP,
+    })
+}
+
 /// Переход в ring 3 (user mode) через IRETQ.
 ///
 /// # Что делает
@@ -167,34 +253,49 @@ pub unsafe extern "C" fn enter_ring3(entry: u64, stack: u64) -> ! {
 /// После возврата из user mode (через прерывание) нужно восстановить
 /// kernel CR3 — это будет в обработчике syscall.
 ///
-/// ВАЖНО: после Cr3::write НЕЛЬЗЯ вызывать println! — VGA буфер (0xB8000)
-/// находится в lower-half (P4 index 0), который НЕ скопирован в user P4.
-/// Любая запись в VGA → page fault → нет обработчика → double fault →
-/// double fault handler тоже пишет в VGA → triple fault → Bochs reset.
+/// ВАЖНО: P4 процесса содержит higher-half kernel-маппинги (256-511:
+/// ядро, HHDM, framebuffer) + VGA buffer (0xB8000, U/S=0). Поэтому после
+/// переключения CR3 kernel-функции (println!, VGA-вывод) работают
+/// корректно, а ring 3 изолирован в чистой lower-half (user space).
+///
+/// Порядок выполнения:
+/// 1. run_process формирует IRETQ-фрейм на kernel-стеке
+/// 2. iretq → user_mode_entry (с kernel CS/SS, kernel CR3)
+/// 3. user_mode_entry переключает CR3 на user P4
+/// 4. user_mode_entry формирует новый IRETQ-фрейм с USER CS/SS
+/// 5. iretq → user code (с USER CS/SS, user CR3)
 pub fn run_process(proc: &Process) {
-    // Печатаем ДО переключения CR3 — потом VGA будет недоступен.
-    println!("Switching CR3 to user P4, entering ring 3...");
+    // Печатаем ДО перехода — потом kernel P4 неактивна.
+    println!("Launching ring 3 at entry 0x{:016x}...", proc.entry_point);
 
-    // Переключаем CR3 на P4 процесса.
-    // Флаги CR3: PCD=0, PWT=0 (normal caching).
-    // ПОСЛЕ ЭТОЙ СТРОКИ НИКАКИХ println! — user P4 не содержит VGA mapping.
+    // Диагностика маппингов в P4 процесса (до переключения CR3):
+    // код, VGA и верхняя страница стека должны быть замаплены.
+    let code_map = paging::check_mapping_in_p4(proc.p4_phys, proc.entry_point);
+    let vga_map = paging::check_mapping_in_p4(proc.p4_phys, VGA_BUFFER_ADDR);
+    let stack_map = paging::check_mapping_in_p4(proc.p4_phys, proc.stack_top - 8);
+    println!(
+        "  check_map: code=0x{:x?}, vga=0x{:x?}, stack=0x{:x?}",
+        code_map, vga_map, stack_map
+    );
+
+    // Сохраняем параметры процесса в статиках для user_mode_entry.
     unsafe {
-        let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(proc.p4_phys));
-        Cr3::write(frame, x86_64::registers::control::Cr3Flags::empty());
+        CURRENT_USER_P4 = proc.p4_phys;
+        USER_ENTRY_POINT = proc.entry_point;
+        USER_STACK_PTR = proc.stack_top;
+    }
 
-        // Переходим в user mode напрямую через inline asm.
-        // Формируем IRETQ-фрейм на текущем (kernel) стеке:
-        // порядок (снизу вверх): SS, RSP, RFLAGS, CS, RIP
-        // Инлайн избегает проблем с prologue extern "C" функции.
-        //
-        // ВАЖНО про RSP (stack_top - 8): iretq в ring 3 требует, чтобы
-        // НОВЫЙ RSP (из фрейма) был выровнен на 16 байт (RSP mod 16 != 0).
-        // USER_STACK_TOP = 0x400000010000 кратен 16 → iretq генерирует
-        // #GP(0) → нет обработчика #GP → DOUBLE FAULT. Bochs строго
-        // следует спецификации (QEMU это пропускал).
-        // stack_top - 8 = 0x...FFF8 ≡ 8 (mod 16) — соответствует SysV ABI
-        // (RSP % 16 == 8 при входе в программу) и лежит в замапленной
-        // странице (верхняя страница стека 0x...F000..0x...FFFF).
+    // iretq → user_mode_entry (kernel функция).
+    // user_mode_entry переключит CR3 и перейдёт к user code.
+    // order (снизу вверх): SS, RSP, RFLAGS, CS, RIP
+    //
+    // ВАЖНО: user_mode_entry — это kernel-функция (ring 0), поэтому
+    // SS и CS должны быть KERNEL selectors, а RSP — kernel stack.
+    // user_mode_entry сама создаст IRETQ-фрейм с USER selectors.
+    unsafe {
+        // Берём вершину KERNEL_RETURN_STACK для iretq
+        let kernel_stack = crate::gdt::KERNEL_RETURN_STACK.as_ptr() as u64
+            + crate::gdt::KERNEL_RETURN_STACK.len() as u64;
         core::arch::asm!(
             "push {ss}",
             "push {sp}",
@@ -202,13 +303,50 @@ pub fn run_process(proc: &Process) {
             "push {cs}",
             "push {rip}",
             "iretq",
-            ss = in(reg) USER_DATA_SELECTOR,
-            sp = in(reg) proc.stack_top - 8,
-            cs = in(reg) USER_CODE_SELECTOR,
-            rip = in(reg) proc.entry_point,
+            ss = in(reg) crate::gdt::KERNEL_DATA_SELECTOR,
+            sp = in(reg) kernel_stack,
+            cs = in(reg) crate::gdt::KERNEL_CODE_SELECTOR,
+            rip = in(reg) user_mode_entry as u64,
             options(noreturn)
         );
     }
+}
+
+/// Переход в user mode с переключением CR3.
+/// Вызывается из iretq после run_process.
+/// Переключает CR3 на user P4, затем iretq к user code.
+#[allow(improper_ctypes_definitions)]
+pub unsafe extern "C" fn user_mode_entry() -> ! {
+    let p4_phys = CURRENT_USER_P4;
+    let entry = USER_ENTRY_POINT;
+    let stack = USER_STACK_PTR;
+    
+    // Переключаем CR3 на user P4
+    if p4_phys != 0 {
+        let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(p4_phys));
+        Cr3::write(frame, x86_64::registers::control::Cr3Flags::empty());
+        // КРИТИЧЕСКИ: инвалидируем TLB после переключения CR3!
+        // Без invlpg CPU использует stale entries из kernel P4,
+        // что приводит к page fault при instruction fetch по USER_CODE_BASE.
+        x86_64::instructions::tlb::flush(VirtAddr::new(USER_CODE_BASE));
+    }
+
+    // Теперь выполняем iretq с user CR3 → user code.
+    // Формируем IRETQ-фрейм на текущем стеке:
+    // SS, RSP, RFLAGS, CS, RIP
+    core::arch::asm!(
+        "push {ss}",
+        "push {sp}",
+        "pushfq",
+        "push {cs}",
+        "push {rip}",
+        "iretq",
+        ss = in(reg) USER_DATA_SELECTOR,
+        sp = in(reg) stack - 8,
+        cs = in(reg) USER_CODE_SELECTOR,
+        rip = in(reg) entry,
+        options(noreturn)
+    );
 }
 
 /// Восстанавливает kernel CR3 после возврата из user mode.

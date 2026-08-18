@@ -94,16 +94,49 @@ pub fn shell() {
                 println!("  about   - about this kernel");
                 println!("  tasks   - run the task scheduler demo");
                 println!("  cursor  - show terminal cursor position");
+                println!("  color   - 16-color palette demo (ANSI SGR)");
                 println!("  test_alloc - test heap allocator (Box/Vec/String)");
                 println!("  test_pmm  - test physical memory manager (alloc/dealloc frames)");
                 println!("  test_paging - test page mapping (map/unmap/translate)");
                 println!("  test_process - create user process (P4, code, stack)");
                 println!("  run_user   - create and run user process in ring 3");
+                println!("  run_elf    - load and run ELF64 user program (ring 3)");
             }
             "about" => {
                 println!("Malinka v0.1.0");
                 println!("x86_64 OS kernel written in Rust");
                 println!("Bootloader: Limine");
+            }
+            "reboot" => {
+                println!("Rebooting...");
+                // Порт 0x604 — клавиатурный контроллер, бит 0 (A20) + reset.
+                // Порт 0xCF9 — южный мост (chipset reset port).
+                unsafe {
+                    // Способ 1: южный мост (CF9)
+                    let mut port = x86_64::instructions::port::Port::<u8>::new(0xCF9);
+                    let val = port.read();
+                    port.write(val | 0x6); // bit1=A20, bit2=reset
+                }
+                // Способ 2: клавиатурный контроллер (fallback)
+                loop {
+                    unsafe {
+                        let mut port = x86_64::instructions::port::Port::<u8>::new(0x64);
+                        loop {
+                            let st = port.read();
+                            if st & 0x1 == 0 { break; }
+                        }
+                        port.write(0xFE); // keyboard reset
+                    }
+                    for _ in 0..100000 {
+                        unsafe { core::arch::asm!("nop"); }
+                    }
+                }
+            }
+            "hlt" => {
+                println!("Halting CPU...");
+                loop {
+                    unsafe { core::arch::asm!("hlt"); }
+                }
             }
             "tasks" | "task" => {
                 // Запускаем одну итерацию планировщика как демонстрацию
@@ -422,6 +455,66 @@ pub fn shell() {
                         println!("  FAILED: create_process error: {}", e);
                     }
                 }
+            }
+            "run_elf" => {
+                // Загрузка и запуск ELF64-программы в ring 3.
+                // ELF встраивается в ядро через include_bytes! на этапе сборки.
+                // Точка входа берётся из ELF header (e_entry), сегменты
+                // загружаются по адресам из PT_LOAD program headers.
+                //
+                // Сборка user-программы: ./build_user.sh
+                // → user_programs/hello.elf (ET_EXEC, x86_64, static)
+                static HELLO_ELF: &[u8] = include_bytes!("../user_programs/hello.elf");
+
+                println!("Loading ELF user program ({} bytes)...", HELLO_ELF.len());
+
+                match crate::process::create_elf_process(HELLO_ELF) {
+                    Ok(proc) => {
+                        println!("Launching ELF ring 3 at entry 0x{:016x}...", proc.entry_point);
+                        crate::process::run_process(&proc);
+                        // Сюда не вернёмся — run_process noreturn,
+                        // возврат идёт через kernel_return_to_shell.
+                    }
+                    Err(e) => {
+                        println!("  FAILED: create_elf_process error: {}", e);
+                    }
+                }
+            }
+            "color" => {
+                // Демонстрация 16-цветной палитры ANSI SGR.
+                // Цвета печатаются на framebuffer (шрифт 8x16) + VGA + serial.
+                println!("16-Color Palette Demo:");
+                for normal_fg in 0..8u8 {
+                    for bright_fg in 0..8u8 {
+                        print!("\x1b[1m{:2}\x1b[0m ", normal_fg + bright_fg);
+                    }
+                    println!();
+                }
+                println!();
+                // Цветные фоны
+                println!("Background colors:");
+                for bg in 0..8u8 {
+                    print!("\x1b[4{}m  {:2}  \x1b[0m ", 40 + bg, bg);
+                }
+                println!();
+                for bg in 8..16u8 {
+                    print!("\x1b[10{}m  {:2}  \x1b[0m ", 40 + bg - 8, bg);
+                }
+                println!();
+                // Комбинации
+                println!();
+                println!("Combinations:");
+                println!("\x1b[31mRed text on default\x1b[0m");
+                println!("\x1b[41mRed background\x1b[0m");
+                println!("\x1b[31m\x1b[41mRed on Red\x1b[0m");
+                println!("\x1b[90mBright black\x1b[0m");
+                println!("\x1b[91mBright red\x1b[0m");
+                println!("\x1b[92mBright green\x1b[0m");
+                println!("\x1b[93mBright yellow\x1b[0m");
+                println!("\x1b[94mBright blue\x1b[0m");
+                println!("\x1b[95mBright magenta\x1b[0m");
+                println!("\x1b[96mBright cyan\x1b[0m");
+                println!("\x1b[97mBright white\x1b[0m");
             }
             "" => {
                 // Пустая команда — просто перенос строки

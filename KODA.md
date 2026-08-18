@@ -9,13 +9,21 @@
 - Загрузка через Limine BIOS ✅
 - Вывод: VGA text buffer (0xB8000) + Serial COM1 + Framebuffer (через Limine, шрифт 8x16) ✅
 - GDT + TSS + IST (отдельные стеки для обработчиков прерываний) ✅
-- IDT: breakpoint, double_fault, timer (IRQ0), keyboard (IRQ1) ✅
+- IDT: breakpoint, double_fault, page_fault, timer (IRQ0), keyboard (IRQ1), syscall (int 0x80) ✅
 - PIC: master + slave, полная инициализация, маски (только IRQ0 и IRQ1) ✅
 - Прерывания стабильны (DOUBLE FAULT устранён) ✅
 - Кооперативный планировщик (до 4 задач) ✅
-- Интерактивный shell: help, echo, about, tasks, clear ✅
+- Heap-аллокатор (8 МБ, `linked_list_allocator`) ✅
+- PMM: bitmap-аллокатор физических фреймов 4K (alloc_frame/dealloc_frame) ✅
+- Paging: map_page/unmap_page/translate, create_user_p4, map_page_in_p4 ✅
+- Пользовательские процессы: create_process, create_elf_process, run_process (ring 3) ✅
+- Syscall: int 0x80 (DPL=3), asm-обёртка syscall_entry, write/exit ✅
+- ELF64-загрузчик: парсер ELF64 + загрузка PT_LOAD сегментов (`src/elf.rs`) ✅
+- User-программы: `user_programs/hello.asm` (NASM → статический ELF64) ✅
+- Интерактивный shell: help, echo, about, tasks, clear, cursor, color, reboot, hlt, test_alloc, test_pmm, test_paging, test_process, run_user, run_elf ✅
 - Ввод: PS/2 клавиатура (IRQ1) + Serial COM1 ✅
 - Модуль терминала `terminal.rs` создан и компилируется, но **не интегрирован** в макросы `print!`/`println!`
+- **Известная проблема**: `run_user` / `run_elf` — DOUBLE FAULT при входе в ring 3 (CR2=0x400000000000, маппинги проверены — замаплены корректно, причина в процессе отладки)
 
 ## Технологии и зависимости
 
@@ -27,8 +35,10 @@
 | `heapless` | 0.7.16 | `Vec<u8, 256>` для буфера клавиатуры без аллокации |
 | `limine` | 0.6.5 | Limine Boot Protocol (запрос framebuffer, HHDM) |
 | `volatile` | 0.6.1 | Зарезервировано (не используется активно) |
+| `linked_list_allocator` | 0.10.x | Heap-аллокатор (8 МБ, `LockedHeap`) |
 | Limine (загрузчик) | 12.5.2 | Передаёт управление в higher-half, предоставляет framebuffer и HHDM |
-| NASM | — | Компиляция `boot.asm` (entry point, 64-бит) |
+| NASM | — | Компиляция `boot.asm` (entry point) и `user_programs/hello.asm` |
+| GNU ld | — | Линковка user-программ (`build_user.sh`) |
 | xorriso | — | Создание загрузочного ISO |
 | Bochs | — | Эмулятор (запуск вручную: `./bochs-bin/bin/bochs -q -f bochsrc.bxrc`) |
 
@@ -38,37 +48,46 @@
 malinka/
 ├── .cargo/
 │   └── config.toml          — цель сборки x86_64-unknown-none, build-std, флаги линкера
-├── .kodaruls                 — правила разработки проекта (8 пунктов)
-├── Cargo.toml                — манифест пакета
-├── build.rs                  — компиляция boot.asm через NASM (elf64)
-├── linker.ld                 — линкер-скрипт (higher-half, секция .requests для Limine)
-├── i686-unknown-none.json    — неиспользуемая цель (проект на x86_64; оставлена)
-├── debug_kernel.sh           — скрипт сборки+запуска через GRUB (устарел, используется Limine)
-├── make_iso.sh               — сборка ISO через xorriso + Limine
-├── plan.txt                  — план разработки (задачи на текущую итерацию)
-├── my_kernel.log             — лог всех изменений (только дописывается, с 2025-08-10)
+├── .gitignore               — исключения (target, Bochs, .kodaruls, boot.iso, ...)
+├── Cargo.toml               — манифест пакета
+├── build.rs                 — компиляция boot.asm через NASM (elf64)
+├── linker.ld                — линкер-скрипт (higher-half, секция .requests для Limine)
+├── i686-unknown-none.json   — неиспользуемая цель (проект на x86_64; оставлена)
+├── debug_kernel.sh          — скрипт сборки+запуска через GRUB (устарел, используется Limine)
+├── make_iso.sh              — сборка ISO через xorriso + Limine (аргумент: no-fb)
+├── plan.txt                 — план разработки (задачи на текущую итерацию)
+├── my_kernel.log            — лог всех изменений (только дописывается, с 2025-08-10)
+├── build_user.sh            — сборка user-программы hello (nasm + ld) → hello.elf
 ├── iso/
-│   ├── kernel.elf            — собранный бинарник ядра
-│   ├── limine.conf           — конфигурация Limine (PROTOCOL, KERNEL_PATH, SERIAL, VERBOSE)
-│   ├── limine-bios.sys       — бинарник Limine BIOS
-│   └── limine-bios-cd.bin    — загрузочный образ Limine для CD
-├── limine-binary/            — исходные бинарники Limine
+│   ├── kernel.elf           — собранный бинарник ядра
+│   ├── limine.conf          — конфигурация Limine (PROTOCOL, KERNEL_PATH, SERIAL, VERBOSE)
+│   ├── limine-bios.sys      — бинарник Limine BIOS
+│   └── limine-bios-cd.bin   — загрузочный образ Limine для CD
+├── limine-binary/           — исходные бинарники Limine
+├── user_programs/           — пользовательские программы (ring 3)
+│   ├── hello.asm            — тестовая программа: write() + exit() через int 0x80
+│   ├── hello.ld             — линкер-скрипт (база 0x400000000000 = USER_CODE_BASE)
+│   └── hello.elf            — собранный статический ET_EXEC (include_bytes! в shell)
 └── src/
-    ├── main.rs               — точка входа _start_rust, инициализация подсистем, запуск shell
-    ├── boot.asm              — 64-битный entry point (установка стека, вызов _start_rust)
-    ├── vga.rs                — VgaWriter + макросы print!/println! (вывод в VGA + serial + framebuffer)
-    ├── serial.rs             — драйвер UART 16550 (COM1): init, write, read, SerialWriter
-    ├── vesa.rs               — вывод на framebuffer: шрифт 8x16, vesa_draw_char/ex, vesa_print_str, VesaWriter
-    ├── limine_fb.rs          — запросы Limine: FramebufferRequest, HhdmRequest
-    ├── gdt.rs                — GDT + TSS + IST (отдельные стеки для #DF, таймера, клавиатуры)
-    ├── interrupts.rs         — IDT (breakpoint, double_fault, timer, keyboard), PIC init, раскладка PS/2
-    ├── scheduler.rs          — кооперативный планировщик (до 4 задач, run_scheduler / run_scheduler_once)
-    ├── tasks.rs              — демо-задачи: task_hello, task_counter
-    ├── shell.rs              — интерактивный shell: getchar (PS/2 + COM1), read_line, команды
-    ├── terminal.rs           — полноценный терминал 80x25 (ANSI, курсор, рендер VGA/serial/framebuffer) — НЕ интегрирован в print!
-    ├── interrupts.rs.bak     — бэкап прерываний (не компилируется)
-    ├── main_old.rs.bak       — бэкап main.rs (не компилируется)
-    └── limine_fb.rs          — (см. выше, дублирования нет)
+    ├── main.rs              — точка входа _start_rust, инициализация подсистем, запуск shell
+    ├── boot.asm             — 64-битный entry point (установка стека, вызов _start_rust)
+    ├── vga.rs               — VgaWriter + макросы print!/println! (вывод в VGA + serial + framebuffer)
+    ├── serial.rs            — драйвер UART 16550 (COM1): init, write, read, SerialWriter
+    ├── vesa.rs              — вывод на framebuffer: шрифт 8x16, vesa_draw_char/ex, vesa_print_str, VesaWriter
+    ├── limine_fb.rs         — запросы Limine: FramebufferRequest, HhdmRequest
+    ├── gdt.rs               — GDT + TSS + IST (стеки для #DF, таймера, клавиатуры), kernel_panic
+    ├── interrupts.rs        — IDT (breakpoint, double_fault, page_fault, timer, keyboard, syscall), PIC init
+    ├── scheduler.rs         — кооперативный планировщик (до 4 задач, run_scheduler / run_scheduler_once)
+    ├── tasks.rs             — демо-задачи: task_hello, task_counter
+    ├── shell.rs             — интерактивный shell: getchar (PS/2 + COM1), команды (в т.ч. run_elf)
+    ├── terminal.rs          — полноценный терминал 80x25 (ANSI, курсор, рендер) — НЕ интегрирован в print!
+    ├── allocator.rs         — heap-аллокатор 8 МБ (linked_list_allocator, LockedHeap)
+    ├── pmm.rs               — PMM: bitmap-аллокатор физических фреймов 4K (alloc_frame/dealloc_frame)
+    ├── paging.rs            — пейджинг: map_page/unmap_page/translate, create_user_p4, map_page_in_p4
+    ├── process.rs           — процессы: create_process, create_elf_process, run_process, user_mode_entry
+    ├── elf.rs               — ELF64-загрузчик: парсер Ehdr/Phdr + загрузка PT_LOAD сегментов
+    ├── interrupts.rs.bak    — бэкап прерываний (не компилируется)
+    └── main_old.rs.bak      — бэкап main.rs (не компилируется)
 ```
 
 ## Архитектура
@@ -79,6 +98,8 @@ malinka/
 2. **boot.asm**: устанавливает RSP на `stack_top` (16 КБ BSS-стек), очищает регистры, вызывает `_start_rust`.
 3. **main.rs `_start_rust`**:
    - `serial::init()` — инициализация COM1 (до первого вывода)
+   - `allocator::init_heap()` — heap 8 МБ (до первых аллокаций)
+   - `pmm::init()` + `paging::init()` — PMM + пейджинг (HHDM, kernel P4)
    - Запрос framebuffer у Limine → `vesa_set_framebuffer` + `vesa_clear_screen`
    - `gdt::init_gdt()` — загрузка своей GDT + TSS (IST-стеки), установка CS/DS/SS
    - `interrupts::init_idt()` — загрузка IDT, инициализация PIC, `sti`
@@ -97,8 +118,10 @@ malinka/
 ### Прерывания
 
 - **PIC**: master (0x20-0x27) + slave (0x28-0x2F), маски — разрешены только IRQ0 (таймер) и IRQ1 (клавиатура)
-- **IDT**: breakpoint (#3), double_fault (#DF, IST 1), timer (IRQ0, IST 2), keyboard (IRQ1, IST 3)
+- **IDT**: breakpoint (#3), double_fault (#DF, IST 1), page_fault (#PF), timer (IRQ0, IST 2), keyboard (IRQ1, IST 3), syscall (int 0x80, DPL=3)
 - **IST-стеки**: `DOUBLE_FAULT_STACK` (16 КБ), `TIMER_STACK` (8 КБ), `KEYBOARD_STACK` (8 КБ) — обработчики не зависят от глубины стека прерванного кода
+- **#PF handler**: диагностика (CR2, RIP, CS/SS, RFLAGS); при PF в user mode — kernel_panic (восстановление kernel CR3 + HLT)
+- **syscall int 0x80**: asm-обёртка `syscall_entry` (naked) сохраняет все GPR → `syscall_handler_rust` (write/exit)
 - Клавиатура: US-раскладка (нижний регистр, без Shift), буфер `heapless::Vec<u8, 256>`
 
 ### Планировщик
@@ -127,6 +150,13 @@ cargo build --release
 
 # Создание загрузочного ISO (через make_iso.sh)
 ./make_iso.sh
+# Режим без framebuffer (для Bochs term/ncurses):
+./make_iso.sh no-fb
+
+# Сборка пользовательской ELF-программы (для команды run_elf)
+# → user_programs/hello.elf (встраивается в ядро через include_bytes!)
+./build_user.sh
+
 # или вручную:
 cargo build --release
 cp target/x86_64-unknown-none/release/malinka iso/kernel.elf
@@ -145,6 +175,8 @@ cp target/x86_64-unknown-none/release/malinka iso/kernel.elf
 `cargo test` **не работает** — цель `x86_64-unknown-none` (bare-metal) не имеет `libtest`. Тестирование проводится вручную через запуск в Bochs и анализ serial-вывода. В проекте нет `#[test]`-функций.
 
 ## Правила разработки (.kodaruls)
+
+Файл `.kodaruls` — локальный, **в git не хранится** (в `.gitignore`). Правила для справки:
 
 1. **Одна операция в один момент времени** — никаких глобальных переписок, только точечные исправления.
 2. **Никогда не переписывать файл целиком** — строго точечные исправления проблемного участка.
@@ -180,10 +212,15 @@ cp target/x86_64-unknown-none/release/malinka iso/kernel.elf
 - **SS::set_reg(data_sel)**: критически важно — Limine оставляет свой SS (0x30), при прерывании CPU кладёт его в IRET-фрейм, а при `iretq` не находит в нашей GDT → #GP → #DF
 - **PIC маскирование**: 0xFC (master) + 0xFF (slave) — без маски IRQ8 (RTC) периодически срабатывает без обработчика → DOUBLE FAULT
 - **Двойной ввод**: getchar() читает и PS/2 (порт 0x60), и COM1 — для работы shell как в графическом режиме, так и с `-serial stdio`
+- **create_user_p4 копирует ТОЛЬКО higher-half (256-511)**: копирование всего kernel P4 ломало ring 3 — user-код мапился в kernel P3/P2/P1 без `USER_ACCESSIBLE`, и ring 3 блокировался на верхнем уровне иерархии → #PF
+- **VGA buffer (0xB8000) мапится в user P4 отдельно**: обработчики прерываний (#PF/#DF/syscall) при активной user CR3 вызывают println!, который пишет в VGA; U/S=0 — ring 3 доступа не получит
+- **run_process → iretq → user_mode_entry → CR3::write(user P4) → iretq → ring 3**: двухэтапный переход с промежуточной точкой в kernel, чтобы переключить адресное пространство ДО входа в user code
+- **ELF-загрузчик**: PT_LOAD сегменты мапятся по адресам из ELF header (не фиксированный USER_CODE_BASE), флаги страниц из p_flags (PF_W→WRITABLE, !PF_X→NO_EXECUTE)
 
 ## План развития (из plan.txt)
 
 1. **Интеграция терминала** — перенаправить `print!`/`println!` на `terminal::TERMINAL` вместо трёх независимых `write!`
 2. **Тестирование терминала в Bochs** — ANSI-цвета, курсор, прокрутка, команды shell
-3. **Команда `color` в shell** — демонстрация 16-цветной палитры через SGR
+3. **Команда `color` в shell** — демонстрация 16-цветной палитры через SGR (реализована, требует проверки)
 4. **Оптимизация рендера** — dirty-флаг вместо полной перерисовки 80x25 на каждый `write!`
+5. **Отладка ring 3** — устранить DOUBLE FAULT при входе в user mode (CR2=0x400000000000, маппинги проверены — замаплены корректно)

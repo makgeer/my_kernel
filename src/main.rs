@@ -19,6 +19,7 @@ mod allocator;
 mod pmm;
 mod paging;
 mod process;
+mod elf;
 
 use core::panic::PanicInfo;
 use crate::scheduler::{add_task};

@@ -4,7 +4,7 @@ use spin::Once;
 use x86_64::instructions::port::Port;
 use x86_64::instructions::segmentation::{CS, SS, Segment};
 use x86_64::instructions::interrupts;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::paging::PhysFrame;
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::{PhysAddr, PrivilegeLevel, VirtAddr};
@@ -33,6 +33,9 @@ pub fn init_idt() {
         // IRQ1 — клавиатура (вектор 0x21, PIC offset), свой стек IST 3
         let k = idt[0x21].set_handler_fn(keyboard_handler);
         unsafe { k.set_stack_index(crate::gdt::KEYBOARD_IST_INDEX) };
+        // #PF — page fault, нужен для диагностики проблем с маппингами
+        // в user mode (отсутствует обработчик → DOUBLE FAULT).
+        idt.page_fault.set_handler_fn(page_fault_handler);
         // int 0x80 — syscall из user mode (ring 3). DPL=3 разрешает
         // вызов int 0x80 из ring 3. Без DPL=3 → #GP при int 0x80 из user.
         // IST не используется — CPU переключается на TSS.rsp0 (kernel stack).
@@ -193,6 +196,49 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     }
     
     outb(PIC1, 0x20);
+}
+
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    err_code: PageFaultErrorCode,
+) {
+    let cr2: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {cr2}, %cr2",
+            cr2 = out(reg) cr2,
+            options(nomem, nostack, att_syntax)
+        );
+    }
+    crate::println!(
+        "PAGE FAULT (ticks={}, err=0x{:x}, RIP=0x{:x}, CR2=0x{:x})",
+        TIMER_TICKS.load(Ordering::Relaxed),
+        err_code.bits(),
+        stack_frame.instruction_pointer,
+        cr2
+    );
+    crate::println!(
+        "  SS=0x{:x}, CS=0x{:x}, RFLAGS=0x{:x}",
+        stack_frame.stack_segment.0,
+        stack_frame.code_segment.0,
+        stack_frame.cpu_flags.bits()
+    );
+
+    // Проверяем: если CS.RPL == 3 (user mode) — переключаем CR3
+    // на user P4 процесса. Это нужно, потому что iretq выполняется
+    // с kernel CR3 (ядро маппировано), а user code изолирован
+    // в своей P4. После переключения — возвращаемся в user mode.
+    let cs_rpl = stack_frame.code_segment.rpl();
+    if cs_rpl == x86_64::PrivilegeLevel::Ring3 {
+        crate::println!("  → User mode PF, CR3 switch needed");
+        // В текущей реализации: run_process переходит через user_mode_entry,
+        // который переключает CR3 ДО iretq к user code.
+        // Если мы здесь — значит user_mode_entry не вызван или сломан.
+        crate::gdt::kernel_panic("Unexpected page fault in user mode");
+    }
+
+    // Если мы в kernel mode — это реальная ошибка
+    crate::gdt::kernel_panic("Page fault in kernel mode");
 }
 
 /// Сохранённые регистры общего назначения при входе в int 0x80.
