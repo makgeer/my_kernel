@@ -17,6 +17,7 @@ use crate::pmm;
 use crate::paging;
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::println;
+use crate::paging::map_page;
 
 /// Базовый виртуальный адрес для пользовательского кода.
 /// Lower-half (бит 47 = 0) — пользовательское пространство.
@@ -33,6 +34,8 @@ pub const USER_STACK_SIZE: usize = 4 * 1024; // 4 страницы = 16 KB
 /// который пишет в VGA. Мапится с U/S=0 — ring 3 доступа не получит
 /// (U/S проверяется на уровне P1, где стоит только PRESENT|WRITABLE).
 pub const VGA_BUFFER_ADDR: u64 = 0xB8000;
+
+const PAGE_SIZE: u64 = 4096;
 
 /// Глобальный указатель на P4 текущего пользовательского процесса.
 /// Используется page fault handler для переключения CR3 при входе
@@ -137,6 +140,30 @@ pub fn create_process(code: &[u8], entry_offset: u64) -> Result<Process, &'stati
 
     let entry_point = USER_CODE_BASE + entry_offset;
 
+    // Маппим user-код и стек в kernel P4 (copy_user_mapping_to_kernel).
+    // Это нужно для двухэтапного перехода в ring 3: второй iretq в user_mode_entry
+    // читает IRET-фрейм со стека и fetch-ит инструкцию по RIP с kernel CR3
+    // (до переключения на user P4). Без этого маппинга instruction fetch
+    // по user-адресу → #PF → DOUBLE FAULT. После iretq CPU переключит CR3
+    // на user P4, и будут использованы user-таблицы.
+    for i in 0..code_pages {
+        let virt = USER_CODE_BASE + (i as u64) * 4096;
+        // Для kernel P4: PRESENT | USER_ACCESSIBLE (без WRITABLE для кода)
+        let kflags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if let Err(e) = copy_user_mapping_to_kernel(virt, p4_phys, kflags) {
+            println!("  WARNING: copy_mapping(code[{}]) failed: {}", i, e);
+        }
+    }
+
+    // Маппинг user стека в kernel P4: PRESENT | USER_ACCESSIBLE | WRITABLE
+    for i in 0..stack_pages {
+        let virt = USER_STACK_TOP - ((i + 1) as u64) * 4096;
+        let kflags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+        if let Err(e) = copy_user_mapping_to_kernel(virt, p4_phys, kflags) {
+            println!("  WARNING: copy_mapping(stack[{}]) failed: {}", i, e);
+        }
+    }
+
     println!(
         "Process created: P4=0x{:016x}, entry=0x{:016x}, stack_top=0x{:016x}",
         p4_phys, entry_point, USER_STACK_TOP
@@ -180,7 +207,22 @@ pub fn create_elf_process(elf_bytes: &[u8]) -> Result<Process, &'static str> {
     // 2. Загружаем сегменты ELF в адресное пространство процесса
     let load_result = crate::elf::load_elf(elf_bytes, p4_phys)?;
 
-    // 3. Выделяем и мапим стек (растёт вниз от USER_STACK_TOP)
+    // 3. Маппим ELF-сегменты и стек в kernel P4 (для iretq fetch в user_mode_entry)
+    for &(seg_virt, seg_memsz) in &load_result.segments {
+        let seg_page_start = seg_virt & !(PAGE_SIZE - 1);
+        let seg_page_end = (seg_virt + seg_memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let mut page = seg_page_start;
+        while page < seg_page_end {
+            // Используем USER_ACCESSIBLE + WRITABLE для всех ELF-страниц
+            let kflags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+            if let Err(e) = copy_user_mapping_to_kernel(page, p4_phys, kflags) {
+                println!("  WARNING: copy_mapping(elf page 0x{:x}) failed: {}", page, e);
+            }
+            page += PAGE_SIZE;
+        }
+    }
+
+    // 4. Выделяем и мапим стек (растёт вниз от USER_STACK_TOP)
     let stack_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     let stack_pages = USER_STACK_SIZE / 4096;
 
@@ -190,6 +232,15 @@ pub fn create_elf_process(elf_bytes: &[u8]) -> Result<Process, &'static str> {
         // следующая ниже и т.д.
         let virt = USER_STACK_TOP - ((i + 1) as u64) * 4096;
         paging::map_page_in_p4(p4_phys, virt, phys, stack_flags)?;
+    }
+
+    // 5. Маппим стек в kernel P4
+    for i in 0..stack_pages {
+        let virt = USER_STACK_TOP - ((i + 1) as u64) * 4096;
+        let kflags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+        if let Err(e) = copy_user_mapping_to_kernel(virt, p4_phys, kflags) {
+            println!("  WARNING: copy_mapping(stack[{}]) failed: {}", i, e);
+        }
     }
 
     println!(
@@ -320,11 +371,32 @@ pub unsafe extern "C" fn user_mode_entry() -> ! {
     let p4_phys = CURRENT_USER_P4;
     let entry = USER_ENTRY_POINT;
     let stack = USER_STACK_PTR;
-    
+
+    // ДИАГНОСТИКА: маркер входа в user_mode_entry — подтверждает, что
+    // iretq из run_process дошёл до этой функции. Также печатаем текущий
+    // CR3 (должен быть kernel P4) и целевую P4 процесса. Если этой строки
+    // нет в логе — iretq/фрейм osбиваются ещё ДО user_mode_entry.
+    {
+        let (cur_frame, _) = Cr3::read();
+        crate::println!(
+            "user_mode_entry: entered (cur CR3=0x{:016x}, target P4=0x{:016x}, entry=0x{:016x})",
+            cur_frame.start_address().as_u64(),
+            p4_phys,
+            entry
+        );
+    }
+
     // Переключаем CR3 на user P4
     if p4_phys != 0 {
         let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(p4_phys));
         Cr3::write(frame, x86_64::registers::control::Cr3Flags::empty());
+        // После переключения сразу проверяем фактический CR3 — код ниже
+        // (iretq к user code) исполняется уже в user адресном пространстве.
+        let (new_frame, _) = Cr3::read();
+        crate::println!(
+            "user_mode_entry: CR3 switched (actual CR3=0x{:016x})",
+            new_frame.start_address().as_u64()
+        );
         // КРИТИЧЕСКИ: инвалидируем TLB после переключения CR3!
         // Без invlpg CPU использует stale entries из kernel P4,
         // что приводит к page fault при instruction fetch по USER_CODE_BASE.

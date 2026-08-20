@@ -424,3 +424,122 @@ pub fn hhdm_offset() -> u64 {
 pub fn kernel_p4_phys() -> u64 {
     unsafe { KERNEL_P4_PHYS }
 }
+
+/// Копирует P4 entry из user P4 в kernel P4.
+///
+/// Нужно для двухэтапного перехода в ring 3: второй iretq в user_mode_entry
+/// читает IRET-фрейм со стека и fetch-ит инструкцию по RIP с kernel CR3
+/// (до переключения на user P4). Без этого маппинга instruction fetch
+/// по user-адресу → #PF → DOUBLE FAULT. После iretq CPU переключит CR3
+/// на user P4, и будут использованы user-таблицы.
+///
+/// Копируем ТОЛЬКО P4 entry — P3/P2/P1 таблицы остаются shared между
+/// kernel и user P4. Это avoids лишних allocations PMM и не ломает
+/// user маппинги (раньше функция модифицировала user P3/P2/P1 на месте,
+/// что было багом).
+pub fn copy_user_mapping_to_kernel(virt: u64, p4_user: u64, _flags: PageTableFlags) -> Result<(), &'static str> {
+    let _lock = PAGING_LOCK.lock();
+
+    let (p4_idx, ..) = virt_to_indices(virt);
+
+    // Читаем текущую kernel P4
+    let (p4_frame, _) = Cr3::read();
+    let kernel_p4_phys = p4_frame.start_address().as_u64();
+
+    unsafe {
+        let kernel_p4: &mut PageTable = &mut *phys_to_virt(kernel_p4_phys);
+        let user_p4: &PageTable = &*phys_to_virt(p4_user);
+
+        // Проверяем, что user P4 имеет P3 entry для этого адреса
+        if !user_p4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+            return Err("copy_user_mapping: user P4 entry not present");
+        }
+
+        // Копируем P4 entry из user P4 в kernel P4.
+        // P3/P2/P1 таблицы shared — не копируем, не модифицируем.
+        kernel_p4[p4_idx].set_addr(
+            user_p4[p4_idx].addr(),
+            user_p4[p4_idx].flags(),
+        );
+    }
+
+    x86_64::instructions::tlb::flush(VirtAddr::new(virt));
+    Ok(())
+}
+
+/// Маппит виртуальную страницу в kernel P4 с флагами PRESENT | USER_ACCESSIBLE.
+///
+/// Нужно для двухэтапного перехода в ring 3: второй iretq в user_mode_entry
+/// читает IRET-фрейм со стека и fetch-ит инструкцию по RIP с kernel CR3
+/// (до переключения на user P4). Без этого маппинга instruction fetch
+/// по user-адресу → #PF → DOUBLE FAULT. После iretq CPU переключит CR3
+/// на user P4, и будут использованы user-таблицы.
+///
+/// Если user P4 известна — используйте copy_user_mapping_to_kernel (эффективнее).
+/// Эта функция создаёт новые P3/P2/P1 таблицы.
+#[deprecated(since = "0.1.0", note = "Use copy_user_mapping_to_kernel instead")]
+pub fn map_kernel_page(virt: u64, phys: u64, flags: PageTableFlags) -> Result<(), &'static str> {
+    let _lock = PAGING_LOCK.lock();
+    let (p4_idx, p3_idx, p2_idx, p1_idx) = virt_to_indices(virt);
+
+    let (p4_frame, _) = Cr3::read();
+    let p4_phys = p4_frame.start_address().as_u64();
+
+    unsafe {
+        let p4: &mut PageTable = &mut *phys_to_virt(p4_phys);
+
+        // --- P3 ---
+        let p3_entry = &mut p4[p4_idx];
+        let p3_phys;
+        if !p3_entry.flags().contains(PageTableFlags::PRESENT) {
+            let new_frame = pmm::alloc_frame().ok_or("PMM: OOM for P3 table")?;
+            p3_phys = new_frame;
+            (*phys_to_virt(new_frame)).zero();
+            p3_entry.set_addr(
+                PhysAddr::new(new_frame),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+            );
+        } else {
+            p3_phys = p3_entry.addr().as_u64();
+        }
+
+        // --- P2 ---
+        let p3: &mut PageTable = &mut *phys_to_virt(p3_phys);
+        let p2_entry = &mut p3[p3_idx];
+        let p2_phys;
+        if !p2_entry.flags().contains(PageTableFlags::PRESENT) {
+            let new_frame = pmm::alloc_frame().ok_or("PMM: OOM for P2 table")?;
+            p2_phys = new_frame;
+            (*phys_to_virt(new_frame)).zero();
+            p2_entry.set_addr(
+                PhysAddr::new(new_frame),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+            );
+        } else {
+            p2_phys = p2_entry.addr().as_u64();
+        }
+
+        // --- P1 ---
+        let p2: &mut PageTable = &mut *phys_to_virt(p2_phys);
+        let p1_entry = &mut p2[p2_idx];
+        let p1_phys;
+        if !p1_entry.flags().contains(PageTableFlags::PRESENT) {
+            let new_frame = pmm::alloc_frame().ok_or("PMM: OOM for P1 table")?;
+            p1_phys = new_frame;
+            (*phys_to_virt(new_frame)).zero();
+            p1_entry.set_addr(
+                PhysAddr::new(new_frame),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+            );
+        } else {
+            p1_phys = p1_entry.addr().as_u64();
+        }
+
+        // --- Запись P1 ---
+        let p1: &mut PageTable = &mut *phys_to_virt(p1_phys);
+        p1[p1_idx].set_addr(PhysAddr::new(phys), flags);
+    }
+
+    x86_64::instructions::tlb::flush(VirtAddr::new(virt));
+    Ok(())
+}
