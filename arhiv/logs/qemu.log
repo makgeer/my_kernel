@@ -1,0 +1,78 @@
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+limine: Loading executable `boot():/kernel.elf`...
+limine: Physical base:   0x1ff53000
+limine: Virtual base:    0xffffffff80000000
+limine: Slide:           0x0
+limine: ELF entry point: 0xffffffff80004550
+limine: Base revision:   0
+limine: Requests count:  2
+limine: Top of HHDM:     0x10000000000
+limine: CPU has 5-level paging support
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Mode was already set, perfect!
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+paging: 1GiB pages are supported!
+acpi: Found RSDP at 0xf52a0
+acpi: "DMAR" not found
+acpi: Found RSDP at 0xf52a0
+acpi: "IVRS" not found
+=== KERNEL START ===
+Framebuffer found: 1280x800
+Framebuffer output enabled
+Interrupts enabled
+=== KERNEL READY ===
+Commands: help, echo, clear, reboot, hlt
+Task: Hello from task
+Task: Counter = 1
+Task: Hello from task
+Task: Counter = 2
+Task: Hello from task
+Task: Counter = 3
+Task: Hello from task
+Task: Counter = 4
+Task: Hello from task
+Task: Counter = 5
+Task: Hello from task
+Task: Counter = 6
+Task: Hello from task
+Task: Counter = 7
+Task: Hello from task
+Task: Counter = 8
+Task: Hello from task
+Task: Counter = 9
+Task: Hello from task
+Task: Counter = 10
+Task: Hello from task
+Task: Counter = 11
+Task: Hello from task
+Task: Counter = 12
+Task: Hello from task
+Task: Counter = 13
+Task: Hello from task
+Task: Counter = 14
+Task: Hello from task
+Task: Counter = 15
+Task: Hello from task
+Task: Counter = 16
+Task: Hello from task
+Task: Counter = 17
+EXCEPTION: DOUBLE FAULT (RIP: 0xffffffff800017fc, err: 0x0)

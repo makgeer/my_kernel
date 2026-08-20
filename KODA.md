@@ -52,8 +52,8 @@ malinka/
 ├── Cargo.toml               — манифест пакета
 ├── build.rs                 — компиляция boot.asm через NASM (elf64)
 ├── linker.ld                — линкер-скрипт (higher-half, секция .requests для Limine)
-├── i686-unknown-none.json   — неиспользуемая цель (проект на x86_64; оставлена)
-├── debug_kernel.sh          — скрипт сборки+запуска через GRUB (устарел, используется Limine)
+├── arhiv/                   — архив неиспользуемого: бэкапы (.bak), i686-unknown-none.json,
+│                              debug_kernel.sh, limine.cfg, логи QEMU/Bochs, временные файлы
 ├── make_iso.sh              — сборка ISO через xorriso + Limine (аргумент: no-fb)
 ├── plan.txt                 — план разработки (задачи на текущую итерацию)
 ├── my_kernel.log            — лог всех изменений (только дописывается, с 2025-08-10)
@@ -85,9 +85,7 @@ malinka/
     ├── pmm.rs               — PMM: bitmap-аллокатор физических фреймов 4K (alloc_frame/dealloc_frame)
     ├── paging.rs            — пейджинг: map_page/unmap_page/translate, create_user_p4, map_page_in_p4
     ├── process.rs           — процессы: create_process, create_elf_process, run_process, user_mode_entry
-    ├── elf.rs               — ELF64-загрузчик: парсер Ehdr/Phdr + загрузка PT_LOAD сегментов
-    ├── interrupts.rs.bak    — бэкап прерываний (не компилируется)
-    └── main_old.rs.bak      — бэкап main.rs (не компилируется)
+    └── elf.rs               — ELF64-загрузчик: парсер Ehdr/Phdr + загрузка PT_LOAD сегментов
 ```
 
 ## Архитектура
@@ -192,7 +190,7 @@ cp target/x86_64-unknown-none/release/malinka iso/kernel.elf
 - **Запуск ядра строго вручную** в системном терминале — не запускать Bochs из AI-ассистента.
 - **Эмулятор — только Bochs** (`./bochs-bin/bin/bochs`). QEMU полностью исключён из проекта (правило 8 `.kodaruls`): не используется, не упоминается в скриптах, документации и логах.
 - **Запрещено удалять любой код** (даже неиспользуемый) — требуется проверка на валидность и введение в основное тело программы. Удаление строго с разрешения человека.
-- Бэкап-файлы (`*.bak`) и неиспользуемые цели (`i686-unknown-none.json`) оставлены в репозитории.
+- Бэкап-файлы (`*.bak`), неиспользуемые цели (`i686-unknown-none.json`) и устаревшие скрипты/логи перенесены в `arhiv/` — актуальный код от них очищен.
 
 ## Стиль кодирования
 

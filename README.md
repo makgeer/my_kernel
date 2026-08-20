@@ -50,15 +50,14 @@ xorriso
 
 mtools
 
-Bochs (рекомендуется) или QEMU
+Bochs
 
 🏃 Запуск
 bash
 # Bochs (рекомендуется)
 ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
 
-# QEMU (устаревший, поддержка ограничена)
-qemu-system-x86_64 -cdrom boot.iso -boot d -m 512M -cpu max -no-reboot -display curses
+
 🧪 Тестирование
 bash
 # В оболочке Malinka
