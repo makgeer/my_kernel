@@ -13,31 +13,24 @@
 - Аллокатор кучи: 8 МБ (linked_list_allocator).
 - PMM: bitmap 128 KB, alloc_frame/dealloc_frame.
 - Пейджинг: map_page/unmap_page/translate, create_user_p4 (higher-half),
-  map_page_in_p4, check_mapping_in_p4.
+  map_page_in_p4, check_mapping_in_p4, copy_user_mapping_to_kernel.
 - Процессы: create_process, create_elf_process, run_process, user_mode_entry.
 - Syscall: int 0x80 (DPL=3), syscall_entry → syscall_handler_rust (write/exit).
-- ELF-загрузчик: src/elf.rs (ET_EXEC, PT_LOAD, флаги из p_flags).
+- ELF-загрузчик: src/elf.rs (ET_EXEC, PT_LOAD, flags из p_flags, segments).
 
 ЗАДАЧИ НА СЛЕДУЮЩУЮ ИТЕРАЦИЮ (по приоритету)
 ------------------------------------------
 
-1. [ОТКРЫТО] DOUBLE FAULT ПРИ ВХОДЕ В RING 3 (run_user/run_elf)
-   - Симптом: после iretq в ring 3 → #PF (CR2=0x400000000000) → #DF.
-   - Маппинги ПРОВЕРЕНЫ: check_map кода/vga/стека = Some (замаплены верно).
-   - Значит причина НЕ в отсутствии маппинга. Гипотезы:
-     a) USER_CODE_BASE=0x400000000000 → P4[0]. После фикса create_user_p4
-        копирует только higher-half, lower-half чистый → user-код должен
-        мапиться в СОБСТВЕННЫЕ P3/P2/P1 с USER_ACCESSIBLE.
-     b) Возможно CR3 не переключён на user P4, и fetch идёт по kernel P4,
-        где 0x400000000000 НЕ замаплен → #PF (CR2=0x400000000000).
-     c) IRET frame: RIP=0x400000000000, CS=0x2b, RSP=0x40000000fff8,
-        SS=0x23, RFLAGS=0x203 — ВАЛИДНЫЙ user-фрейм.
-   - План: добавить вывод CR3 перед iretq в user_mode_entry; проверить,
-     что user_mode_entry вообще выполняется (println-маркер).
+1. [ИСПРАВЛЕНО] DOUBLE FAULT ПРИ ВХОДЕ В RING 3
+   - Причина: kernel P4 не содержит маппингов lower-half, iretq fetch
+     по user CR3 → #PF. Исправлено: copy_user_mapping_to_kernel() копирует
+     P1/P2/P3 из user P4 в kernel P4 для кода и стека.
+   - Нужно протестировать: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc,
+     команда run_user / run_elf.
 
-2. (после ring 3) ИНТЕГРАЦИЯ ТЕРМИНАЛА — print!/println! на terminal::TERMINAL
+2. (если ring 3 работает) ИНТЕГРАЦИЯ ТЕРМИНАЛА — print!/println! на terminal::TERMINAL
 
-3. (после ring 3) ОПТИМИЗАЦИЯ РЕНДЕРА — dirty-флаг вместо полной перерисовки
+3. (если ring 3 работает) ОПТИМИЗАЦИЯ РЕНДЕРА — dirty-флаг вместо полной перерисовки
 
 4. (ЕСЛИ ОСТАНЕТСЯ ВРЕМЯ) МНОГОПРОЦЕССНОСТЬ
    - Список процессов, планировщик round-robin

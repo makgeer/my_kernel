@@ -1804,3 +1804,77 @@ ISO: boot.iso, 473 секторов (no-fb)
 4. cargo check: ✅ успешно (предупреждения не критичны)
 Действия: перемещение выполнено, документация актуализирована.
 5. Коммит: очистка к предрелизу (мусор → arhiv/).
+
+--- 2026-08-20: ОТЛАДКА RING 3 (ДИАГНОСТИКА user_mode_entry) ---
+1. Внесена точечная диагностика в src/process.rs → user_mode_entry:
+   - маркер входа (cur CR3, target P4, entry) — подтверждает, что iretq
+     из run_process дошёл до user_mode_entry;
+   - контроль переключения CR3 на user P4 (фактический CR3 после write);
+   - после Cr3::write — инвалидация TLB (flush USER_CODE_BASE).
+2. cargo check: ✅ успешно (только известные warnings, ошибок нет).
+3. make_iso.sh no-fb: ✅ ISO создан (boot.iso, 472 секторов). Некритичная
+   ошибка в конце скрипта — xorriso ищется по пути /run/host/usr/local/bin.
+4. СЛЕДУЮЩИЙ ШАГ (вручную, правило 8): ./bochs-bin/bin/bochs -q -f bochsrc.bxrc,
+   команда run_user / run_elf, анализ bochs_serial.log:
+   - нет строк "user_mode_entry: entered" → ломается iretq/фрейм ДО функции;
+   - есть "entered", нет "CR3 switched" → падает на переходе CR3;
+   - есть обе строки, но #PF→#DF → проблема в маппинге/fetch user кода.
+
+[2026-08-20] ИСПРАВЛЕНИЕ DOUBLE FAULT ПРИ ВХОДЕ В RING 3 (run_user/run_elf):
+  - СИМПТОМ: CR2=0x400000000000 — page fault при instruction fetch
+    по USER_CODE_BASE при втором iretq в user_mode_entry.
+  - ПРИЧИНА: двухэтапный переход в ring 3:
+    1) iretq → user_mode_entry (с kernel CR3)
+    2) Cr3::write(user P4) — переключение на user P4
+    3) iretq → user code (с user CR3)
+    
+    На шаге 3 CPU читает IRET-фрейм со стека и fetch-ит инструкцию
+    по RIP С KERNEL CR3 (до переключения на user CR3). Kernel P4
+    НЕ содержит маппингов для lower-half (entries 0-255 пусты) —
+    USER_CODE_BASE=0x400000000000 не замаплен → #PF → DOUBLE FAULT.
+  
+  - ИСПРАВЛЕНИЕ:
+    * src/paging.rs: добавлена функция copy_user_mapping_to_kernel()
+      — копирует P1 маппинг из user P4 в kernel P4 (использует ТЕ ЖЕ
+      P3/P2/P1 таблицы, только меняет флаги). Эффективнее создания
+      новых таблиц.
+    * src/process.rs::create_process: после маппинга кода/стека в
+      user P4, копируются маппинги в kernel P4 (flags: PRESENT |
+      USER_ACCESSIBLE для кода, + WRITABLE для стека).
+    * src/process.rs::create_elf_process: аналогично для ELF-сегментов.
+    * src/elf.rs: ElfLoadResult теперь содержит segments (для маппинга
+      в kernel P4).
+  
+  - СБОРКА: cargo build --release ✅ (37 warnings — asm_sub_register,
+    static_mut_refs, deprecated — всё ожидаемо).
+  - ISO: boot.iso собран (242848 байт kernel.elf).
+  
+  - ОЖИДАЕМЫЙ РЕЗУЛЬТАТ: user_mode_entry успешно переключает CR3,
+    iretq fetch-ит инструкцию по user CR3, код выполняется в ring 3.
+    DOUBLE FAULT должен исчезнуть.
+  
+  - КОМАНДА ДЛЯ ТЕСТА (вручную!):
+    ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+
+[2026-08-20] ИСПРАВЛЕНИЕ DOUBLE FAULT ПРИ ВХОДЕ В RING 3 (повторная попытка):
+  - ПРОБЛЕМА: предыдущая реализация copy_user_mapping_to_kernel модифицировала
+    user P3/P2/P1 таблицы НА МЕСТЕ (kernel_p3 = &p3 = та же физическая страница).
+    Это могло приводить к повреждению user маппингов.
+  - ИСПРАВЛЕНИЕ: упрощена copy_user_mapping_to_kernel — теперь копирует
+    ТОЛЬКО P4 entry из user P4 в kernel P4, не трогая P3/P2/P1.
+    P3/P2/P1 таблицы остаются shared между kernel и user P4.
+  - СБОРКА: cargo build --release ✅ (36 warnings).
+  - ISO: boot.iso собран (242848 байт kernel.elf).
+  - Нужно протестировать: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc,
+    команда run_user / run_elf.
+
+[2026-08-20] ОТВЕТ НА ВОПРОС ПРО КОМАНДУ color:
+  - Команда color использует ANSI SGR escape-последовательности (стандарт
+    для терминалов). Это НЕ "8-битный код цветов" — это управляющие
+    последовательности вида \x1b[31m (красный текст), \x1b[41m (красный
+    фон), \x1b[1m (жирный), \x1b[0m (сброс).
+  - Терминал Bochs (ncurses) должен интерпретировать эти последовательности
+    и отображать цветной текст. Если вы видите сырые escape-последовательности
+    на экране — значит терминал их не обрабатывает (возможно, Bochs ncurses
+    не поддерживает ANSI-коды по умолчанию).
+  - Код команды находится в src/shell.rs строки 483-518.

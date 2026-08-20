@@ -15,6 +15,7 @@ use x86_64::structures::paging::page_table::PageTableFlags;
 use crate::pmm;
 use crate::paging;
 use crate::println;
+use heapless::Vec;
 
 // ── Константы ELF ────────────────────────────────────────────────
 
@@ -91,6 +92,9 @@ struct Elf64Phdr {
 pub struct ElfLoadResult {
     /// Точка входа (e_entry из ELF header) — виртуальный адрес в user space.
     pub entry_point: u64,
+    /// Загруженные PT_LOAD сегменты: (виртуальный адрес начала, размер).
+    /// Используется для маппинга в kernel P4 перед переходом в ring 3.
+    pub segments: Vec<(u64, u64), 8>,
 }
 
 /// Парсит и загружает ELF64 в адресное пространство процесса (P4).
@@ -181,6 +185,7 @@ pub fn load_elf(elf_bytes: &[u8], p4_phys: u64) -> Result<ElfLoadResult, &'stati
 
     // ── 9. Загрузка каждого PT_LOAD сегмента ──
     let mut loaded_segments = 0u32;
+    let mut segments: Vec<(u64, u64), 8> = Vec::new();
 
     for i in 0..phnum {
         let phdr_offset = phoff + i * phentsize;
@@ -200,6 +205,11 @@ pub fn load_elf(elf_bytes: &[u8], p4_phys: u64) -> Result<ElfLoadResult, &'stati
 
         load_segment(elf_bytes, phdr, p4_phys)?;
         loaded_segments += 1;
+
+        // Запоминаем загруженный сегмент: (vaddr, memsz)
+        if segments.push((phdr.p_vaddr, phdr.p_memsz)).is_err() {
+            println!("ELF: WARNING: too many segments, ignoring");
+        }
     }
 
     if loaded_segments == 0 {
@@ -210,6 +220,7 @@ pub fn load_elf(elf_bytes: &[u8], p4_phys: u64) -> Result<ElfLoadResult, &'stati
 
     Ok(ElfLoadResult {
         entry_point: ehdr.e_entry,
+        segments,
     })
 }
 
