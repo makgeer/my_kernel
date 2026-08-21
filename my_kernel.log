@@ -1878,3 +1878,483 @@ ISO: boot.iso, 473 секторов (no-fb)
     на экране — значит терминал их не обрабатывает (возможно, Bochs ncurses
     не поддерживает ANSI-коды по умолчанию).
   - Код команды находится в src/shell.rs строки 483-518.
+
+--- 2026-08-21: ВОЗОБНОВЛЕНИЕ РАБОТЫ — исправление компиляции ---
+1. cargo check выявил 4 ошибки E0425: cannot find function `copy_user_mapping_to_kernel`
+   в src/process.rs (строки 153, 162, 218, 241).
+   ПРИЧИНА: функция существует в src/paging.rs (строка 440), но не была
+   импортирована в process.rs. Вместо неё висел неиспользуемый импорт
+   `use crate::paging::map_page;` (warning unused_imports).
+2. ИСПРАВЛЕНИЕ (точечное): заменён импорт в src/process.rs строка 20:
+   `use crate::paging::map_page;` → `use crate::paging::copy_user_mapping_to_kernel;`
+3. cargo check: ✅ успешно (36 warnings — известные asm_sub_register,
+   static_mut_refs, deprecated — не критичны, ошибок нет).
+4. СОСТОЯНИЕ: ядро компилируется. Ring 3 (run_user/run_elf) ожидает
+   ручного тестирования в Bochs (правило: запуск строго вручную).
+   Команда: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc → run_user / run_elf.
+
+--- 2026-08-21: ВОССТАНОВЛЕНИЕ В SHELL ВМЕСТО ЗАВИСАНИЯ ---
+ЗАПРОС ПОЛЬЗОВАТЕЛЯ: "любые ошибки не должны приводить к зависанию ядра.
+  При каждом kernel panic возвращаться в shell."
+
+КОНТЕКСТ: при run_elf → DOUBLE FAULT (CR2=0x400000000000), ядро зависало
+  в loop { hlt }. Пользователь хочет, чтобы вместо зависания происходил
+  возврат в shell для продолжения работы.
+
+ИЗМЕНЕНИЯ (3 файла, точечные):
+
+1. src/gdt.rs::kernel_panic — КЛЮЧЕВОЕ ИЗМЕНЕНИЕ:
+   - Было: loop { hlt } (зависание навсегда)
+   - Стало: восстановление kernel CR3 → переключение на чистый
+     KERNEL_RETURN_STACK (16-байт выравнивание) → call shell::shell()
+   - Механика: asm! блок с cli/mov rsp/sti/call/shell, options(noreturn)
+   - cli/sti: запрет прерываний на момент переключения стека, затем
+     разрешение (shell нуждается в IRQ0/IRQ1)
+   - Если shell вернётся — hlt loop (запасной вариант)
+   - Диагностика: "Recovering to kernel shell..." бирюзовым цветом
+     (правило .kodaruls п.6 — новый код выделять бирюзовым)
+   - Обновлён doc-комментарий: описан механизм восстановления
+
+2. src/interrupts.rs::double_fault_handler:
+   - Было: loop { hlt }
+   - Стало: вызов crate::gdt::kernel_panic("Double fault — recovering...")
+   - kernel_panic восстанавливает CR3, стек, вызывает shell
+
+3. src/main.rs::panic (Rust panic handler):
+   - Было: println!("PANIC: ...") + loop { hlt }
+   - Стало: println!("PANIC: ...") + crate::gdt::kernel_panic("Rust panic...")
+   - Rust panic теперь тоже восстанавливается в shell
+
+ПОЧЕМУ ЭТО РАБОТАЕТ:
+- Обработчик #DF работает на IST-стеке (DOUBLE_FAULT_STACK 16КБ) —
+  у нас есть рабочий стек для диагностики и вызова kernel_panic
+- kernel_panic делает mov rsp на KERNEL_RETURN_STACK — чистый стек,
+  независимый от упавшего контекста (старый стек abandon'ится)
+- shell::shell() вызывается как обычная функция (call), не через iretq —
+  не нужно восстанавливать IRET-фрейм (который может быть сломан)
+- После sti прерывания снова работают: timer (IST2), keyboard (IST3)
+  используют свои стеки, не затрагивают KERNEL_RETURN_STACK
+
+ОГРАНИЧЕНИЯ (известные риски):
+- Если panic произошёл при захваченном TERMINAL.lock() — println! в
+  kernel_panic может deadlock (spin::Mutex не имеет poisoning).
+  Это существующий риск, не введён данным изменением.
+- Возврат в shell не «отменяет» упавшую операцию — пользователь должен
+  понимать, что состояние ядра может быть частично изменено.
+
+СБОРКА:
+- cargo check: ✅ (37 warnings — известные, ошибок нет)
+- cargo build --release: ✅
+- make_iso.sh no-fb: ✅ boot.iso (474 секторов, kernel.elf 238376 байт)
+  (некритичная ошибка xorriso в конце скрипта — известная)
+
+ТЕСТИРОВАНИЕ (вручную!):
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+  → run_elf → DOUBLE FAULT → "Recovering to kernel shell..." → shell>
+  Ожидание: вместо зависания — возврат к приглашению shell.
+
+--- 2026-08-21: ДИАГНОСТИКА #PF → #DF ПРИ ВХОДЕ В RING 3 ---
+КОНТЕКСТ: run_user/run_elf → DOUBLE FAULT на iretq в user_mode_entry
+  (RIP=0xffffffff800025a4 — адрес инструкции iretq, подтверждено objdump).
+  CR2=0x400000000000 — #PF при fetch первой инструкции user code.
+  КЛЮЧ: в логе НЕТ "PAGE FAULT" — #PF handler НЕ вызывается,
+  #PF → #DF напрямую.
+
+ГИПОТЕЗА: #PF handler не имеет IST-стека. При #PF из ring 3 CPU
+  переключается на TSS.rsp0 (kernel stack). Если доставка #PF через
+  TSS.rsp0 fails (например, stack недоступен в user P4 или рекурсивный
+  #PF при записи фрейма) → сразу #DF без вызова #PF handler.
+
+ИЗМЕНЕНИЯ (3 файла):
+
+1. src/gdt.rs:
+   - [+] PAGE_FAULT_IST_INDEX = 4 (новый IST-слот для #PF)
+   - [+] PAGE_FAULT_STACK [u8; 8192] — собственный стек для #PF handler
+   - [+] TSS.interrupt_stack_table[4] = вершина PAGE_FAULT_STACK
+   - Теперь #PF handler имеет независимый стек, не зависит от TSS.rsp0
+
+2. src/interrupts.rs:
+   - #PF: set_stack_index(PAGE_FAULT_IST_INDEX) — IST 4
+   - [+] Прямая serial-диагностика в начале #PF handler:
+     serial_write_str_direct + write_hex (без println/terminal/lock).
+     Печатает CR2, err_code, RIP, CS напрямую в COM1 — даже если
+     terminal повреждён или lock захвачен.
+   - [+] Прямая serial-диагностика в #DF handler (после println):
+     RIP, CR2 напрямую в COM1 для надёжности.
+
+3. src/serial.rs:
+   - [+] write_hex(u64) — прямой hex-вывод без fmt/alloc
+   - [+] serial_write_str_direct(&str) — прямой вывод строки без lock
+   - Эти функции безопасны в обработчиках исключений (нет terminal,
+     нет Mutex, нет alloc — только порты COM1)
+
+СБОРКА:
+- cargo check: ✅ (37 warnings, ошибок нет)
+- make_iso.sh no-fb: ✅ boot.iso (476 секторов, kernel.elf 242712 байт)
+
+ТЕСТИРОВАНИЕ (вручную!):
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+  → run_user / run_elf
+  Ожидание: теперь должен увидеть "[PF] direct: CR2=0x... err=0x... RIP=0x..."
+  в serial-выводе ДО double fault. err_code покажет причину #PF:
+    бит 0 (P): 0 = non-present page, 1 = protection violation
+    бит 1 (W/R): 0 = read, 1 = write
+    бит 2 (U/S): 0 = kernel, 1 = user
+    бит 4 (I/D): 0 = data access, 1 = instruction fetch
+  Если err=0x14 (U/S=1, I/D=1, P=0) → user fetch по отсутствующей странице.
+  Если err=0x1 (P=1, kernel) → protection violation (например, NX бит).
+
+--- 2026-08-21: НАЙДЕНА ПРИЧИНА DOUBLE FAULT ПРИ ВХОДЕ В RING 3 ---
+КОНТЕКСТ: анализ bochs.log (запуск 13:20) показал две ошибки CPU:
+  - check_cs(0x002b): not a valid code segment !
+  - interrupt(long mode): gate.p == 0
+  0x2B = USER_CODE_SELECTOR (0x28|RPL=3). Bochs отвергает CS при iretq
+  в ring 3 — CPU загружает дескриптор по index 5, а это НЕ code segment.
+
+КОРЕНЬ ПРИЧИНЫ (src/gdt.rs):
+  Дескриптор TSS в long mode занимает ДВЕ записи GDT (16 байт) —
+  это видно в исходниках крейта x86_64 0.15.5:
+    GlobalDescriptorTable::append() для Descriptor::SystemSegment делает
+    push(value_low) + push(value_high) — 2 слота (индексы 3 и 4).
+
+  Наш GDT layout оказался:
+    0x00: null
+    0x08: kernel code   (index 1)
+    0x10: kernel data   (index 2)
+    0x18: TSS low       (index 3)
+    0x20: TSS high      (index 4)   <-- вторая половина TSS
+    0x28: user data     (index 5)
+    0x30: user code     (index 6)
+
+  А в константах было захардкожено:
+    USER_DATA_SELECTOR = 0x20 | 0x03  -> index 4 = TSS.high (!!)
+    USER_CODE_SELECTOR = 0x28 | 0x03  -> index 5 = user DATA (!!)
+  При iretq в ring 3: CS=0x2B (index 5) = дескриптор данных, а не кода
+  -> Bochs: "not a valid code segment" -> #GP -> #DF.
+
+ИЗМЕНЕНИЯ (src/gdt.rs, точечные):
+  - USER_DATA_SELECTOR = 0x28 | 0x03  (index 5, правильный user data)
+  - USER_CODE_SELECTOR = 0x30 | 0x03  (index 6, правильный user code)
+  - Обновлён doc-комментарий: расписан реальный layout GDT с учётом
+    двухслотового TSS и история бага.
+
+ЗАВИСИМОСТИ:
+  Селекторы используются через константы в process.rs (enter_ring3,
+  user_mode_entry) — других захардкоженных значений 0x23/0x2B нет.
+
+СБОРКА:
+  - cargo check: ✅ (37 warnings, ошибок нет)
+  - make_iso.sh no-fb: ✅ boot.iso (kernel.elf 242712 байт)
+
+ТЕСТИРОВАНИЕ (вручную!):
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+  Второй терминал: nc localhost 8888
+  -> run_user / run_elf
+  Ожидание: теперь iretq должен загрузить CS=0x33 (user code), SS=0x2B
+  (user data) — переход в ring 3, hello из user space, syscall write/exit.
+
+--- 2026-08-21: RING 3 ВХОД РАБОТАЕТ + ИСПРАВЛЕНИЕ run_user (write buffer) ---
+КОНТЕКСТ: тест пользователя (Bochs) показал:
+  - iretq в ring 3 теперь успешен (фикс селекторов GDT 0x2B/0x33 работает):
+    "SYSCALL #1 from ring 3! ... CS: 0x33, RSP: 0x40000000fff8"
+  - НО: "write: unmapped user buffer at 0x40000000000032" — EFAULT.
+
+ДИАГНОЗ: адрес в логе syscall (arg2=0x0040000000000032) НЕ совпадает с
+  правильным msg_addr (0x0000400000000032). В байт-коде run_user в shell.rs
+  mov rsi, msg_addr содержал 0x40 на БАЙТЕ 6 (биты 48-55):
+    32 00 00 00 00 00 40 00  -> LE = 0x00400000000032 = 0x40000000000032
+  Такой виртуальный адрес → P4[0] — не замаплен в user P4 → translate=None.
+
+ИСПРАВЛЕНИЕ (src/shell.rs, точечное):
+  Байты mov rsi, msg_addr заменены на правильные:
+    32 00 00 00 40 00 00 00  -> LE = 0x0000400000000032 = 0x400000000032
+  0x40 переставлен с байта 6 (биты 48-55) на байт 4 (биты 32-39).
+  Добавлен комментарий с объяснением (правило .kodaruls п.4).
+
+СБОРКА: cargo check ✅, make_iso.sh no-fb ✅ (ISO пересобран).
+
+ТЕСТИРОВАНИЕ (вручную):
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+  -> run_user
+  Ожидание: write из user space печатает "Hello from user mode!",
+  затем exit(0) и возврат в kernel shell.
+
+--- 2026-08-21: ФИНАЛЬНЫЙ ФИКС run_user (0x40 на байте 5) ---
+
+КОНТЕКСТ: тест пользователя показал:
+  - run_elf РАБОТАЕТ: "Hello from ELF user program!" (arg2=0x0000400000000024)
+    В hello.asm lea rsi,[rel msg] ставит 0x40 на байт 5 — правильно.
+  - run_user НЕ работает: arg2=0x0000004000000032 (0x40 на байте 4).
+
+ПРИЧИНА: моя прошлая правка была ошибочной.
+  msg_addr = 0x0000400000000032 = 0x40 << 40 + 0x32.
+  Значит 0x40 должен стоять на БАЙТЕ 5 (биты 40-47), а я поставил на байте 4
+  (биты 32-39) → 0x40 << 32 = 0x0000004000000000 → неверный адрес.
+
+ИСПРАВЛЕНО (src/shell.rs):
+  Было: 32 00 00 00 40 00 00 00  (0x40 на байте 4)
+  Стало: 32 00 00 00 00 40 00 00  (0x40 на байте 5) ← ПРАВИЛЬНО
+  Добавлен комментарий с историей всех трёх ошибок позиции 0x40.
+
+ПОДТВЕРЖДЕНО работой run_elf: arg2=0x0000400000000024 — там 0x40 на байте 5.
+
+СБОРКА: cargo check + make_iso.sh no-fb OK.
+
+ТЕСТИРОВАНИЕ (вручную):
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+  -> run_user — ожидание "Hello from user mode!"
+  -> run_elf  — подтверждён пользователем ✅
+
+--- 2026-08-21: БЕЗОПАСНЫЕ ARGUMENTS SYSCALL + READ (copy_from_user/copy_to_user) ---
+
+КОНТЕКСТ: ring 3 стабилен (run_user/run_elf работают). По запросу
+  пользователя добавлены безопасная проверка аргументов syscall и
+  новые системные вызовы.
+
+ИЗМЕНЕНИЯ (3 файла + новая user-программа):
+
+1. src/paging.rs [+]:
+   - flags_at(virt) — флаги P1 записи в АКТИВНОЙ P4 (по CR3)
+   - flags_in_p4(p4_phys, virt) — флаги в указанной P4
+   Нужны для проверки USER_ACCESSIBLE/WRITABLE при обработке syscall.
+
+2. src/interrupts.rs [+]:
+   - user_range_valid(addr, len, need_write) — проверка диапазона
+     в user space: canonical lower-half + PRESENT + USER_ACCESSIBLE
+     (+WRITABLE для записи). Аналог Linux access_ok + PTE check.
+   - copy_from_user(dst, addr, len) / copy_to_user(src, addr, len)
+     — копирование с проверкой (ядро не трогает user-буферы напрямую).
+   - write (#1): теперь копирует буфер в kernel (4096), печатает из
+     kernel-буфера; непечатные байты (кроме \n \r \t) заменяются на "."
+   - НОВЫЙ syscall read (#0): неблокирующее чтение из stdin (fd=0).
+     Источники: KEYBOARD_BUFFER (PS/2, IRQ1) + COM1 serial. Возвращает
+     количество прочитанных байт (0 если данных нет), -EFAULT/-EBADF.
+
+3. user_programs/ [НОВЫЕ]:
+   - syscall_test.asm — демо: write prompt, read 1 байт, write эхо, exit
+   - syscall_test.ld — ДВА PT_LOAD сегмента: R E (.text/.rodata) +
+     RW (.data, ALIGN(0x1000)) — проверка multi-segment загрузки
+   - build_syscall_test.sh — сборка syscall_test.elf
+   Проверено readelf: 2 LOAD сегмента с флагами R E и RW.
+
+4. src/shell.rs [+]: команда "run_syscall" (include_bytes!
+   syscall_test.elf + create_elf_process + run_process), help обновлён.
+
+СБОРКА: cargo check OK, make_iso.sh no-fb OK.
+
+ТЕСТИРОВАНИЕ (вручную):
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+  -> run_syscall → "Press a key:" → ввести символ в nc →
+    "You pressed: X" → возврат в shell.
+  Повторно проверить run_user и run_elf (write теперь через copy).
+
+--- 2026-08-21: ПОЧИНЕН ВОЗВРАТ ИЗ SYSCALL (обычные вызовы не выходят из user mode) ---
+
+ПРОБЛЕМА: тест run_syscall показал "Press a key:" и сразу "Returned
+  from user mode to kernel" — процесс НЕ дошёл до read. Причина:
+  syscall_handler_rust в КОНЦЕ ЛЮБОГО syscall (write, read) модифицировал
+  IRET-фрейм на kernel_return_to_shell и восстанавливал kernel CR3 —
+  то есть после первого же вызова процесс возвращался в kernel вместо
+  продолжения в user mode.
+
+ИСПРАВЛЕНИЕ (src/interrupts.rs, точечное):
+  - Блок восстановления kernel CR3 + модификации IRET-фрейма →
+    kernel_return_to_shell перенесён из общего хвоста функции
+    ВНУТРЬ ветки exit (#60).
+  - Обычные syscall (read/write) теперь НЕ трогают CR3 и фрейм:
+    после iretq в syscall_entry процесс продолжает работу в user code
+    (CPU не меняет CR3 при int 0x80 — контекст процесса цел).
+  - exit() по-прежнему единственный путь возврата в kernel shell.
+
+СБОРКА: cargo check OK, make_iso.sh no-fb OK.
+
+ТЕСТИРОВАНИЕ (вручную):
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+  -> run_syscall: ожидается цикл read до ввода символа,
+    "You pressed: X" и ТОЛЬКО после exit() возврат в shell.
+  -> Повторно проверить run_user и run_elf.
+
+--- 2026-08-21: READ СДЕЛАН БЛОКИРУЮЩИМ + УБРАН СПАМ ДИАГНОСТИКИ ---
+
+КОНТЕКСТ: тест run_syscall показал, что процесс зациклился:
+  тысячи "SYSCALL #0" сarg2=0x4000001000 (буфер key в RW-сегменте).
+  read был НЕБЛОКИРУЮЩИЙ (возвращал 0 при отсутствии данных),
+  asm-программа крутила busy-loop. Плюс диагностика печаталась
+  на КАЖДЫЙ вызов read — захлёстывала nc-терминал и мешала вводу.
+
+ИЗМЕНЕНИЯ:
+1. src/interrupts.rs (read #0): БЛОКИРУЮЩИЙ аналог read в Linux.
+   - Сбор данных: KEYBOARD_BUFFER (IRQ1) + COM1 (serial).
+   - Если данных нет — засыпаем: unsafe hlt (IF=1, прерывания
+     разрешены: RFLAGS 0x246). Пробуждение по IRQ0 (таймер, ~1мс)
+     или IRQ1 (клавиатура) → проверка снова. Цикл до появления байта.
+2. src/interrupts.rs (диагностика): SYSCALL-дамп теперь печатается
+   ТОЛЬКО для syscall_num != 0 (write/exit/unknown). Для read (0)
+   лог не забивается — иначе каждый блокирующий вызов создавал
+   бы лавину вывода.
+3. user_programs/syscall_test.asm: убран .wait_loop (busy-wait) —
+   read теперь блокирующий, программа ждёт один вызов read.
+
+СБОРКА: cargo check OK, build_syscall_test.sh OK (2 LOAD сегмента),
+  make_iso.sh no-fb OK.
+
+ОЖИДАЕМОЕ ПОВЕДЕНИЕ (вручную):
+  run_syscall -> "Press a key:" -> процесс ВИСИТ БЕЗ СПАМА (ядро
+  спит в hlt) -> нажатие клавиши в nc -> "You pressed: X" -> exit ->
+  возврат в shell.
+
+--- 2026-08-21: БЛОКИРУЮЩИЙ READ + УБРАЛ СПАМ ДИАГНОСТИКУ ---
+
+КОНТЕКСТ: run_syscall показал, что процесс читал в цикле:
+  тысячи "SYSCALL #0" с arg2=0x4000001000 (буфер key в RW-сегменте).
+ read был НЕ блокирующим (возвращал 0 при отсутствии данных),
+  asm-программа крутила busy-loop. Плюс диагностика печаталась
+  на КАЖДЫЙ вызов read — забивала nc-терминал и мешала вводу.
+
+ИЗМЕНЕНИЯ:
+1. src/interrupts.rs (read #0): сделал read БЛОКИРУЮЩИМ (как в Linux).
+   - Сбор данных: KEYBOARD_BUFFER (IRQ1) + COM1 (serial).
+   - Если данных нет — засыпаем: unsafe hlt (IF=1,
+     RFLAGS 0x246), просыпаемся по IRQ0 (таймер, ~1 мс)
+     или IRQ1 (клавиатура) → проверяем снова. Цикл до появления байта.
+2. src/interrupts.rs (диагностика): SYSCALL-дамп теперь печатается
+   ТОЛЬКО для syscall_num != 0 (write/exit/unknown). Для read (0)
+   лог не засоряется — иначе каждый блокирующий вызов создавал
+   бы лавину вывода.
+3. user_programs/syscall_test.asm: убран .wait_loop (busy-wait) —
+   read теперь блокирующий, программа ждёт один вызов read.
+
+СБОРКА: cargo check OK, build_syscall_test.sh OK (2 LOAD-сегмента),
+   make_iso.sh no-fb OK.
+
+ОЖИДАНИЕ (вручную):
+   run_syscall -> "Press a key:" -> процесс ВИСИТ БЕЗ СПАМА
+   (ядро спит в hlt) -> нажатие клавиши в nc -> "You pressed: X" -> exit
+   -> возврат в shell.
+
+  Записал и обновил план (plan.txt) — переходим к Rhai + brush (когда подтвердишь).
+
+--- 2026-08-21: ФИКС ЗАВИСАНИЯ read (sti перед hlt) ---
+
+КОНТЕКСТ: run_syscall после "Press a key:" не получал ввод от nc.
+  Символы в nc — локальное эхо, ядро их не видит.
+
+ПРИЧИНА: int 0x80 сбрасывает флаг IF (в обработчике прерывания
+  прерывания запрещены). hlt с IF=0 НЕ пробуждается по maskable
+  interrupts (IRQ0-таймер, IRQ1-клавиатура) → процесс засыпал
+  навсегда, nc-эхо не видело движения.
+
+ИСПРАВЛЕНИЕ (src/interrupts.rs, read #0):
+  Было: hlt (IF=0, не просыпается от таймера)
+  Стало: sti; hlt (безопасный паттерн — разрешаем прерывания,
+  затем спим; при pending прерывании оно сработает до hlt,
+  иначе hlt ждёт следующего).
+
+СБОРКА: cargo check OK, make_iso.sh no-fb OK.
+
+ТЕСТИРОВАНИЕ (вручную):
+  run_syscall -> "Press a key:" -> тишина (без спама) ->
+  нажатие клавиши в nc -> "You pressed: X" -> exit -> shell.
+
+--- 2026-08-21: RHai ИНТЕГРАЦИЯ + BRUSH (MVP) — Rhai (no_std) и brush
+
+КОНТЕКСТ: пользователь запросил встроить в ядро Rhai и brush.
+
+RHAI:
+  - Cargo.toml: rhai = { version = "1.25.1", default-features = false,
+    features = ["no_std"] } — крейт собирается в no_std, использует
+    нашу кучу (alloc).
+  - src/script.rs (НОВЫЙ): обёртка Engine + регистрация API print/println
+    (вывод через наш терминал). run_script(source) выполняет скрипт.
+  - src/shell.rs: команда `script "<код>"` — выполнение Rhai-кода.
+
+BRUSH:
+  - Крейт brush v0.4.0 требует std (fs/process/io) + edition 2024,
+    rust 1.88 — в no_std ядро НЕ внедряется.
+  - Поэтому src/brush.rs (НОВЫЙ): собственная bash-совместимая
+    оболочка MVP: set/unset/env/echo/help/exit, подстановка $VAR и $?,
+    ввод через shell::read_line (PS/2 + COM1).
+  - src/shell.rs: команда `brush` — вход в оболочку (выход — `exit`).
+
+СБОРКА: cargo check OK, cargo build --release OK (LTO),
+  make_iso.sh no-fb OK.
+
+ТЕСТИРОВАНИЕ (вручную):
+  script "print(40+2)" -> 42; brush -> set NAME World -> echo
+  "Hello, $NAME!" -> Hello, World! -> exit.
+
+--- 2026-08-21: ФИКС КОМАНДЫ script (обработка аргументов) ---
+
+КОНТЕКСТ: команда `script "print(40+2)"` не находилась — shell
+  использовал `match cmd` где "script" (без аргументов) не совпадал
+  с полной строкой `script "print(40+2)"` → Unknown command.
+
+ИСПРАВЛЕНИЕ (src/shell.rs):
+  - В match оставлен `"script" =>` (без аргументов) → вывод usage.
+  - В блок `_ =>` добавлена ветка `starts_with("script ")`:
+    код извлекается из cmd[7..], кавычки удаляются через
+    trim_matches('), вызывается crate::script::run_script(code).
+
+  Аналогично существующей обработке `echo` в блоке `_`.
+
+СБОРКА: cargo check OK, release OK, ISO OK.
+
+--- 2026-08-21: ФИКС on_debug (Rhai) + ФИКС make_iso.sh ---
+
+КОНТЕКСТ: cargo check падал с ошибкой E0593 в src/script.rs —
+  сигнатура on_debug изменилась в Rhai 1.25.1 (3 аргумента вместо 1).
+  Плюс make_iso.sh падал на дублирующем блоке (путь xorriso из
+  Flatpak-эпохи /run/host/... больше не существует).
+
+ИЗМЕНЕНИЯ:
+1. src/script.rs — on_debug теперь принимает (s, _src, _pos):
+   Fn(&str, Option<&str>, Position) — сигнатура Rhai 1.25.1.
+   [исправление ошибки компиляции]
+2. make_iso.sh — XORRISO_BIN: /run/host/usr/local/bin/xorriso →
+   /usr/local/bin/xorriso (актуальный путь, xorriso 1.5.6).
+   [исправление падения сборки ISO]
+3. make_iso.sh — isoinfo: добавлен флаг -i (синтаксис).
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh no-fb OK
+  (boot.iso 4.0M, bootable, все файлы на месте).
+
+ТЕСТИРОВАНИЕ (вручную): script "print(40+2)" -> 42; brush -> exit.
+
+--- 2026-08-21: ФИКС on_debug (Rhai) + ФИКС make_iso.sh ---
+
+КОНТЕКСТ: cargo check падал с ошибкой E0593 в src/script.rs —
+  сигнатура on_debug изменилась в Rhai 1.25.1 (3 аргумента вместо 1).
+  Плюс make_iso.sh падал на дублирующем блоке (путь xorriso из
+  Flatpak-эпохи /run/host/... больше не существует).
+
+ИЗМЕНЕНИЯ:
+1. src/script.rs — on_debug теперь принимает (s, _src, _pos):
+   Fn(&str, Option<&str>, Position) — сигнатура Rhai 1.25.1.
+   [исправление ошибки компиляции]
+2. make_iso.sh — XORRISO_BIN: /run/host/usr/local/bin/xorriso →
+   /usr/local/bin/xorriso (актуальный путь, xorriso 1.5.6).
+   [исправление падения сборки ISO]
+3. make_iso.sh — isoinfo: добавлен флаг -i (синтаксис).
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh no-fb OK
+  (boot.iso 4.0M, bootable, все файлы на месте).
+
+ТЕСТИРОВАНИЕ (вручную): script "print(40+2)" -> 42; brush -> exit.
+
+--- 2026-08-21: ФИКС ВЫВОДА script (on_print без \n) ---
+
+КОНТЕКСТ: в Bochs команда `script "print(4+3)"` не показывала результат —
+  казалось, что вывод отсутствует.
+
+ПРИЧИНА: Rhai вызывает on_print-колбэк, передавая текст БЕЗ перевода
+  строки. Наш колбэк делал crate::print!("{}", s) — без \n. Результат
+  печатался на той же строке, что и следующий промпт shell `>`,
+  поэтому визуально сливался и был незаметен.
+
+ИСПРАВЛЕНИЕ (src/script.rs): on_print теперь использует
+  crate::println!("{}", s) — добавляет перевод строки после каждого
+  вывода Rhai.
+
+СБОРКА: cargo check OK, make_iso.sh no-fb OK (boot.iso 4.0M).
+
+ТЕСТИРОВАНИЕ (вручную): script "print(4+3)" -> 7 на отдельной строке.

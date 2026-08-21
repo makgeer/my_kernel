@@ -1,425 +1,280 @@
-Malinka — Микроядро на Rust
-Malinka — это легковесное, безопасное и модульное микроядро, написанное на Rust. Проект создаётся с нуля как исследовательская ОС для x86_64 с акцентом на минимализм, производительность и изоляцию компонентов.
+# Malinka — Учебное ядро ОС на Rust
 
-🚀 Возможности
-✅ Микроядро — сервисы работают в userspace
+**Malinka** — учебное ядро операционной системы для архитектуры x86_64 (bare-metal, `no_std` / `no_main`). Загружается через загрузчик [Limine](https://limine-bootloader.org/) в higher-half режиме (базовый адрес `0xFFFFFFFF80000000`). Ядро реализует базовую инфраструктуру ОС: вывод на framebuffer/VGA/serial, обработку прерываний (PIC, IDT, GDT/TSS/IST), кооперативный планировщик задач, пользовательские процессы (ring 3), системные вызовы, ELF64-загрузчик, встроенный скриптовый движок Rhai и интерактивный shell.
 
-✅ Безопасность — написано на Rust (no_std, безопасные абстракции)
+---
 
-✅ 64-битная архитектура — полная поддержка x86_64
+## Возможности
 
-✅ Загрузчик Limine — современный загрузочный протокол
+### Загрузка и вывод
+- **Загрузчик Limine** (BIOS) — переход в long mode, higher-half, HHDM
+- **Вывод**: VGA text buffer (0xB8000) + Serial COM1 (UART 16550) + Framebuffer (Limine, шрифт 8x16)
+- **Ввод**: PS/2 клавиатура (IRQ1, US-раскладка) + Serial COM1
 
-✅ Framebuffer + VGA — вывод на экран и последовательный порт
+### Управление памятью
+- **PMM**: bitmap-аллокатор физических фреймов 4K (`alloc_frame` / `dealloc_frame`)
+- **Paging**: 4-уровневые таблицы страниц x86_64 (`map_page` / `unmap_page` / `translate`, `create_user_p4`, `map_page_in_p4`)
+- **Heap-аллокатор**: 8 МБ на основе `linked_list_allocator`
+- **Изолированные адресные пространства**: каждый процесс получает собственную P4-таблицу
 
-✅ Прерывания — IDT, GDT, TSS, IST, PIC (IRQ0, IRQ1)
+### Прерывания и защита
+- **GDT + TSS + IST**: отдельные стеки для обработчиков #DF (16 КБ), таймера (8 КБ), клавиатуры (8 КБ)
+- **IDT**: breakpoint (#3), double_fault (#DF), page_fault (#PF), timer (IRQ0), keyboard (IRQ1), syscall (int 0x80)
+- **PIC**: master + slave, ремап, маскирование (разрешены только IRQ0 и IRQ1)
+- **#PF handler**: диагностика (CR2, RIP, CS/SS, RFLAGS), восстановление kernel CR3 при панике
 
-✅ Планировщик — кооперативный, с задачами
+### Пользовательские процессы (Ring 3)
+- **create_process** — создание процесса с маппингом кода и стека
+- **create_elf_process** — загрузка ELF64 (PT_LOAD сегменты, флаги страниц из p_flags)
+- **run_process** — двухэтапный переход: `iretq → user_mode_entry → CR3::write(user P4) → iretq → ring 3`
+- **Безопасные syscalls**: `copy_from_user` / `copy_to_user` + `user_range_valid`
 
-✅ Shell — интерактивная оболочка с командами
+### Системные вызовы (int 0x80, DPL=3)
+| № | Имя | Назначение |
+|---|-----|-----------|
+| 0 | `read` | Блокирующее чтение из stdin (PS/2 + COM1) |
+| 1 | `write` | Вывод строки в консоль (через `copy_from_user`) |
+| 60 | `exit` | Завершение процесса |
 
-✅ Куча — аллокатор на основе linked_list_allocator
+### Скриптовый движок
+- **Rhai** (no_std) — выполнение скриптов прямо в ядре через команду `script "<код>"`
+- **Brush** — собственная bash-совместимая оболочка MVP: `set`/`unset`/`env`/`echo`/`help`/`exit`, подстановка `$VAR` и `$?`
 
-✅ PMM + Paging — физический менеджер памяти и страничная адресация
+### Shell — интерактивная оболочка
+| Команда | Описание |
+|---------|----------|
+| `help` | Список команд |
+| `echo <текст>` | Вывод текста |
+| `about` | Информация об ОС |
+| `tasks` | Запуск кооперативного планировщика |
+| `clear` | Очистка экрана |
+| `cursor` | Управление курсором |
+| `color` | Демонстрация 16-цветной палитры SGR |
+| `reboot` | Перезагрузка |
+| `hlt` | Останов CPU |
+| `test_alloc` | Тест аллокатора кучи |
+| `test_pmm` | Тест физической памяти |
+| `test_paging` | Тест страничной адресации |
+| `test_process` | Тест создания процесса |
+| `run_user` | Запуск user-программы (inline asm) |
+| `run_elf` | Загрузка и запуск ELF64-программы |
+| `run_syscall` | Тест read/write syscalls (2 PT_LOAD сегмента) |
+| `script "<код>"` | Выполнение Rhai-скрипта |
+| `brush` | Вход в bash-совместимую оболочку |
 
-✅ Процессы — изолированные адресные пространства, переход в Ring 3
+---
 
-✅ Syscalls — поддержка int 0x80 (write/exit)
+## Технологии и зависимости
 
-🛠 Установка и сборка
-bash
+| Компонент | Версия | Назначение |
+|-----------|--------|------------|
+| Rust (nightly) | — | Язык реализации, `#![feature(abi_x86_interrupt)]` |
+| `x86_64` | 0.15.2 | API для работы с портами, сегментами, IDT, GDT, TSS |
+| `spin` | 0.9.8 | `Mutex` и `Once` без аллокации (no_std) |
+| `heapless` | 0.7.16 | `Vec<u8, 256>` для буфера клавиатуры без аллокации |
+| `limine` | 0.6.5 | Limine Boot Protocol (запрос framebuffer, HHDM) |
+| `linked_list_allocator` | 0.10.x | Heap-аллокатор (8 МБ, `LockedHeap`) |
+| `rhai` | 1.25.1 | Скриптовый движок (no_std, `features = ["no_std"]`) |
+| Limine (загрузчик) | 12.5.2 | Передаёт управление в higher-half, framebuffer, HHDM |
+| NASM | — | Компиляция `boot.asm` и user-программ |
+| GNU ld | — | Линковка user-программ |
+| xorriso | — | Создание загрузочного ISO |
+| Bochs | — | Эмулятор для тестирования |
+
+---
+
+## Структура проекта
+
+```
+malinka/
+├── .cargo/
+│   └── config.toml          — цель сборки x86_64-unknown-none, build-std, флаги линкера
+├── Cargo.toml               — манифест пакета
+├── build.rs                 — компиляция boot.asm через NASM (elf64)
+├── linker.ld                — линкер-скрипт (higher-half, секция .requests для Limine)
+├── make_iso.sh              — сборка ISO через xorriso + Limine (аргумент: no-fb)
+├── build_user.sh            — сборка user-программы hello (nasm + ld) → hello.elf
+├── build_syscall_test.sh    — сборка user-программы syscall_test (2 PT_LOAD сегмента)
+├── bochsrc.bxrc             — конфигурация Bochs
+├── iso/                     — файлы для ISO (kernel.elf, limine.conf, limine-bios.*)
+├── limine-binary/           — исходные бинарники Limine
+├── user_programs/           — пользовательские программы (ring 3)
+│   ├── hello.asm            — тестовая программа: write() + exit()
+│   ├── hello.ld             — линкер-скрипт (база 0x400000000000)
+│   ├── hello.elf            — собранный статический ET_EXEC
+│   ├── syscall_test.asm     — тест read/write syscalls (2 сегмента)
+│   ├── syscall_test.ld      — линкер-скрипт для syscall_test
+│   └── syscall_test.elf     — собранный ELF
+├── arhiv/                   — архив неиспользуемых файлов (.bak, устаревшие скрипты)
+├── plan.txt                 — план разработки
+├── my_kernel.log            — лог всех изменений (с 2025-08-10)
+├── KODA.md                  — технический контекст проекта
+├── Documents.md             — подробная документация ОС
+└── src/
+    ├── main.rs              — точка входа _start_rust, инициализация подсистем, запуск shell
+    ├── boot.asm             — 64-битный entry point (установка стека, вызов _start_rust)
+    ├── vga.rs               — VgaWriter + макросы print!/println! (вывод в VGA + serial + framebuffer)
+    ├── serial.rs            — драйвер UART 16550 (COM1): init, write, read, SerialWriter
+    ├── vesa.rs              — вывод на framebuffer: шрифт 8x16, vesa_draw_char/ex, vesa_print_str
+    ├── limine_fb.rs         — запросы Limine: FramebufferRequest, HhdmRequest
+    ├── gdt.rs               — GDT + TSS + IST, kernel_panic
+    ├── interrupts.rs        — IDT, PIC, syscall handler, copy_from/to_user, page_fault
+    ├── scheduler.rs         — кооперативный планировщик (до 4 задач)
+    ├── tasks.rs             — демо-задачи: task_hello, task_counter
+    ├── shell.rs             — интерактивный shell: getchar, команды (run_elf, script, brush)
+    ├── terminal.rs          — терминал 80x25 (ANSI, курсор, рендер)
+    ├── allocator.rs         — heap-аллокатор 8 МБ (linked_list_allocator, LockedHeap)
+    ├── pmm.rs               — PMM: bitmap-аллокатор физических фреймов 4K
+    ├── paging.rs            — пейджинг: map_page/unmap_page/translate, create_user_p4
+    ├── process.rs           — процессы: create_process, create_elf_process, run_process
+    ├── elf.rs               — ELF64-загрузчик: парсер Ehdr/Phdr + загрузка PT_LOAD
+    ├── script.rs            — встроенный скриптовый движок Rhai (no_std)
+    └── brush.rs             — bash-совместимая оболочка MVP
+```
+
+---
+
+## Сборка и запуск
+
+### Требования
+
+- **Rust nightly** (`rustup default nightly`)
+- **Цель компиляции**: `x86_64-unknown-none` (`rustup target add x86_64-unknown-none`)
+- **NASM** (ассемблер)
+- **xorriso** (создание ISO)
+- **Bochs** (эмулятор, собранный с поддержкой x86-64)
+
+### Команды
+
+```bash
 # Клонировать репозиторий
 git clone https://github.com/makgeer/my_kernel.git
 cd my_kernel
 
-# Установить цель для компиляции
-rustup target add x86_64-unknown-none
+# Проверка компиляции (без линковки)
+cargo check
 
-# Собрать ядро (режим framebuffer)
-cargo build --release --features fb
+# Сборка (debug)
+cargo build
 
-# Собрать ядро (только VGA)
-cargo build --release --no-default-features
+# Сборка (release, с LTO)
+cargo build --release
 
-# Собрать ISO-образ
+# Создание загрузочного ISO (с framebuffer)
 ./make_iso.sh
-📦 Зависимости
-Rust nightly (последняя стабильная версия)
 
-xorriso
+# Режим без framebuffer (только VGA 80x25 + serial, для Bochs term)
+./make_iso.sh no-fb
 
-mtools
+# Сборка пользовательских ELF-программ
+./build_user.sh              # hello.elf
+./build_syscall_test.sh      # syscall_test.elf
+```
 
-Bochs
+### Запуск в Bochs
 
-🏃 Запуск
-bash
-# Bochs (рекомендуется)
+```bash
+# Запуск строго вручную в системном терминале
 ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+```
 
+### Тестирование
 
-🧪 Тестирование
-bash
-# В оболочке Malinka
-> help                      # список команд
-> about                     # информация об ОС
-> echo <текст>              # вывод текста
-> tasks                     # запуск планировщика
-> test_alloc                # тест кучи
-> test_pmm                  # тест физической памяти
-> test_paging               # тест страничной адресации
-> test_process              # тест создания процесса
-> run_user                  # тест syscall
-> clear                     # очистка экрана
-📁 Структура проекта
-text
-my_kernel/
-├── src/
-│   ├── main.rs             # Точка входа
-│   ├── boot.asm            # Загрузчик (64-бит)
-│   ├── gdt.rs              # Глобальная таблица дескрипторов
-│   ├── interrupts.rs       # IDT, PIC, обработчики
-│   ├── serial.rs           # COM1-драйвер
-│   ├── vga.rs              # VGA-буфер
-│   ├── vesa.rs             # Framebuffer-вывод
-│   ├── limine_fb.rs        # Запрос фреймбуфера у Limine
-│   ├── terminal.rs         # Модуль терминала (ANSI/VGA/FB)
-│   ├── shell.rs            # Интерактивная оболочка
-│   ├── allocator.rs        # Аллокатор кучи
-│   ├── pmm.rs              # Физический менеджер памяти
-│   ├── paging.rs           # Страничная адресация
-│   ├── process.rs          # Процессы и Ring 3
-│   ├── scheduler.rs        # Кооперативный планировщик
-│   └── tasks.rs            # Тестовые задачи
-├── iso/                    # Файлы для ISO
-├── bochs-bin/              # Bochs (скомпилированная версия)
-├── linker.ld               # Линкер-скрипт
-├── make_iso.sh             # Скрипт сборки ISO
-├── bochsrc.bxrc            # Конфигурация Bochs
-├── KODA.md                 # Контекст для AI-ассистента
-├── plan.txt                # План развития
-└── README.md               # Этот файл
-📄 Лицензия
+`cargo test` не работает — цель `x86_64-unknown-none` (bare-metal) не имеет `libtest`. Тестирование проводится вручную через запуск в Bochs и анализ serial-вывода.
+
+Встроенные тесты в shell: `test_alloc`, `test_pmm`, `test_paging`, `test_process`, `run_user`, `run_elf`, `run_syscall`, `script "print(40+2)"`, `brush`.
+
+---
+
+## Архитектура
+
+### Поток загрузки
+
+1. **Limine** загружает `kernel.elf` из ISO, переводит CPU в long mode (64-бит), мапит физическую память через HHDM, передаёт управление на `_start` (из `boot.asm`).
+2. **boot.asm**: устанавливает RSP на `stack_top` (16 КБ BSS-стек), очищает регистры, вызывает `_start_rust`.
+3. **main.rs `_start_rust`**:
+   - `serial::init()` — инициализация COM1
+   - `allocator::init_heap()` — heap 8 МБ
+   - `pmm::init()` + `paging::init()` — PMM + пейджинг (HHDM, kernel P4)
+   - Запрос framebuffer у Limine → `vesa_set_framebuffer` + `vesa_clear_screen`
+   - `gdt::init_gdt()` — загрузка GDT + TSS (IST-стеки), установка CS/DS/SS
+   - `interrupts::init_idt()` — загрузка IDT, инициализация PIC, `sti`
+   - `add_task()` — регистрация демо-задач
+   - `shell::shell()` — интерактивная оболочка
+
+### Вывод
+
+Макрос `print!` (в `vga.rs`) дублирует вывод в три устройства одновременно:
+- **VgaWriter** → VGA text buffer `0xB8000`
+- **SERIAL** → COM1 (serial)
+- **VesaWriter** → Limine framebuffer (шрифт 8x16)
+
+### Прерывания
+
+- **PIC**: master (0x20-0x27) + slave (0x28-0x2F), маски — разрешены только IRQ0 (таймер) и IRQ1 (клавиатура)
+- **IDT**: breakpoint (#3), double_fault (#DF, IST 1), page_fault (#PF), timer (IRQ0, IST 2), keyboard (IRQ1, IST 3), syscall (int 0x80, DPL=3)
+- **IST-стеки**: `DOUBLE_FAULT_STACK` (16 КБ), `TIMER_STACK` (8 КБ), `KEYBOARD_STACK` (8 КБ)
+- **#PF handler**: диагностика (CR2, RIP, CS/SS, RFLAGS); при PF в user mode — kernel_panic
+- **syscall int 0x80**: asm-обёртка `syscall_entry` (naked) сохраняет все GPR → `syscall_handler_rust` (read/write/exit)
+- **Клавиатура**: US-раскладка (нижний регистр), буфер `heapless::Vec<u8, 256>`
+
+### Планировщик
+
+Кооперативный, до 4 задач (`Mutex<[Option<Task>; 4]>`). `run_scheduler_once()` выполняет один проход всех задач — вызывается из shell командой `tasks`.
+
+### Пользовательские процессы (Ring 3)
+
+- **create_user_p4** копирует ТОЛЬКО higher-half (P4[256-511]) — копирование всего kernel P4 ломало ring 3
+- **VGA buffer (0xB8000)** мапится в user P4 отдельно — обработчики прерываний при активной user CR3 вызывают `println!`
+- **Двухэтапный переход**: `run_process → iretq → user_mode_entry → CR3::write(user P4) → iretq → ring 3`
+- **ELF-загрузчик**: PT_LOAD сегменты мапятся по адресам из ELF header, флаги страниц из p_flags (PF_W→WRITABLE, !PF_X→NO_EXECUTE)
+- **Безопасные syscalls**: `copy_from_user` / `copy_to_user` с проверкой валидности пользовательских адресов
+
+### Ключевые архитектурные решения
+
+- **Limine вместо GRUB/Multiboot2** — нативная поддержка framebuffer и HHDM в higher-half
+- **Higher-half (0xFFFFFFFF80000000)** — Limine требует PHDRs в верхней половине адресного пространства
+- **IST-стеки** — устраняют DOUBLE FAULT при переполнении стека ядра во время прерывания
+- **SS::set_reg(data_sel)** — Limine оставляет свой SS (0x30), при прерывании CPU кладёт его в IRET-фрейм, а при `iretq` не находит в нашей GDT → #GP → #DF
+- **PIC маскирование**: 0xFC (master) + 0xFF (slave) — без маски IRQ8 (RTC) периодически срабатывает без обработчика → DOUBLE FAULT
+
+---
+
+## План развития
+
+1. **Планировщик процессов** — вытесняющий round-robin, переключение контекста между ring 3 процессами
+2. **IPC** — каналы/почтовые ящики для обмена сообщениями между процессами
+3. **Файловая система** — VFS + FAT32/ext2
+4. **Защита памяти** — SMAP/SMEP, W^X, guard pages, KASLR
+5. **Загружаемые модули** — драйверы как отдельные ELF-модули
+
+---
+
+## Лицензия
+
 Apache 2.0 — свободное использование, модификация и распространение.
 
-🤝 Контакты
-Автор: makgeer
+## Контакты
 
+Автор: makgeer  
 GitHub: https://github.com/makgeer
 
-🇬🇧 English
-Malinka — Rust Microkernel
-Malinka is a lightweight, secure, and modular microkernel written in Rust. Built from scratch as a research OS for x86_64 with a focus on minimalism, performance, and component isolation.
+---
 
-🚀 Features
-✅ Microkernel architecture — services run in userspace
+## English
 
-✅ Memory safety — written in Rust (no_std, safe abstractions)
+**Malinka** is an educational x86_64 kernel written in Rust (bare-metal, `no_std` / `no_main`). It boots via the Limine bootloader in higher-half mode. The kernel implements basic OS infrastructure: framebuffer/VGA/serial output, interrupt handling (PIC, IDT, GDT/TSS/IST), a cooperative task scheduler, user-space processes (ring 3), system calls, an ELF64 loader, an embedded Rhai scripting engine, and an interactive shell.
 
-✅ 64-bit — full x86_64 support
+### Quick start
 
-✅ Limine bootloader — modern boot protocol
-
-✅ Framebuffer + VGA — graphical and serial output
-
-✅ Interrupts — IDT, GDT, TSS, IST, PIC (IRQ0, IRQ1)
-
-✅ Cooperative scheduler — with tasks
-
-✅ Shell — interactive command line
-
-✅ Heap allocator — linked_list_allocator-based
-
-✅ PMM + Paging — physical memory manager and page tables
-
-✅ Processes — isolated address spaces, Ring 3 transitions
-
-✅ Syscalls — int 0x80 (write/exit)
-
-🛠 Build & Run
-bash
+```bash
 git clone https://github.com/makgeer/my_kernel.git
 cd my_kernel
 rustup target add x86_64-unknown-none
-cargo build --release --features fb
-./make_iso.sh
+./make_iso.sh no-fb
 ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
-📄 License
+```
+
+### License
+
 Apache 2.0 — free to use, modify, and distribute.
-
-🤝 Contact
-Author: makgeer
-
-GitHub: https://github.com/makgeer
-
-🇫🇷 Français
-Malinka — Micro-noyau en Rust
-Malinka est un micro-noyau léger, sécurisé et modulaire écrit en Rust. Conçu de zéro comme un système d'exploitation de recherche pour x86_64, avec un accent sur le minimalisme, la performance et l'isolation des composants.
-
-🚀 Fonctionnalités
-✅ Micro-noyau — services en espace utilisateur
-
-✅ Sécurité — écrit en Rust (no_std, abstractions sûres)
-
-✅ 64-bit — support complet x86_64
-
-✅ Chargeur Limine — protocole de démarrage moderne
-
-✅ Framebuffer + VGA — sortie écran et port série
-
-✅ Interruptions — IDT, GDT, TSS, IST, PIC (IRQ0, IRQ1)
-
-✅ Ordonnanceur — coopératif avec tâches
-
-✅ Shell — ligne de commande interactive
-
-✅ Allocateur heap — basé sur linked_list_allocator
-
-✅ PMM + Paging — gestionnaire de mémoire physique et pagination
-
-✅ Processus — espaces d'adressage isolés, passage en Ring 3
-
-✅ Syscalls — int 0x80 (write/exit)
-
-🛠 Construction et exécution
-bash
-git clone https://github.com/makgeer/my_kernel.git
-cd my_kernel
-rustup target add x86_64-unknown-none
-cargo build --release --features fb
-./make_iso.sh
-./bochs-bin/bin/bochs -q -f bochsrc.bxrc
-📄 Licence
-Apache 2.0 — utilisation, modification et distribution libres.
-
-🤝 Contact
-Auteur: makgeer
-
-GitHub: https://github.com/makgeer
-
-🇪🇸 Español
-Malinka — Micronúcleo en Rust
-Malinka es un micronúcleo ligero, seguro y modular escrito en Rust. Construido desde cero como un SO de investigación para x86_64, con enfoque en minimalismo, rendimiento y aislamiento de componentes.
-
-🚀 Características
-✅ Micronúcleo — servicios en espacio de usuario
-
-✅ Seguridad — escrito en Rust (no_std, abstracciones seguras)
-
-✅ 64 bits — soporte completo x86_64
-
-✅ Cargador Limine — protocolo de arranque moderno
-
-✅ Framebuffer + VGA — salida gráfica y por puerto serie
-
-✅ Interrupciones — IDT, GDT, TSS, IST, PIC (IRQ0, IRQ1)
-
-✅ Planificador — cooperativo con tareas
-
-✅ Shell — línea de comandos interactiva
-
-✅ Asignador de heap — basado en linked_list_allocator
-
-✅ PMM + Paging — gestor de memoria física y paginación
-
-✅ Procesos — espacios de direcciones aislados, paso a Ring 3
-
-✅ Syscalls — int 0x80 (write/exit)
-
-🛠 Compilación y ejecución
-bash
-git clone https://github.com/makgeer/my_kernel.git
-cd my_kernel
-rustup target add x86_64-unknown-none
-cargo build --release --features fb
-./make_iso.sh
-./bochs-bin/bin/bochs -q -f bochsrc.bxrc
-📄 Licencia
-Apache 2.0 — uso, modificación y distribución libres.
-
-🤝 Contacto
-Autor: makgeer
-
-GitHub: https://github.com/makgeer
-
-🇩🇪 Deutsch
-Malinka — Rust-Mikrokernel
-Malinka ist ein leichtgewichtiger, sicherer und modularer Mikrokernel in Rust. Von Grund auf als Forschungs-OS für x86_64 entwickelt, mit Fokus auf Minimalismus, Leistung und Komponentenisolation.
-
-🚀 Funktionen
-✅ Mikrokernel — Dienste im Userspace
-
-✅ Sicherheit — in Rust geschrieben (no_std, sichere Abstraktionen)
-
-✅ 64-Bit — vollständige x86_64-Unterstützung
-
-✅ Limine-Bootloader — modernes Bootprotokoll
-
-✅ Framebuffer + VGA — Bildschirm- und serielle Ausgabe
-
-✅ Interrupts — IDT, GDT, TSS, IST, PIC (IRQ0, IRQ1)
-
-✅ Scheduler — kooperativ mit Aufgaben
-
-✅ Shell — interaktive Befehlszeile
-
-✅ Heap-Allokator — basierend auf linked_list_allocator
-
-✅ PMM + Paging — physischer Speichermanager und Seitentabellen
-
-✅ Prozesse — isolierte Adressräume, Ring-3-Wechsel
-
-✅ Syscalls — int 0x80 (write/exit)
-
-🛠 Bauen und Ausführen
-bash
-git clone https://github.com/makgeer/my_kernel.git
-cd my_kernel
-rustup target add x86_64-unknown-none
-cargo build --release --features fb
-./make_iso.sh
-./bochs-bin/bin/bochs -q -f bochsrc.bxrc
-📄 Lizenz
-Apache 2.0 — freie Nutzung, Änderung und Verbreitung.
-
-🤝 Kontakt
-Autor: makgeer
-
-GitHub: https://github.com/makgeer
-
-🇵🇹 Português
-Malinka — Micronúcleo em Rust
-Malinka é um micronúcleo leve, seguro e modular escrito em Rust. Construído do zero como um SO de pesquisa para x86_64, com foco em minimalismo, desempenho e isolamento de componentes.
-
-🚀 Funcionalidades
-✅ Micronúcleo — serviços em espaço de usuário
-
-✅ Segurança — escrito em Rust (no_std, abstrações seguras)
-
-✅ 64 bits — suporte completo x86_64
-
-✅ Carregador Limine — protocolo de inicialização moderno
-
-✅ Framebuffer + VGA — saída gráfica e serial
-
-✅ Interrupções — IDT, GDT, TSS, IST, PIC (IRQ0, IRQ1)
-
-✅ Escalonador — cooperativo com tarefas
-
-✅ Shell — linha de comando interativa
-
-✅ Alocador de heap — baseado em linked_list_allocator
-
-✅ PMM + Paging — gerenciador de memória física e paginação
-
-✅ Processos — espaços de endereço isolados, transição para Ring 3
-
-✅ Syscalls — int 0x80 (write/exit)
-
-🛠 Construção e execução
-bash
-git clone https://github.com/makgeer/my_kernel.git
-cd my_kernel
-rustup target add x86_64-unknown-none
-cargo build --release --features fb
-./make_iso.sh
-./bochs-bin/bin/bochs -q -f bochsrc.bxrc
-📄 Licença
-Apache 2.0 — uso, modificação e distribuição livres.
-
-🤝 Contato
-Autor: makgeer
-
-GitHub: https://github.com/makgeer
-
-🇨🇳 中文
-Malinka — Rust 微内核
-Malinka 是一个轻量、安全、模块化的 Rust 微内核。从零开始构建，作为 x86_64 的研究型操作系统，注重极简主义、性能和组件隔离。
-
-🚀 特性
-✅ 微内核架构 — 服务运行在用户空间
-
-✅ 内存安全 — 使用 Rust 编写（no_std，安全抽象）
-
-✅ 64 位 — 完整支持 x86_64
-
-✅ Limine 引导程序 — 现代引导协议
-
-✅ Framebuffer + VGA — 图形和串口输出
-
-✅ 中断处理 — IDT、GDT、TSS、IST、PIC（IRQ0、IRQ1）
-
-✅ 协作式调度器 — 支持任务
-
-✅ Shell — 交互式命令行
-
-✅ 堆分配器 — 基于 linked_list_allocator
-
-✅ PMM + 分页 — 物理内存管理和页表
-
-✅ 进程 — 隔离地址空间，Ring 3 切换
-
-✅ 系统调用 — int 0x80（write/exit）
-
-🛠 构建与运行
-bash
-git clone https://github.com/makgeer/my_kernel.git
-cd my_kernel
-rustup target add x86_64-unknown-none
-cargo build --release --features fb
-./make_iso.sh
-./bochs-bin/bin/bochs -q -f bochsrc.bxrc
-📄 许可证
-Apache 2.0 — 自由使用、修改和分发。
-
-🤝 联系方式
-作者: makgeer
-
-GitHub: https://github.com/makgeer
-
-🇯🇵 日本語
-Malinka — Rust マイクロカーネル
-Malinka は、Rust で書かれた軽量で安全なモジュラー型マイクロカーネルです。x86_64 向けの研究用 OS としてゼロから構築され、ミニマリズム、パフォーマンス、コンポーネントの分離に焦点を当てています。
-
-🚀 特徴
-✅ マイクロカーネルアーキテクチャ — サービスはユーザースペースで動作
-
-✅ メモリ安全性 — Rust で記述（no_std、安全な抽象化）
-
-✅ 64 ビット — x86_64 を完全サポート
-
-✅ Limine ブートローダ — モダンなブートプロトコル
-
-✅ Framebuffer + VGA — グラフィカル出力とシリアル出力
-
-✅ 割り込み — IDT、GDT、TSS、IST、PIC（IRQ0、IRQ1）
-
-✅ 協調スケジューラ — タスク対応
-
-✅ シェル — 対話型コマンドライン
-
-✅ ヒープアロケータ — linked_list_allocator ベース
-
-✅ PMM + ページング — 物理メモリ管理とページテーブル
-
-✅ プロセス — 分離されたアドレス空間、Ring 3 への移行
-
-✅ システムコール — int 0x80（write/exit）
-
-🛠 ビルドと実行
-bash
-git clone https://github.com/makgeer/my_kernel.git
-cd my_kernel
-rustup target add x86_64-unknown-none
-cargo build --release --features fb
-./make_iso.sh
-./bochs-bin/bin/bochs -q -f bochsrc.bxrc
-📄 ライセンス
-Apache 2.0 — 自由に使用、変更、再配布が可能です。
-
-🤝 連絡先
-作者: makgeer
-
-GitHub: https://github.com/makgeer
-
-This response is AI-generated, for reference only.

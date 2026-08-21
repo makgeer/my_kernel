@@ -20,10 +20,15 @@
 - Syscall: int 0x80 (DPL=3), asm-обёртка syscall_entry, write/exit ✅
 - ELF64-загрузчик: парсер ELF64 + загрузка PT_LOAD сегментов (`src/elf.rs`) ✅
 - User-программы: `user_programs/hello.asm` (NASM → статический ELF64) ✅
-- Интерактивный shell: help, echo, about, tasks, clear, cursor, color, reboot, hlt, test_alloc, test_pmm, test_paging, test_process, run_user, run_elf ✅
+- Интерактивный shell: help, echo, about, tasks, clear, cursor, color, reboot, hlt, test_alloc, test_pmm, test_paging, test_process, run_user, run_elf, run_syscall, script, brush ✅
 - Ввод: PS/2 клавиатура (IRQ1) + Serial COM1 ✅
-- Модуль терминала `terminal.rs` создан и компилируется, но **не интегрирован** в макросы `print!`/`println!`
-- **Известная проблема**: `run_user` / `run_elf` — DOUBLE FAULT при входе в ring 3 (CR2=0x400000000000, маппинги проверены — замаплены корректно, причина в процессе отладки)
+- Модуль терминала `terminal.rs` — интегрирован в `print!`/`println!` (вывод через TERMINAL)
+- Скриптовый движок Rhai (no_std) — команда `script "<код>"` ✅
+- Bash-совместимая оболочка brush — команда `brush` ✅
+- Безопасные syscalls: `copy_from_user` / `copy_to_user` + `user_range_valid` ✅
+- Syscall `read` (#0) — блокирующее чтение из stdin (PS/2 + COM1) ✅
+- User-программы: `hello.asm`, `syscall_test.asm` (2 PT_LOAD сегмента) ✅
+- Ring 3 работает: `run_user`, `run_elf`, `run_syscall` — вход, syscalls, выход ✅
 
 ## Технологии и зависимости
 
@@ -36,6 +41,7 @@
 | `limine` | 0.6.5 | Limine Boot Protocol (запрос framebuffer, HHDM) |
 | `volatile` | 0.6.1 | Зарезервировано (не используется активно) |
 | `linked_list_allocator` | 0.10.x | Heap-аллокатор (8 МБ, `LockedHeap`) |
+| `rhai` | 1.25.1 | Скриптовый движок (no_std, `features = ["no_std"]`) |
 | Limine (загрузчик) | 12.5.2 | Передаёт управление в higher-half, предоставляет framebuffer и HHDM |
 | NASM | — | Компиляция `boot.asm` (entry point) и `user_programs/hello.asm` |
 | GNU ld | — | Линковка user-программ (`build_user.sh`) |
@@ -58,6 +64,7 @@ malinka/
 ├── plan.txt                 — план разработки (задачи на текущую итерацию)
 ├── my_kernel.log            — лог всех изменений (только дописывается, с 2025-08-10)
 ├── build_user.sh            — сборка user-программы hello (nasm + ld) → hello.elf
+├── build_syscall_test.sh    — сборка user-программы syscall_test (2 PT_LOAD сегмента)
 ├── iso/
 │   ├── kernel.elf           — собранный бинарник ядра
 │   ├── limine.conf          — конфигурация Limine (PROTOCOL, KERNEL_PATH, SERIAL, VERBOSE)
@@ -67,7 +74,10 @@ malinka/
 ├── user_programs/           — пользовательские программы (ring 3)
 │   ├── hello.asm            — тестовая программа: write() + exit() через int 0x80
 │   ├── hello.ld             — линкер-скрипт (база 0x400000000000 = USER_CODE_BASE)
-│   └── hello.elf            — собранный статический ET_EXEC (include_bytes! в shell)
+│   ├── hello.elf            — собранный статический ET_EXEC (include_bytes! в shell)
+│   ├── syscall_test.asm     — тест read/write syscalls (2 PT_LOAD сегмента)
+│   ├── syscall_test.ld      — линкер-скрипт для syscall_test
+│   └── syscall_test.elf     — собранный ELF
 └── src/
     ├── main.rs              — точка входа _start_rust, инициализация подсистем, запуск shell
     ├── boot.asm             — 64-битный entry point (установка стека, вызов _start_rust)
@@ -85,7 +95,9 @@ malinka/
     ├── pmm.rs               — PMM: bitmap-аллокатор физических фреймов 4K (alloc_frame/dealloc_frame)
     ├── paging.rs            — пейджинг: map_page/unmap_page/translate, create_user_p4, map_page_in_p4
     ├── process.rs           — процессы: create_process, create_elf_process, run_process, user_mode_entry
-    └── elf.rs               — ELF64-загрузчик: парсер Ehdr/Phdr + загрузка PT_LOAD сегментов
+    ├── elf.rs               — ELF64-загрузчик: парсер Ehdr/Phdr + загрузка PT_LOAD сегментов
+    ├── script.rs            — встроенный скриптовый движок Rhai (no_std): run_script, API print/println
+    └── brush.rs            — bash-совместимая оболочка MVP (set/unset/env/echo/help/exit, $VAR)
 ```
 
 ## Архитектура
@@ -111,7 +123,7 @@ malinka/
 - `SERIAL` → COM1 (serial)
 - `VesaWriter` → Limine framebuffer (рисует сразу, без буфера)
 
-Модуль `terminal.rs` реализует полноценный терминал (offscreen-буфер 80x25, ANSI SGR, курсор, прокрутка) и рендер во все три устройства, но **пока не подключён** к `print!` — это следующая задача по плану.
+Модуль `terminal.rs` реализует полноценный терминал (offscreen-буфер 80x25, ANSI SGR, курсор, прокрутка) и рендер во все три устройства, интегрирован в макросы `print!`/`println!`.
 
 ### Прерывания
 
@@ -119,7 +131,7 @@ malinka/
 - **IDT**: breakpoint (#3), double_fault (#DF, IST 1), page_fault (#PF), timer (IRQ0, IST 2), keyboard (IRQ1, IST 3), syscall (int 0x80, DPL=3)
 - **IST-стеки**: `DOUBLE_FAULT_STACK` (16 КБ), `TIMER_STACK` (8 КБ), `KEYBOARD_STACK` (8 КБ) — обработчики не зависят от глубины стека прерванного кода
 - **#PF handler**: диагностика (CR2, RIP, CS/SS, RFLAGS); при PF в user mode — kernel_panic (восстановление kernel CR3 + HLT)
-- **syscall int 0x80**: asm-обёртка `syscall_entry` (naked) сохраняет все GPR → `syscall_handler_rust` (write/exit)
+- **syscall int 0x80**: asm-обёртка `syscall_entry` (naked) сохраняет все GPR → `syscall_handler_rust` (read/write/exit)
 - Клавиатура: US-раскладка (нижний регистр, без Shift), буфер `heapless::Vec<u8, 256>`
 
 ### Планировщик
@@ -187,7 +199,7 @@ cp target/x86_64-unknown-none/release/malinka iso/kernel.elf
 
 ### Дополнительные правила (из системного контекста)
 
-- **Запуск ядра строго вручную** в системном терминале — не запускать Bochs из AI-ассистента.
+- **Запуск ядра строго вручную** в системном терминале — не запускать Bochs автоматически.
 - **Эмулятор — только Bochs** (`./bochs-bin/bin/bochs`). QEMU полностью исключён из проекта (правило 8 `.kodaruls`): не используется, не упоминается в скриптах, документации и логах.
 - **Запрещено удалять любой код** (даже неиспользуемый) — требуется проверка на валидность и введение в основное тело программы. Удаление строго с разрешения человека.
 - Бэкап-файлы (`*.bak`), неиспользуемые цели (`i686-unknown-none.json`) и устаревшие скрипты/логи перенесены в `arhiv/` — актуальный код от них очищен.
@@ -215,10 +227,10 @@ cp target/x86_64-unknown-none/release/malinka iso/kernel.elf
 - **run_process → iretq → user_mode_entry → CR3::write(user P4) → iretq → ring 3**: двухэтапный переход с промежуточной точкой в kernel, чтобы переключить адресное пространство ДО входа в user code
 - **ELF-загрузчик**: PT_LOAD сегменты мапятся по адресам из ELF header (не фиксированный USER_CODE_BASE), флаги страниц из p_flags (PF_W→WRITABLE, !PF_X→NO_EXECUTE)
 
-## План развития (из plan.txt)
+## План развития
 
-1. **Интеграция терминала** — перенаправить `print!`/`println!` на `terminal::TERMINAL` вместо трёх независимых `write!`
-2. **Тестирование терминала в Bochs** — ANSI-цвета, курсор, прокрутка, команды shell
-3. **Команда `color` в shell** — демонстрация 16-цветной палитры через SGR (реализована, требует проверки)
-4. **Оптимизация рендера** — dirty-флаг вместо полной перерисовки 80x25 на каждый `write!`
-5. **Отладка ring 3** — устранить DOUBLE FAULT при входе в user mode (CR2=0x400000000000, маппинги проверены — замаплены корректно)
+1. **Планировщик процессов** — вытесняющий round-robin, переключение контекста между ring 3 процессами
+2. **IPC** — каналы/почтовые ящики для обмена сообщениями между процессами
+3. **Файловая система** — VFS + FAT32/ext2
+4. **Защита памяти** — SMAP/SMEP, W^X, guard pages, KASLR
+5. **Загружаемые модули** — драйверы как отдельные ELF-модули

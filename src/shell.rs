@@ -101,6 +101,7 @@ pub fn shell() {
                 println!("  test_process - create user process (P4, code, stack)");
                 println!("  run_user   - create and run user process in ring 3");
                 println!("  run_elf    - load and run ELF64 user program (ring 3)");
+                println!("  run_syscall - ELF with read/write syscalls (multi-segment)");
             }
             "about" => {
                 println!("Malinka v0.1.0");
@@ -137,6 +138,15 @@ pub fn shell() {
                 loop {
                     unsafe { core::arch::asm!("hlt"); }
                 }
+            }
+            "brush" => {
+                // Вход во встроенную bash-совместимую оболочку.
+                // Возврат в kernel shell — командой `exit` внутри brush.
+                crate::brush::run();
+            }
+            "script" => {
+                // Команда без аргументов — выводим usage
+                println!("Usage: script \"<rhai code>\" (e.g. script \"print(40+2)\")");
             }
             "tasks" | "task" => {
                 // Запускаем одну итерацию планировщика как демонстрацию
@@ -421,8 +431,17 @@ pub fn shell() {
                     0xB8, 0x01, 0x00, 0x00, 0x00,             // mov eax, 1
                     0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
                     // mov rsi, msg_addr (little-endian)
+                    // msg_addr = 0x0000400000000032 → байты LE:
+                    //   32 00 00 00 | 00 40 00 00
+                    // (0x40 — на байте 5, т.е. биты 40-47: 0x40 << 40 = 0x400000000000)
+                    // ИСТОРИЯ ОШИБОК (позиция 0x40 в imm64):
+                    //   байт 6: 0x40 << 48 = 0x0040000000000032 (не canonical)
+                    //   байт 4: 0x40 << 32 = 0x0000004000000032 (не тот сегмент)
+                    //   байт 5: 0x40 << 40 = 0x0000400000000032 ← ПРАВИЛЬНО
+                    // Ориентир: в hello.asm (run_elf) lea rsi,[rel msg] даёт
+                    // 0x40 на байте 5 — и ELF-вариант работает.
                     0x48, 0xBE,
-                    0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+                    0x32, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00,
                     // mov rdx, 22
                     0x48, 0xBA,
                     0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -480,6 +499,30 @@ pub fn shell() {
                     }
                 }
             }
+"run_syscall" => {
+                // Загрузка и запуск user-программы syscall_test с НОВЫМИ
+                // системными вызовами: read(0,...) — ввод с клавиатуры/COM1,
+                // write(1,...) — вывод. Программа имеет ДВА PT_LOAD сегмента
+                // (R E для кода, RW для данных) — проверка загрузчика ELF.
+                //
+                // Сборка: ./build_syscall_test.sh
+                // → user_programs/syscall_test.elf
+                static SYSCALL_ELF: &[u8] = include_bytes!("../user_programs/syscall_test.elf");
+
+                println!("Loading syscall_test ({} bytes)...", SYSCALL_ELF.len());
+
+                match crate::process::create_elf_process(SYSCALL_ELF) {
+                    Ok(proc) => {
+                        println!("Launching syscall_test ring 3 (read/write demo)...");
+                        crate::process::run_process(&proc);
+                        // Сюда не вернёмся — run_process noreturn,
+                        // возврат идёт через kernel_return_to_shell.
+                    }
+                    Err(e) => {
+                        println!("  FAILED: create_elf_process error: {}", e);
+                    }
+                }
+            }
             "color" => {
                 // Демонстрация 16-цветной палитры ANSI SGR.
                 // Цвета печатаются на framebuffer (шрифт 8x16) + VGA + serial.
@@ -522,6 +565,16 @@ pub fn shell() {
             _ => {
                 if cmd.starts_with("echo ") {
                     println!("{}", &cmd[5..]);
+                } else if cmd.starts_with("script ") {
+                    // script "<rhai code>" — выполнение встроенного скрипта Rhai
+                    let code = cmd[7..].trim_end_matches('\0').trim();
+                    if code.is_empty() {
+                        println!("Usage: script \"<rhai code>\"");
+                    } else {
+                        // Убираем кавычки, если они есть
+                        let code = code.trim_matches('"');
+                        crate::script::run_script(code);
+                    }
                 } else {
                     println!("Unknown command: {}", cmd);
                 }

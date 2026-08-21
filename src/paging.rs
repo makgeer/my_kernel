@@ -292,6 +292,50 @@ pub fn check_mapping_in_p4(p4_phys: u64, virt: u64) -> Option<u64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// НОВЫЙ КОД (бирюзовый, правило .kodaruls п.6): безопасные системные вызовы.
+// ---------------------------------------------------------------------------
+
+/// Возвращает флаги записи P1 для виртуального адреса в активной P4 таблице
+/// (та, на которую указывает CR3). None — если хотя бы один уровень
+/// иерархии отсутствует (страница не замаплена).
+///
+/// Используется системными вызовами (syscall_handler_rust) для проверки
+/// аргументов из user space: достаточно проверить флаги USER_ACCESSIBLE
+/// и (для буферов на запись) WRITABLE на уровне P1 — флаги на верхних
+/// уровнях иерархии для user-страниц выставляются одинаковыми в
+/// map_page_in_p4 (PRESENT | WRITABLE | USER_ACCESSIBLE).
+pub fn flags_at(virt: u64) -> Option<PageTableFlags> {
+    let (p4_frame, _) = Cr3::read();
+    flags_in_p4(p4_frame.start_address().as_u64(), virt)
+}
+
+/// Возвращает флаги записи P1 для виртуального адреса в УКАЗАННОЙ P4
+/// таблице (не обязательно активной). None — если страница не замаплена.
+pub fn flags_in_p4(p4_phys: u64, virt: u64) -> Option<PageTableFlags> {
+    let (p4_idx, p3_idx, p2_idx, p1_idx) = virt_to_indices(virt);
+
+    unsafe {
+        let p4: &PageTable = &*phys_to_virt(p4_phys);
+        let p3_entry = &p4[p4_idx];
+        if !p3_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let p3: &PageTable = &*phys_to_virt(p3_entry.addr().as_u64());
+        let p2_entry = &p3[p3_idx];
+        if !p2_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let p2: &PageTable = &*phys_to_virt(p2_entry.addr().as_u64());
+        let p1_entry = &p2[p2_idx];
+        if !p1_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let p1: &PageTable = &*phys_to_virt(p1_entry.addr().as_u64());
+        Some(p1[p1_idx].flags())
+    }
+}
+
 /// Мапит виртуальную страницу 4K в указанной P4 таблице (не обязательно активной).
 ///
 /// Используется при создании нового процесса: страницы мапятся в новой P4

@@ -20,6 +20,8 @@ mod pmm;
 mod paging;
 mod process;
 mod elf;
+mod script;
+mod brush;
 
 use core::panic::PanicInfo;
 use crate::scheduler::{add_task};
@@ -122,7 +124,7 @@ pub extern "C" fn _start_rust() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("PANIC: {}", info.message());
-    loop {
-        unsafe { core::arch::asm!("hlt"); }
-    }
+    // Вместо зависания — восстанавливаемся в shell через kernel_panic.
+    // kernel_panic восстановит CR3, переключит стек и вызовет shell().
+    crate::gdt::kernel_panic("Rust panic — recovering to kernel shell");
 }
