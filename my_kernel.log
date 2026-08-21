@@ -2492,3 +2492,28 @@ BRUSH:
 
 ОЖИДАНИЕ (вручную):
   run_elf -> exit(0) -> ps -> таблица пуста (процесс Terminated).
+
+--- 2026-08-22: ИТОГИ ДНЯ + ПЛАН НА ЗАВТРА ---
+
+СДЕЛАНО СЕГОДНЯ:
+1. Фикс on_debug (Rhai 1.25.1, 3 аргумента) + фикс make_iso.sh (путь xorriso).
+2. Фикс вывода script (on_print без \n → println!).
+3. Коммит beta-0.1.0 в ветку Malinka.beta_0.1.0 (рабочий вариант ядра).
+4. Обновлена документация: README.md, KODA.md, Documents.md (без AI).
+5. Слияние beta в ветку разработка (fast-forward).
+6. Начат вытесняющий планировщик: process_manager.rs (ProcessContext,
+   ProcessState, ManagedProcess, ProcessManager, context_switch).
+7. Команда ps в shell.
+8. Интеграция с timer_handler (scheduler_tick) и create_elf_process (spawn).
+9. terminate_current() при exit — ps корректно убирает завершённые процессы.
+
+ВЕТКИ:
+  Malinka.beta_0.1.0 — снимок беты (2f722da)
+  разработка — активная разработка (a419e41), 6 коммитов впереди origin
+
+ПЛАН НА ЗАВТРА:
+1. ФИКС ps: вернуть вывод развёрнутых процессов (после отображения
+   таблицы команда ps должна завершаться, не висеть).
+2. Продолжить вытесняющий планировщик: реальное переключение контекста
+   из timer_handler через context_switch.
+3. Далее по плану развития (IPC, ФС, защита памяти).
