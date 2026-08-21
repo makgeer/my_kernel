@@ -275,6 +275,20 @@ pub fn scheduler_tick() -> bool {
     PROCESS_MANAGER.lock().tick()
 }
 
+/// Сбрасывает квант текущего процесса (если он Running).
+/// Вызывается из timer_handler когда квант истёк, но реальное
+/// переключение контекста ещё не реализовано.
+pub fn reset_quantum_if_running() {
+    let mut pm = PROCESS_MANAGER.lock();
+    if let Some(idx) = pm.current {
+        if let Some(ref mut proc) = pm.processes[idx] {
+            if proc.state == ProcessState::Running {
+                proc.ticks_left = proc.quantum;
+            }
+        }
+    }
+}
+
 /// Выбирает следующий процесс для выполнения.
 /// Возвращает индекс в таблице или None.
 pub fn next_process() -> Option<usize> {

@@ -248,6 +248,23 @@ pub fn create_elf_process(elf_bytes: &[u8]) -> Result<Process, &'static str> {
         p4_phys, load_result.entry_point, USER_STACK_TOP
     );
 
+    // Регистрируем процесс в менеджере процессов (для вытесняющего
+    // планировщика). PID присваивается менеджером. Если менеджер
+    // переполнен — процесс всё равно создаётся, но не планируется.
+    match crate::process_manager::spawn(
+        "elf",
+        p4_phys,
+        load_result.entry_point,
+        USER_STACK_TOP,
+    ) {
+        Ok(pid) => {
+            println!("  Registered in process manager: PID={}", pid);
+        }
+        Err(e) => {
+            println!("  WARNING: process manager full: {}", e);
+        }
+    }
+
     Ok(Process {
         p4_phys,
         entry_point: load_result.entry_point,

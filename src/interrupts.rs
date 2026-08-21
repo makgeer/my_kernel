@@ -189,6 +189,15 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     LAST_TIMER_CS.store(CS::get_reg().0 as usize, Ordering::Relaxed);
     // Счётчик тиков для диагностики DOUBLE FAULT
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+
+    // Вытесняющий планировщик: уменьшаем квант текущего процесса.
+    // Если квант истёк — нужен context_switch (пока диагностика).
+    if crate::process_manager::scheduler_tick() {
+        // Квант истёк — в будущем здесь будет переключение контекста.
+        // Пока просто сбрасываем квант (процесс продолжает работать).
+        crate::process_manager::reset_quantum_if_running();
+    }
+
     // Отправляем EOI в PIC (port 0x20) — без этого таймер не выдаст следующее прерывание
     outb(PIC1, 0x20);
 }
