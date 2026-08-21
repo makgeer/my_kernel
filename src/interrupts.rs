@@ -5,7 +5,7 @@ use x86_64::instructions::port::Port;
 use x86_64::instructions::segmentation::{CS, SS, Segment};
 use x86_64::instructions::interrupts;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use x86_64::structures::paging::PhysFrame;
+use x86_64::structures::paging::{page_table::PageTableFlags, PhysFrame};
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::{PhysAddr, PrivilegeLevel, VirtAddr};
 use x86_64::registers::control::{Cr3, Cr3Flags};
@@ -35,7 +35,11 @@ pub fn init_idt() {
         unsafe { k.set_stack_index(crate::gdt::KEYBOARD_IST_INDEX) };
         // #PF — page fault, нужен для диагностики проблем с маппингами
         // в user mode (отсутствует обработчик → DOUBLE FAULT).
-        idt.page_fault.set_handler_fn(page_fault_handler);
+        // Собственный IST-стек (IST 4): #PF может возникнуть в ring 3,
+        // когда TSS.rsp0 (kernel stack) может быть проблемным — IST
+        // гарантирует валидный стек для обработчика независимо от RSP0.
+        let pf = idt.page_fault.set_handler_fn(page_fault_handler);
+        unsafe { pf.set_stack_index(crate::gdt::PAGE_FAULT_IST_INDEX) };
         // int 0x80 — syscall из user mode (ring 3). DPL=3 разрешает
         // вызов int 0x80 из ring 3. Без DPL=3 → #GP при int 0x80 из user.
         // IST не используется — CPU переключается на TSS.rsp0 (kernel stack).
@@ -94,6 +98,13 @@ extern "x86-interrupt" fn double_fault_handler(
         _err_code,
         cr2
     );
+    // Прямая serial-диагностика без terminal — гарантирует вывод даже
+    // если println (terminal/lock) недоступен.
+    crate::serial::serial_write_str_direct("\n[DF] direct: RIP=0x");
+    crate::serial::write_hex(stack_frame.instruction_pointer.as_u64());
+    crate::serial::serial_write_str_direct(" CR2=0x");
+    crate::serial::write_hex(cr2);
+    crate::serial::serial_write_str_direct("\n");
     // Дамп IRET-фрейма, который iretq пытался вытолкнуть.
     // stack_frame.stack_pointer — это RSP на момент #DF; на нём (или рядом)
     // лежит фрейм прерванного/фейлящего iretq контекста.
@@ -116,9 +127,11 @@ extern "x86-interrupt" fn double_fault_handler(
         LAST_TIMER_SS.load(Ordering::Relaxed),
         LAST_TIMER_CS.load(Ordering::Relaxed)
     );
-    loop {
-        unsafe { core::arch::asm!("hlt"); }
-    }
+    // Вместо зависания (hlt loop) — восстанавливаемся в shell.
+    // kernel_panic восстановит kernel CR3, переключится на чистый
+    // kernel стек и вызовет shell::shell(). Пользователь продолжит
+    // работу, а не перезагрузит систему вручную.
+    crate::gdt::kernel_panic("Double fault — recovering to kernel shell");
 }
 
 /* Увеличен буфер с 16 до 256 символов — клавиатура генерирует прерывания быстрее обработки */
@@ -210,6 +223,18 @@ extern "x86-interrupt" fn page_fault_handler(
             options(nomem, nostack, att_syntax)
         );
     }
+    // Прямая serial-диагностика (без println/terminal/lock): #PF может
+    // возникнуть в контексте, где terminal или lock повреждены.
+    crate::serial::serial_write_str_direct("\n[PF] direct: CR2=0x");
+    crate::serial::write_hex(cr2);
+    crate::serial::serial_write_str_direct(" err=0x");
+    crate::serial::write_hex(err_code.bits() as u64);
+    crate::serial::serial_write_str_direct(" RIP=0x");
+    crate::serial::write_hex(stack_frame.instruction_pointer.as_u64());
+    crate::serial::serial_write_str_direct(" CS=0x");
+    crate::serial::write_hex(stack_frame.code_segment.0 as u64);
+    crate::serial::serial_write_str_direct("\n");
+
     crate::println!(
         "PAGE FAULT (ticks={}, err=0x{:x}, RIP=0x{:x}, CR2=0x{:x})",
         TIMER_TICKS.load(Ordering::Relaxed),
@@ -319,6 +344,95 @@ unsafe extern "C" fn syscall_entry() -> ! {
     );
 }
 
+// ---------------------------------------------------------------------------
+// НОВЫЙ КОД (бирюзовый, правило .kodaruls п.6): безопасная работа с
+// аргументами системных вызовов — проверка диапазонов в user space и
+// копирование данных между user и kernel (аналог Linux copy_from_user /
+// copy_to_user).
+//
+// ВАЖНО про адресное пространство: обработчик syscall (int 0x80) вызывается
+// с активной CR3 = P4 процесса (CPU не меняет CR3 при прерывании). Поэтому
+// paging::flags_at()/translate() проверяют адреса именно в адресном
+// пространстве процесса, а запись/чтение по user-адресам работает
+// напрямую. Всё это безопасно только благодаря предварительной проверке
+// user_range_valid().
+// ---------------------------------------------------------------------------
+
+/// Canonical user space (lower half): бит 47 = 0.
+/// Всё выше — higher-half ядра (и лимине-маппинги), user-буферы там
+/// запрещены, даже если страница замаплена.
+const USER_SPACE_TOP: u64 = 0x0000_8000_0000_0000;
+
+/// Проверяет, что адрес лежит в canonical user space.
+fn addr_in_user_space(addr: u64) -> bool {
+    addr < USER_SPACE_TOP
+}
+
+/// Проверяет диапазон [addr, addr+len) в user space процесса:
+/// - не выходит за границы canonical lower half;
+/// - не переполняет u64 (addr + len);
+/// - каждая затронутая страница замаплена (PRESENT) и доступна из ring 3
+///   (USER_ACCESSIBLE);
+/// - если `need_write` — страницы доступны на запись (WRITABLE).
+///
+/// Вызывается ДО копирования/записи — защита от передачи ядру адресов
+/// kernel-памяти, VGA-буфера или unmapped областей (аналог access_ok +
+/// проверка PTE в Linux).
+fn user_range_valid(addr: u64, len: usize, need_write: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if !addr_in_user_space(addr) {
+        return false;
+    }
+    let end = match addr.checked_add(len as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    // Идём по страницам: каждая должна быть замаплена с нужными флагами.
+    let mut page = addr & !0xFFF;
+    while page < end {
+        let flags = match crate::paging::flags_at(page) {
+            Some(f) => f,
+            None => return false,
+        };
+        if !flags.contains(PageTableFlags::PRESENT)
+            || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+        {
+            return false;
+        }
+        if need_write && !flags.contains(PageTableFlags::WRITABLE) {
+            return false;
+        }
+        page += 0x1000;
+    }
+    true
+}
+
+/// Копирует `len` байт из user space (адрес `addr`) в kernel-буфер `dst`.
+/// Возвращает false, если диапазон не валиден (копирование не выполнено).
+fn copy_from_user(dst: *mut u8, addr: u64, len: usize) -> bool {
+    if !user_range_valid(addr, len, false) {
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(addr as *const u8, dst, len);
+    }
+    true
+}
+
+/// Копирует `len` байт из kernel-буфера `src` в user space (адрес `addr`).
+/// Возвращает false, если диапазон не валиден (копирование не выполнено).
+fn copy_to_user(src: *const u8, addr: u64, len: usize) -> bool {
+    if !user_range_valid(addr, len, true) {
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, addr as *mut u8, len);
+    }
+    true
+}
+
 /// Rust-обработчик системного вызова. Вызывается из asm-обёртки
 /// syscall_entry, когда все регистры уже сохранены.
 ///
@@ -349,28 +463,126 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
     let arg2 = regs.rsi;
     let arg3 = regs.rdx;
 
-    crate::println!(
-        "SYSCALL #{} from ring 3! (arg1=0x{:016x}, arg2=0x{:016x}, arg3=0x{:016x})",
-        syscall_num, arg1, arg2, arg3
-    );
-    crate::println!(
-        "  user RIP: 0x{:x}, RSP: 0x{:x}, CS: 0x{:x}, RFLAGS: 0x{:x}",
-        frame.instruction_pointer,
-        frame.stack_pointer,
-        frame.code_segment.0,
-        frame.cpu_flags.bits()
-    );
+    // Диагностика. ВАЖНО: для read (#0) НЕ печатаем — read блокирующий,
+    // и до нажатия клавиши вызывается многократно. Иначе лог/терминал
+    // захлёстываются выводом, а сбор данных через nc замедляется.
+    if syscall_num != 0 {
+        crate::println!(
+            "SYSCALL #{} from ring 3! (arg1=0x{:016x}, arg2=0x{:016x}, arg3=0x{:016x})",
+            syscall_num, arg1, arg2, arg3
+        );
+        crate::println!(
+            "  user RIP: 0x{:x}, RSP: 0x{:x}, CS: 0x{:x}, RFLAGS: 0x{:x}",
+            frame.instruction_pointer,
+            frame.stack_pointer,
+            frame.code_segment.0,
+            frame.cpu_flags.bits()
+        );
+    }
 
     // Диспетчер системных вызовов по номеру (eax).
     // Номера заимствованы у Linux (x86_64):
+    //   0  — read(fd, buf, count) — чтение из stdin (блокирующее)
     //   1  — write(fd, buf, len) — вывод строки из user space
     //   60 — exit(code) — завершение процесса (возврат в kernel shell)
     //
     // ВАЖНО про контекст: обработчик вызван из int 0x80, а CPU при входе
     // в обработчик НЕ меняет CR3 — он всё ещё указывает на P4 процесса.
-    // Поэтому user-адреса (buf) валидны, и paging::translate() проверяет
-    // маппинг именно в адресном пространстве процесса.
+    // Поэтому user-адреса проверяются через paging::flags_at() ПО АКТИВНОЙ
+    // P4 (user_range_valid = аналог access_ok), а сами данные копируются
+    // между user и kernel через copy_from_user/copy_to_user — ядро НЕ работает
+    // с user-буферами напрямую после проверки (защита от подмены
+    // страниц во время копирования).
     match syscall_num {
+        0 => {
+            // read(fd, buf, count) — чтение из stdin (fd=0).
+            // Реализация БЛОКИРУЮЩАЯ: ждём байт из буфера клавиатуры (IRQ1)
+            // + COM1 (serial). Если данных нет вообще — засыпаем (hlt с IF=1;
+            // RFLAGS из user mode 0x246: прерывания разрешены), просыпаемся
+            // по таймеру/клавиатуре и проверяем снова, пока не появится байт.
+            let fd = arg1;
+            let buf = arg2 as *mut u8;
+            let count = arg3 as usize;
+
+            if fd != 0 {
+                // Поддерживаем только stdin (fd=0)
+                crate::println!("  read: unsupported fd {}", fd);
+                regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EBADF
+            } else if count == 0 {
+                regs.rax = 0;
+            } else {
+                // Ограничение: за один read выдаём не более 256 байт
+                // (размер kernel-буфера ниже).
+                let count = count.min(256);
+
+                // 1. Проверяем, что user-буфер вообще можно писать.
+                if !user_range_valid(buf as u64, count, true) {
+                    crate::println!(
+                        "  read: invalid user buffer at 0x{:x}",
+                        buf as u64
+                    );
+                    regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
+                } else {
+                    // 2. Блокирующий сбор данных в kernel-буфер.
+                    //    Источники: буфер клавиатуры (IRQ1) + COM1 (serial).
+                    //    Если данных нет вообще — засыпаем (hlt) до
+                    //    следующего прерывания (IRQ0/IRQ1 пробуждают CPU,
+                    //    обработчики работают на IST-стеках), затем снова
+                    //    проверяем ввод. Цикл прервётся, когда появится
+                    //    хотя бы один байт.
+                    let mut kbuf = [0u8; 256];
+                    let mut n = 0usize;
+
+                    while n == 0 {
+                        {
+                            let mut kb = KEYBOARD_BUFFER.lock();
+                            while n < count {
+                                match kb.first() {
+                                    Some(b) => {
+                                        kbuf[n] = *b;
+                                        kb.remove(0);
+                                        n += 1;
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                        while n < count && crate::serial::serial_has_data() {
+                            kbuf[n] = crate::serial::serial_read();
+                            n += 1;
+                        }
+
+                        if n == 0 {
+                            // Нет данных — спим. КРИТИЧЕСКИ: int 0x80
+                            // сбрасывает IF (прерывания запрещены внутри
+                            // обработчика). hlt с IF=0 НЕ просыпается от
+                            // maskable interrupts (таймер, клавиатура) —
+                            // процесс зависнет навсегда. Поэтому СНАЧАЛА
+                            // sti (разрешаем прерывания — они станут
+                            // доставляться начиная со следующей инструкции),
+                            // ЗАТЕМ hlt (если прерывание уже pending, оно
+                            // сработает до hlt; иначе hlt ждёт следующего).
+                            // Это стандартный safe pattern sti; hlt.
+                            unsafe {
+                                core::arch::asm!(
+                                    "sti",
+                                    "hlt",
+                                    options(nomem, nostack, preserves_flags)
+                                );
+                            }
+                        }
+                    }
+
+                    // 3. Копируем в user space. Диапазон уже проверен выше,
+                    //    поэтому copy_to_user должна успешно завершиться.
+                    if copy_to_user(kbuf.as_ptr(), buf as u64, n) {
+                        regs.rax = n as u64; // прочитано байт
+                    } else {
+                        regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
+                    }
+                }
+            }
+        }
         1 => {
             // write(fd, buf, len)
             let fd = arg1;
@@ -383,57 +595,90 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
                 regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EBADF
             } else {
                 // Ограничение на длину: не больше 4096 байт (одна страница),
-                // чтобы цикл проверки/вывода не выполнялся бесконечно при
+                // чтобы копирование/вывод не выполнялись бесконечно при
                 // неверном (огромном) len из user space.
                 let len = len.min(4096);
 
-                // Проверяем, что ВЕСЬ буфер замаплен в user space.
-                // Идём по страницам: translate() возвращает Some, только если
-                // все уровни таблиц (P4→P3→P2→P1) содержат PRESENT-записи.
-                let mut valid = true;
-                let mut i = 0usize;
-                while i < len {
-                    let virt = buf as u64 + i as u64;
-                    if crate::paging::translate(virt).is_none() {
-                        crate::println!(
-                            "  write: unmapped user buffer at 0x{:x}",
-                            virt
-                        );
-                        valid = false;
-                        break;
-                    }
-                    // Перескакиваем на начало следующей страницы:
-                    // остаток текущей страницы заведомо замаплен целиком.
-                    let page_off = (virt & 0xFFF) as usize;
-                    i += (4096 - page_off).min(len - i);
-                }
-
-                if valid {
-                    // Выводим байты посимвольно прямо из user space.
-                    // Печать (println!/print!) пишет в higher-half (VGA,
-                    // framebuffer, serial) — этот диапазон скопирован в user
-                    // P4 (entries 256-511), поэтому вывод безопасен.
+                // Копируем буфер из user space в kernel-буфер.
+                // copy_from_user проверяет ВСЮ область (каждую страницу):
+                // canonical lower-half, PRESENT, USER_ACCESSIBLE.
+                // После успешной копии ядро работает только со своим
+                // буфером — страницы user-процесса больше не читаются.
+                let mut kbuf = [0u8; 4096];
+                if !copy_from_user(kbuf.as_mut_ptr(), buf as u64, len) {
+                    crate::println!(
+                        "  write: invalid user buffer at 0x{:x}",
+                        buf as u64
+                    );
+                    regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
+                } else {
+                    // Выводим байты из kernel-буфера. Непечатные символы
+                    // (кроме \n \r 	) заменяем на '.' — бинарные данные
+                    // не должны ломать терминал/серийный протокол.
                     for i in 0..len {
-                        let c = unsafe { *buf.add(i) };
-                        crate::print!("{}", c as char);
+                        let b = kbuf[i];
+                        let c = match b {
+                            b'\n' | b'\r' | 0x09 | 0x20..=0x7e => b as char,
+                            _ => '.',
+                        };
+                        crate::print!("{}", c);
                     }
                     regs.rax = len as u64; // возвращаем число записанных байт
-                } else {
-                    regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
                 }
             }
         }
         60 => {
-            // exit(code) — завершение процесса.
-            // Возврат в kernel mode уже настроен ниже (IRET-фрейм →
-            // kernel_return_to_shell), поэтому здесь просто логируем код
-            // выхода и возвращаем его в rax.
+            // exit(code) — завершение процесса и возврат в kernel shell.
+            // НЕ переходим в user mode: модифицируем IRET-фрейм и CR3 так,
+            // чтобы iretq после syscall_entry вернул нас в kernel.
             let code = arg1;
             crate::println!(
                 "  exit({}) — процесс завершён, возврат в kernel shell",
                 code
             );
             regs.rax = 0; // успешное завершение syscall
+
+            // 1. Восстанавливаем kernel CR3 (сейчас активна user P4 процесса)
+            let kernel_p4 = crate::paging::kernel_p4_phys();
+            if kernel_p4 != 0 {
+                unsafe {
+                    let frame = PhysFrame::containing_address(PhysAddr::new(kernel_p4));
+                    Cr3::write(frame, Cr3Flags::empty());
+                }
+            }
+
+            // 2. Модифицируем IRET-фрейм для возврата в kernel mode.
+            //    ВАЖНО: это сопряжено с потерей user-стека/контекста —
+            //    процесс завершается, его P4/фреймы остаются (утечка в
+            //    учебном ядре; корректное освобождение — отдельная задача).
+            //    Текущий kernel-стек (KERNEL_RETURN_STACK) — валиден.
+            unsafe {
+                let mut m = frame.as_mut();
+                m.update(|f| {
+                    // RIP → kernel_return_to_shell (возвращаемся в shell)
+                    f.instruction_pointer =
+                        VirtAddr::new(kernel_return_to_shell as *const () as u64);
+                    // CS → kernel code selector (RPL=0, ring 0)
+                    f.code_segment = SegmentSelector::new(
+                        crate::gdt::KERNEL_CODE_SELECTOR >> 3,
+                        PrivilegeLevel::Ring0,
+                    );
+                    // SS → kernel data selector (RPL=0)
+                    f.stack_segment = SegmentSelector::new(
+                        crate::gdt::KERNEL_DATA_SELECTOR >> 3,
+                        PrivilegeLevel::Ring0,
+                    );
+                    // RSP → вершина KERNEL_RETURN_STACK (валидный kernel стек)
+                    let stack_ptr =
+                        core::ptr::addr_of!(crate::gdt::KERNEL_RETURN_STACK) as *const u8;
+                    f.stack_pointer = VirtAddr::new(
+                        stack_ptr as u64 + crate::gdt::KERNEL_RETURN_STACK.len() as u64
+                    );
+                });
+            }
+            // После возврата в syscall_entry pop'ы восстановят регистры,
+            // затем iretq использует модифицированный фрейм: CPU переходит
+            // в ring 0 на kernel_return_to_shell с kernel стеком.
         }
         _ => {
             crate::println!("  Unknown syscall number: {}", syscall_num);
@@ -441,44 +686,11 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
         }
     }
 
-    // 1. Восстанавливаем kernel CR3
-    let kernel_p4 = crate::paging::kernel_p4_phys();
-    if kernel_p4 != 0 {
-        unsafe {
-            let frame = PhysFrame::containing_address(PhysAddr::new(kernel_p4));
-            Cr3::write(frame, Cr3Flags::empty());
-        }
-    }
-
-    // 2. Модифицируем IRET-фрейм для возврата в kernel mode
-    unsafe {
-        let mut m = frame.as_mut();
-        m.update(|f| {
-            // RIP → kernel_return_to_shell (возвращаемся в shell)
-            f.instruction_pointer = VirtAddr::new(kernel_return_to_shell as *const () as u64);
-            // CS → kernel code selector (RPL=0, ring 0)
-            f.code_segment = SegmentSelector::new(
-                crate::gdt::KERNEL_CODE_SELECTOR >> 3,
-                PrivilegeLevel::Ring0,
-            );
-            // SS → kernel data selector (RPL=0)
-            f.stack_segment = SegmentSelector::new(
-                crate::gdt::KERNEL_DATA_SELECTOR >> 3,
-                PrivilegeLevel::Ring0,
-            );
-            // RSP → вершина KERNEL_RETURN_STACK (валидный kernel стек)
-            // Используем addr_of! для избежания static_mut_refs warning
-            let stack_ptr = core::ptr::addr_of!(crate::gdt::KERNEL_RETURN_STACK) as *const u8;
-            f.stack_pointer = VirtAddr::new(
-                stack_ptr as u64 + crate::gdt::KERNEL_RETURN_STACK.len() as u64
-            );
-        });
-    }
-
-    // После возврата в syscall_entry pop'ы восстановят регистры
-    // (в т.ч. модифицированный regs.rax — код возврата syscall),
-    // затем iretq использует модифицированный фрейм: CPU переходит
-    // в ring 0 на kernel_return_to_shell с kernel стеком.
+    // ВАЖНО: обычные syscall (read/write) НЕ меняют CR3 и IRET-фрейм —
+    // процесс продолжает работать в user mode. CPU не переключает CR3 при
+    // входе в int 0x80, поэтому после iretq в syscall_entry мы окажемся
+    // на прежнем месте в user code с той же P4 (контекст процесса цел).
+    // Только exit() модифицирует фрейм и возвращает в kernel (см. выше).
 }
 
 /// Точка возврата из user mode в kernel.

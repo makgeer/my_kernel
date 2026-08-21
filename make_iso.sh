@@ -46,7 +46,7 @@ echo "=== ISO Structure ==="
 ls -la iso/
 
 # Создание ISO
-XORRISO_BIN="/run/host/usr/local/bin/xorriso"
+XORRISO_BIN="/usr/local/bin/xorriso"
 if [ ! -f "$XORRISO_BIN" ]; then
     echo "ERROR: xorriso not found at $XORRISO_BIN"
     exit 1
@@ -74,4 +74,4 @@ echo ""
 echo "=== Final ISO ==="
 ls -lh boot.iso
 file boot.iso
-isoinfo -R -f boot.iso | head -20
+isoinfo -R -f -i boot.iso | head -20

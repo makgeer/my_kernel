@@ -12,20 +12,33 @@ use x86_64::VirtAddr;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 1;
 pub const TIMER_IST_INDEX: u16 = 2;
 pub const KEYBOARD_IST_INDEX: u16 = 3;
+/// IST для #PF — собственный стек, независимый от TSS.rsp0.
+/// Без этого #PF из ring 3 может сразу дать #DF (если доставка #PF
+/// через TSS.rsp0 fails). IST гарантирует валидный стек для #PF handler.
+pub const PAGE_FAULT_IST_INDEX: u16 = 4;
 
 /// Селекторы сегментов (индексы в GDT).
-/// Каждый селектор = индекс × 8 + DPL (0=kernel, 3=user).
-/// GDT layout:
+/// Каждый селектор = индекс * 8 + DPL (0=kernel, 3=user).
+///
+/// GDT layout (ВНИМАНИЕ: дескриптор TSS в long mode занимает ДВЕ записи
+/// GDT — 16 байт. Из-за этого user-селекторы сдвинуты на 1 от наивной
+/// нумерации: user data — index 5, user code — index 6):
 ///   0x00: null
 ///   0x08: kernel code  (index 1)
 ///   0x10: kernel data  (index 2)
-///   0x18: TSS          (index 3)
-///   0x20: user data    (index 4)
-///   0x28: user code    (index 5)
+///   0x18: TSS low      (index 3)
+///   0x20: TSS high     (index 4) — вторая половина дескриптора TSS
+///   0x28: user data    (index 5)
+///   0x30: user code    (index 6)
+///
+/// ИСТОРИЯ БАГА: ранее здесь было user data = 0x20 (index 4 = TSS high)
+/// и user code = 0x28 (index 5 = user data). При iretq в ring 3 CPU
+/// загружал CS=0x2B → index 5 → дескриптор user DATA (тип 0x3, не code!)
+/// → Bochs: "check_cs(0x002b): not a valid code segment" → #GP → #DF.
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
-pub const USER_DATA_SELECTOR: u16 = 0x20 | 0x03; // index 4, RPL=3
-pub const USER_CODE_SELECTOR: u16 = 0x28 | 0x03; // index 5, RPL=3
+pub const USER_DATA_SELECTOR: u16 = 0x28 | 0x03; // index 5, RPL=3
+pub const USER_CODE_SELECTOR: u16 = 0x30 | 0x03; // index 6, RPL=3
 
 /* Отдельные стеки для обработчиков прерываний.
    16 КБ для #DF (нужен запас при диагностике), по 8 КБ для IRQ0/IRQ1.
@@ -35,6 +48,7 @@ pub const USER_CODE_SELECTOR: u16 = 0x28 | 0x03; // index 5, RPL=3
 static mut DOUBLE_FAULT_STACK: [u8; 16384] = [0; 16384];
 static mut TIMER_STACK: [u8; 8192] = [0; 8192];
 static mut KEYBOARD_STACK: [u8; 8192] = [0; 8192];
+static mut PAGE_FAULT_STACK: [u8; 8192] = [0; 8192];
 
 /// Kernel stack для возврата из user mode (ring 3 → ring 0).
 /// При int 0x80 из user mode CPU переключается на TSS.rsp0 — этот стек.
@@ -62,6 +76,8 @@ pub fn init_gdt() {
             VirtAddr::new(TIMER_STACK.as_ptr() as u64 + TIMER_STACK.len() as u64);
         TSS.interrupt_stack_table[KEYBOARD_IST_INDEX as usize] =
             VirtAddr::new(KEYBOARD_STACK.as_ptr() as u64 + KEYBOARD_STACK.len() as u64);
+        TSS.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] =
+            VirtAddr::new(PAGE_FAULT_STACK.as_ptr() as u64 + PAGE_FAULT_STACK.len() as u64);
 
         // RSP0 — стек для перехода из ring 3 в ring 0 (int 0x80, прерывания).
         // Без RSP0 при int из user mode CPU использует RSP=0 → page fault.
@@ -105,13 +121,24 @@ pub fn init_gdt() {
 }
 
 /// Аварийный возврат в kernel shell при критической ошибке.
-/// Вызывается из обработчика page fault при возврате из user mode.
+/// Вызывается из обработчика page fault, double fault или Rust panic.
+///
+/// Вместо зависания (hlt loop) — восстанавливает kernel контекст:
+/// 1. Восстанавливает kernel CR3 (если была активна user P4)
+/// 2. Печатает диагностику
+/// 3. Переключается на чистый kernel стек (KERNEL_RETURN_STACK)
+/// 4. Вызывает shell::shell() — пользователь продолжает работу
+///
+/// Это возможно потому что обработчики #DF/#PF работают на IST-стеках
+/// (DOUBLE_FAULT_STACK) или на стеке обработчика — у нас есть
+/// рабочий стек для диагностики. Переключение на KERNEL_RETURN_STACK
+/// даёт чистый стек для shell, независимый от упавшего контекста.
 pub fn kernel_panic(msg: &str) -> ! {
     use x86_64::structures::paging::PhysFrame;
     use x86_64::registers::control::{Cr3, Cr3Flags};
     use crate::paging;
 
-    // Восстанавливаем kernel CR3
+    // Восстанавливаем kernel CR3 (в случае если CR3 был user P4)
     let kernel_p4 = paging::kernel_p4_phys();
     if kernel_p4 != 0 {
         unsafe {
@@ -121,11 +148,33 @@ pub fn kernel_panic(msg: &str) -> ! {
     }
 
     crate::println!("KERNEL PANIC: {}", msg);
-    crate::println!("SS=0x{:x}, CS=0x{:x}", 
+    crate::println!("SS=0x{:x}, CS=0x{:x}",
         x86_64::instructions::segmentation::SS::get_reg().0,
         x86_64::instructions::segmentation::CS::get_reg().0
     );
-    loop {
-        unsafe { core::arch::asm!("hlt"); }
+    // Бирюзовый цвет — новый код (правило .kodaruls п.6)
+    crate::println!("\x1b[36mRecovering to kernel shell...\x1b[0m");
+
+    // Переключаемся на чистый kernel стек и входим в shell.
+    // cli/sti: запрещаем прерывания на время переключения стека
+    // (чтобы ни один обработчик не использовал полу-перезаписанный RSP),
+    // затем снова разрешаем — shell нуждается в IRQ0/IRQ1 (клавиатура).
+    // Выравнивание 16 байт (SysV ABI): call push'ит 8 байт → RSP%16==8
+    // внутри shell, что соответствует ABI.
+    unsafe {
+        let stack_top = (core::ptr::addr_of!(KERNEL_RETURN_STACK) as *const u8 as u64
+            + KERNEL_RETURN_STACK.len() as u64) & !0xF;
+        core::arch::asm!(
+            "cli",
+            "mov rsp, {sp}",   // чистый kernel стек
+            "sti",
+            "call {shell}",    // вход в shell
+            "2:",
+            "hlt",             // если shell вернётся — спим
+            "jmp 2b",
+            sp = in(reg) stack_top,
+            shell = sym crate::shell::shell,
+            options(noreturn)
+        );
     }
 }

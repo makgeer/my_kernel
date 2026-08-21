@@ -17,7 +17,7 @@ use crate::pmm;
 use crate::paging;
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::println;
-use crate::paging::map_page;
+use crate::paging::copy_user_mapping_to_kernel;
 
 /// Базовый виртуальный адрес для пользовательского кода.
 /// Lower-half (бит 47 = 0) — пользовательское пространство.
