@@ -2388,3 +2388,58 @@ BRUSH:
    - убрано "на 8 языках" из описания README
 5. Коммит: 25 files changed, 2123 insertions(+), 569 deletions(-)
    Хэш: 8c86ae4, ветка: Malinka.beta_0.1.0
+
+--- 2026-08-21: НАЧАЛО ВЫТЕСНЯЮЩЕГО ПЛАНИРОВЩИКА (инфраструктура) ---
+
+КОНТЕКСТ: план развития п.1 — вытесняющий round-robin планировщик
+  с переключением контекста между ring 3 процессами. Текущий
+  scheduler.rs — кооперативный (просто вызывает функции по очереди).
+  process.rs — запускает процесс через iretq без возврата в планировщик.
+
+ШАГ 1: создан модуль src/process_manager.rs — фундамент для
+  вытесняющего планировщика (БЕЗ переключения контекста пока):
+  - ProcessContext: сохранённые регистры CPU (RAX-R15, RIP, RSP,
+    RFLAGS, CR3) — #[repr(C)] для asm-доступа по смещениям
+  - ProcessState: Ready / Running / Blocked / Terminated
+  - ManagedProcess: PID, имя, состояние, P4, entry, stack, контекст,
+    квант времени (5 тиков по умолчанию)
+  - ProcessManager: таблица [Option<ManagedProcess>; 16], round-robin
+    select_next(), terminate(), tick(), reset_quantum(), list()
+  - PROCESS_MANAGER: Mutex<ProcessManager> — глобальный экземпляр
+  - spawn(), list_processes(), scheduler_tick(), next_process() — API
+
+ДОБАВЛЕНО:
+  - src/main.rs: mod process_manager
+  - src/shell.rs: команда `ps` — вывод таблицы процессов
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh no-fb OK.
+  Команда `ps` покажет заголовок таблицы (процессов пока нет —
+  интеграция с create_process будет на следующем шаге).
+
+СЛЕДУЮЩИЙ ШАГ: context_switch (asm) + интеграция с timer_handler
+  (IRQ0 → scheduler_tick → context_switch).
+
+--- 2026-08-21: CONTEXT_SWITCH (asm) + КОММИТ В РАЗРАБОТКА ---
+
+КОНТЕКСТ: продолжение реализации вытесняющего планировщика.
+  Добавлена naked-функция context_switch для переключения регистрового
+  контекста между процессами.
+
+ИЗМЕНЕНИЯ:
+1. src/process_manager.rs — context_switch (naked, extern "C"):
+   - Сохраняет 15 GPR (RAX-R15) + RIP + RSP + RFLAGS + CR3 в
+     ProcessContext текущего процесса (по указателю в RDI)
+   - Загружает регистры из ProcessContext следующего процесса (RSI)
+   - Переключает CR3 на P4 следующего процесса
+   - Восстанавливает RSP, RFLAGS, RDI, RSI
+   - Возвращается в точку прерывания следующего процесса (push RIP; ret)
+   - Фикс: RIP сохраняется в RCX ДО перезаписи RSI/RSI (иначе
+     обращение [rsi + 0x78] после mov rsi читало бы мусор)
+2. Убраны неиспользуемые импорты (Cr3, PhysFrame, PhysAddr).
+
+СБОРКА: cargo check OK (0 предупреждений в process_manager),
+  cargo build --release OK, make_iso.sh no-fb OK.
+
+ПРИМЕЧАНИЕ: context_switch пока не вызывается — это примитив для
+  следующего шага (интеграция с timer_handler IRQ0).
+  Команда `ps` работает (показывает пустую таблицу).

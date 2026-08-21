@@ -19,6 +19,7 @@ mod allocator;
 mod pmm;
 mod paging;
 mod process;
+mod process_manager;
 mod elf;
 mod script;
 mod brush;
