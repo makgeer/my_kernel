@@ -289,6 +289,23 @@ pub fn reset_quantum_if_running() {
     }
 }
 
+/// Отмечает текущий процесс как завершённый (Terminated).
+/// Вызывается из обработчика syscall exit (int 0x80, #60).
+/// После этого слот процесса можно переиспользовать.
+pub fn terminate_current() {
+    let mut pm = PROCESS_MANAGER.lock();
+    if let Some(idx) = pm.current {
+        if let Some(ref mut proc) = pm.processes[idx] {
+            proc.state = ProcessState::Terminated;
+            crate::println!(
+                "  process PID={} ({}) -> Terminated",
+                proc.pid, proc.name
+            );
+        }
+        pm.current = None;
+    }
+}
+
 /// Выбирает следующий процесс для выполнения.
 /// Возвращает индекс в таблице или None.
 pub fn next_process() -> Option<usize> {

@@ -647,6 +647,10 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
             );
             regs.rax = 0; // успешное завершение syscall
 
+            // Отмечаем текущий процесс в менеджере как Terminated,
+            // чтобы команда ps не показывала его как Ready.
+            crate::process_manager::terminate_current();
+
             // 1. Восстанавливаем kernel CR3 (сейчас активна user P4 процесса)
             let kernel_p4 = crate::paging::kernel_p4_phys();
             if kernel_p4 != 0 {

@@ -2472,3 +2472,23 @@ BRUSH:
     запускается в ring 3.
   ps -> показывает зарегистрированный процесс (после возврата
     в shell, если процесс завершится через exit).
+
+--- 2026-08-22: ФИКС ps — TERMINATE_CURRENT ПРИ EXIT ---
+
+КОНТЕКСТ: после run_elf → exit(0) → возврат в shell, команда ps
+  показывала завершённый процесс в состоянии Ready. Процесс не
+  помечался как Terminated в менеджере.
+
+ИЗМЕНЕНИЯ:
+1. src/process_manager.rs — terminate_current():
+   - Помечает текущий процесс как Terminated
+   - Сбрасывает pm.current = None
+   - Выводит диагностику "process PID=N (name) -> Terminated"
+2. src/interrupts.rs (exit handler, syscall #60):
+   - Добавлен вызов terminate_current() ПЕРЕД восстановлением CR3
+   — процесс корректно завершается в менеджере
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh no-fb OK.
+
+ОЖИДАНИЕ (вручную):
+  run_elf -> exit(0) -> ps -> таблица пуста (процесс Terminated).
