@@ -45,11 +45,11 @@
 
 ```mermaid
 graph TD
-    A[Пользовательский процесс Ring 3] -->|int 0x80| B[Обработчик Syscall Ring 0];
-    B --> C[Ядро Ring 0];
-    C --> D[Менеджер памяти PMM/Paging];
+    A[[Пользовательский процесс] Ring 3] -->|int 0x80| B[[Обработчик] Syscall Ring 0];
+    B --> C[[Ядро] Ring 0];
+    C --> D[[Менеджер памяти] PMM/Paging];
     C --> E[Планировщик];
-    C --> F[Драйверы VGA/Serial];
+    C --> F[[Драйверы] VGA/Serial];
     F --> G[Вывод на экран];
 
     H[Оболочка Shell Ring 0] -->|создание| A;
