@@ -102,6 +102,8 @@ pub fn shell() {
                 println!("  run_user   - create and run user process in ring 3");
                 println!("  run_elf    - load and run ELF64 user program (ring 3)");
                 println!("  run_syscall - ELF with read/write syscalls (multi-segment)");
+                println!("  run_multi  - run 2 processes (loop_a + loop_b) for preemptive scheduler test");
+                println!("  test_ipc   - run 2 processes (ipc_sender + ipc_receiver) for IPC test");
             }
             "about" => {
                 println!("Malinka v0.1.0");
@@ -164,12 +166,11 @@ pub fn shell() {
                 println!("cursor: row={}, col={}", r, c);
             }
             "clear" => {
-                crate::vesa::vesa_clear_screen(0x000000);
-                crate::vga::WRITER.lock().clear();
-                // Очистка буфера терминала — с момента интеграции терминала
-                // весь вывод идёт через TERMINAL, и без очистки его буфера
-                // следующая перерисовка вернёт старый текст.
+                // Очистка через терминал: clear_screen() очищает буфер 80x25,
+                // сбрасывает курсор и шлёт ANSI-коды очистки в serial.
+                // framebuffer/VGA перерисуются при следующем flush().
                 crate::terminal::TERMINAL.lock().clear_screen();
+                crate::terminal::TERMINAL.lock().flush();
             }
             "test_alloc" => {
                 // Проверка аллокатора кучи: выделяем Box, Vec и String,
@@ -526,6 +527,20 @@ pub fn shell() {
                         println!("  FAILED: create_elf_process error: {}", e);
                     }
                 }
+            }
+            "run_multi" => {
+                // Тест вытесняющего планировщика (правило .kodaruls п.12):
+                // запускает 2 процесса через src/tests.rs::test_scheduler().
+                // Ожидаемый вывод: чередование "A" и "B", затем возврат в shell.
+                crate::tests::test_scheduler();
+                // test_scheduler не возвращается (run_process noreturn).
+                // Код ниже не выполняется — возврат через kernel_return_to_shell.
+            }
+            "test_ipc" => {
+                // Тест IPC: отправитель шлёт 3 сообщения получателю.
+                // Ожидаемый вывод: "MSG1HELLOWORLD", затем возврат в shell.
+                crate::tests::test_ipc();
+                // test_ipc не возвращается (run_process noreturn).
             }
             "color" => {
                 // Демонстрация 16-цветной палитры ANSI SGR.

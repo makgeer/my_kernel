@@ -9,6 +9,8 @@ test_alloc
 *.swp
 # Правила разработки — локальные, не в репозитории
 .kodaruls
+# Контекст проекта Koda — локальный, не в репозитории
+KODA.md
 # Объектные файлы user-программ (артефакты build_user.sh)
 user_programs/*.o
 bochs-2.8.tar.gz

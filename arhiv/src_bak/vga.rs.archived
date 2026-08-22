@@ -1,0 +1,29 @@
+// ============================================================================
+// src/vga.rs — макросы вывода print!/println!
+//
+// Раньше здесь же был VgaWriter (прямой вывод в VGA 0xB8000), но после
+// интеграции терминала (terminal.rs) он не используется — терминал сам
+// рендерит в VGA + Serial + Framebuffer. VgaWriter перенесён в arhiv/src_bak/.
+//
+// Макросы остаются здесь, т.к. используются во всём ядре через $crate::print!.
+// ============================================================================
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        // Интеграция терминала: единый вывод через terminal::TERMINAL
+        // вместо трёх независимых write!. Терминал сам разбирает ANSI-коды
+        // (цвета, курсор, прокрутка) и рендерит во все три устройства
+        // (VGA + Serial + Framebuffer) через flush(). Старые цели (WRITER,
+        // SERIAL, VesaWriter) остаются в коде — не удаляются, но больше
+        // не вызываются из print!.
+        let _ = write!($crate::terminal::TERMINAL.lock(), $($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! println {
+    () => ($crate::print!("\n"));
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}

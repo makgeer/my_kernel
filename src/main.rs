@@ -5,14 +5,13 @@
 
 extern crate alloc;
 
-mod vga;
+mod video;
 mod interrupts;
 mod scheduler;
 mod tasks;
 mod limine_fb;
 mod serial;
 mod gdt;
-mod vesa;
 mod shell;
 mod terminal;
 mod allocator;
@@ -23,6 +22,8 @@ mod process_manager;
 mod elf;
 mod script;
 mod brush;
+mod debug;
+mod tests;
 
 use core::panic::PanicInfo;
 use crate::scheduler::{add_task};
@@ -78,13 +79,13 @@ pub extern "C" fn _start_rust() -> ! {
                 // (0xffff8000fd000000 + 0xffff800000000000 = 0xffff0000fd000000)
                 // и запись по несуществующему адресу → page fault → triple fault.
                 let fb_virt = fb.address() as *mut u32;
-                vesa::vesa_set_framebuffer(
+                video::set_framebuffer(
                     fb_virt,
                     fb.pitch as u32,
                     width as u32,
                     height as u32,
                 );
-                vesa::vesa_clear_screen(0x000000);
+                video::clear_screen(0x000000);
                 println!("Framebuffer output enabled");
             } else {
                 println!("No framebuffer available");

@@ -93,40 +93,6 @@ pub fn serial_write_num(n: u16) {
     write_byte(b'0' + ones as u8);
 }
 
-/// Запись 64-битного числа в 16-ричном виде (без префикса 0x).
-/// Прямой посимвольный вывод без fmt/alloc — безопасен даже если
-/// terminal/lock повреждены (используется в #PF/#DF диагностике).
-pub fn write_hex(value: u64) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    // Выводим 16 нибблов от старшего к младшему.
-    let mut written = false;
-    for shift in (0..64).step_by(4).rev() {
-        let nibble = ((value >> shift) & 0xF) as usize;
-        // Пропускаем ведущие нули (но последнюю цифру печатаем всегда)
-        if nibble != 0 || shift == 0 {
-            write_byte(HEX[nibble]);
-            written = true;
-        } else if written {
-            write_byte(HEX[nibble]);
-        }
-    }
-}
-
-/// Прямая диагностическая строка в COM1 без fmt/alloc и без lock.
-/// Используется в обработчиках исключений (#PF/#DF), где println!
-/// (terminal + lock) может сам вызвать page fault / deadlock.
-pub fn serial_write_str_direct(s: &str) {
-    for b in s.bytes() {
-        match b {
-            b'\n' => {
-                write_byte(b'\r');
-                write_byte(b'\n');
-            }
-            _ => write_byte(b),
-        }
-    }
-}
-
 /// Обёртка для использования в макросах через fmt::Write
 pub struct SerialWriter;
 

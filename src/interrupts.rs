@@ -27,9 +27,15 @@ pub fn init_idt() {
         // unsafe: set_stack_index не проверяет диапазон, но индексы 1..=3
         // гарантированы константами инициализации TSS в gdt::init_gdt()
         unsafe { df.set_stack_index(crate::gdt::DOUBLE_FAULT_IST_INDEX) };
-        // IRQ0 — таймер (вектор 0x20, PIC offset), свой стек IST 2
-        let t = idt[0x20].set_handler_fn(timer_handler);
-        unsafe { t.set_stack_index(crate::gdt::TIMER_IST_INDEX) };
+        // IRQ0 — таймер (вектор 0x20, PIC offset), свой стек IST 2.
+        // Naked handler: сохраняет GPR, вызывает timer_schedule_rust,
+        // модифицирует IRET-фрейм для переключения контекста, iretq.
+        // set_handler_addr — CPU переходит на функцию напрямую без пролога.
+        unsafe {
+            idt[0x20]
+                .set_handler_addr(VirtAddr::new(timer_handler_naked as u64))
+                .set_stack_index(crate::gdt::TIMER_IST_INDEX);
+        }
         // IRQ1 — клавиатура (вектор 0x21, PIC offset), свой стек IST 3
         let k = idt[0x21].set_handler_fn(keyboard_handler);
         unsafe { k.set_stack_index(crate::gdt::KEYBOARD_IST_INDEX) };
@@ -100,11 +106,11 @@ extern "x86-interrupt" fn double_fault_handler(
     );
     // Прямая serial-диагностика без terminal — гарантирует вывод даже
     // если println (terminal/lock) недоступен.
-    crate::serial::serial_write_str_direct("\n[DF] direct: RIP=0x");
-    crate::serial::write_hex(stack_frame.instruction_pointer.as_u64());
-    crate::serial::serial_write_str_direct(" CR2=0x");
-    crate::serial::write_hex(cr2);
-    crate::serial::serial_write_str_direct("\n");
+    crate::debug::serial_write_str_direct("\n[DF] direct: RIP=0x");
+    crate::debug::write_hex(stack_frame.instruction_pointer.as_u64());
+    crate::debug::serial_write_str_direct(" CR2=0x");
+    crate::debug::write_hex(cr2);
+    crate::debug::serial_write_str_direct("\n");
     // Дамп IRET-фрейма, который iretq пытался вытолкнуть.
     // stack_frame.stack_pointer — это RSP на момент #DF; на нём (или рядом)
     // лежит фрейм прерванного/фейлящего iretq контекста.
@@ -202,6 +208,78 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     outb(PIC1, 0x20);
 }
 
+/// Naked timer handler для вытесняющего планировщика.
+///
+/// Заменяет extern "x86-interrupt" timer_handler на векторе 0x20.
+///
+/// Layout стека при входе (IST, без error code — timer IRQ не пушит код):
+///   RSP + 0x00: RIP     ← push'd last by CPU
+///   RSP + 0x08: CS
+///   RSP + 0x10: RFLAGS
+///   RSP + 0x18: RSP_user
+///   RSP + 0x20: SS      ← push'd first by CPU
+///
+/// Handler:
+/// 1. Пушит все 15 GPR (rax..r15) → на стеке 15*8 = 120 байт GPR + 40 IRET
+/// 2. mov rdi = rsp (указатель на GPR), lea rsi = [rsp + 120] (указатель на IRET-фрейм)
+/// 3. call timer_schedule_rust(regs: *mut GprRegs, frame: *mut IretFrame)
+/// 4. Если вернула false — просто pop GPR, EOI, iretq (нет переключения)
+/// 5. Если вернула true — GPR и IRET-фрейм уже модифицированы планировщиком
+/// 6. pop GPR (возможно изменённые), EOI, iretq → переход к следующему процессу
+#[unsafe(naked)]
+unsafe extern "C" fn timer_handler_naked() -> ! {
+    core::arch::naked_asm!(
+        // Сохраняем все GPR (порядок: r15 первым → rax последним)
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        // rdi = указатель на сохранённые GPR (начало массива push'ей)
+        "mov rdi, rsp",
+        // rsi = указатель на IRET-фрейм (после 15 GPR = 15*8 = 0x78)
+        "lea rsi, [rsp + 0x78]",
+        // Вызываем Rust-планировщик
+        "call {func}",
+        // EOI в PIC — ДО восстановления GPR.
+        // push rax: сохраняем RAX, т.к. out портит AL через mov al.
+        "push rax",
+        "mov dx, 0x20",
+        "mov al, 0x20",
+        "out dx, al",
+        "pop rax",
+        // Восстанавливаем GPR (порядок: rax первым → r15 последним)
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        // Возврат к (возможно другому) процессу
+        "iretq",
+        func = sym crate::process_manager::timer_schedule_rust,
+    );
+}
+
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     let mut port = Port::<u8>::new(0x60);
     let scancode = unsafe { port.read() };
@@ -234,15 +312,15 @@ extern "x86-interrupt" fn page_fault_handler(
     }
     // Прямая serial-диагностика (без println/terminal/lock): #PF может
     // возникнуть в контексте, где terminal или lock повреждены.
-    crate::serial::serial_write_str_direct("\n[PF] direct: CR2=0x");
-    crate::serial::write_hex(cr2);
-    crate::serial::serial_write_str_direct(" err=0x");
-    crate::serial::write_hex(err_code.bits() as u64);
-    crate::serial::serial_write_str_direct(" RIP=0x");
-    crate::serial::write_hex(stack_frame.instruction_pointer.as_u64());
-    crate::serial::serial_write_str_direct(" CS=0x");
-    crate::serial::write_hex(stack_frame.code_segment.0 as u64);
-    crate::serial::serial_write_str_direct("\n");
+    crate::debug::serial_write_str_direct("\n[PF] direct: CR2=0x");
+    crate::debug::write_hex(cr2);
+    crate::debug::serial_write_str_direct(" err=0x");
+    crate::debug::write_hex(err_code.bits() as u64);
+    crate::debug::serial_write_str_direct(" RIP=0x");
+    crate::debug::write_hex(stack_frame.instruction_pointer.as_u64());
+    crate::debug::serial_write_str_direct(" CS=0x");
+    crate::debug::write_hex(stack_frame.code_segment.0 as u64);
+    crate::debug::serial_write_str_direct("\n");
 
     crate::println!(
         "PAGE FAULT (ticks={}, err=0x{:x}, RIP=0x{:x}, CR2=0x{:x})",
@@ -472,10 +550,10 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
     let arg2 = regs.rsi;
     let arg3 = regs.rdx;
 
-    // Диагностика. ВАЖНО: для read (#0) НЕ печатаем — read блокирующий,
-    // и до нажатия клавиши вызывается многократно. Иначе лог/терминал
-    // захлёстываются выводом, а сбор данных через nc замедляется.
-    if syscall_num != 0 {
+    // Диагностика. ВАЖНО: для read (#0) и write (#1) НЕ печатаем —
+    // read блокирующий (многократные вызовы), write вызывается часто
+    // (каждый символ в цикличных процессах). Иначе лог захлёбывается.
+    if syscall_num != 0 && syscall_num != 1 {
         crate::println!(
             "SYSCALL #{} from ring 3! (arg1=0x{:016x}, arg2=0x{:016x}, arg3=0x{:016x})",
             syscall_num, arg1, arg2, arg3
@@ -636,62 +714,218 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
                 }
             }
         }
-        60 => {
-            // exit(code) — завершение процесса и возврат в kernel shell.
-            // НЕ переходим в user mode: модифицируем IRET-фрейм и CR3 так,
-            // чтобы iretq после syscall_entry вернул нас в kernel.
-            let code = arg1;
-            crate::println!(
-                "  exit({}) — процесс завершён, возврат в kernel shell",
-                code
-            );
-            regs.rax = 0; // успешное завершение syscall
+        40 => {
+            // ipc_send(pid, buf, len)
+            let to_pid = arg1 as usize;
+            let buf = arg2 as *const u8;
+            let len = arg3 as usize;
 
-            // Отмечаем текущий процесс в менеджере как Terminated,
-            // чтобы команда ps не показывала его как Ready.
-            crate::process_manager::terminate_current();
-
-            // 1. Восстанавливаем kernel CR3 (сейчас активна user P4 процесса)
-            let kernel_p4 = crate::paging::kernel_p4_phys();
-            if kernel_p4 != 0 {
-                unsafe {
-                    let frame = PhysFrame::containing_address(PhysAddr::new(kernel_p4));
-                    Cr3::write(frame, Cr3Flags::empty());
+            // Копируем данные из user space в kernel-буфер (безопасно).
+            let mut kbuf = [0u8; crate::process_manager::IPC_MSG_SIZE];
+            let copy_len = len.min(crate::process_manager::IPC_MSG_SIZE);
+            if copy_len > 0 && !copy_from_user(kbuf.as_mut_ptr(), buf as u64, copy_len) {
+                crate::println!("  ipc_send: invalid user buffer at 0x{:x}", buf as u64);
+                regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
+            } else {
+                let res = crate::process_manager::ipc_send(to_pid, &kbuf[..copy_len]);
+                regs.rax = res as u64;
+                if res != 0 {
+                    crate::println!(
+                        "  ipc_send: failed (to_pid={})",
+                        to_pid
+                    );
                 }
             }
+        }
+        41 => {
+            // ipc_recv(buf, len)
+            let buf = arg1 as *mut u8;
+            let len = arg2 as usize;
 
-            // 2. Модифицируем IRET-фрейм для возврата в kernel mode.
-            //    ВАЖНО: это сопряжено с потерей user-стека/контекста —
-            //    процесс завершается, его P4/фреймы остаются (утечка в
-            //    учебном ядре; корректное освобождение — отдельная задача).
-            //    Текущий kernel-стек (KERNEL_RETURN_STACK) — валиден.
-            unsafe {
-                let mut m = frame.as_mut();
-                m.update(|f| {
-                    // RIP → kernel_return_to_shell (возвращаемся в shell)
-                    f.instruction_pointer =
-                        VirtAddr::new(kernel_return_to_shell as *const () as u64);
-                    // CS → kernel code selector (RPL=0, ring 0)
-                    f.code_segment = SegmentSelector::new(
-                        crate::gdt::KERNEL_CODE_SELECTOR >> 3,
-                        PrivilegeLevel::Ring0,
-                    );
-                    // SS → kernel data selector (RPL=0)
-                    f.stack_segment = SegmentSelector::new(
-                        crate::gdt::KERNEL_DATA_SELECTOR >> 3,
-                        PrivilegeLevel::Ring0,
-                    );
-                    // RSP → вершина KERNEL_RETURN_STACK (валидный kernel стек)
-                    let stack_ptr =
-                        core::ptr::addr_of!(crate::gdt::KERNEL_RETURN_STACK) as *const u8;
-                    f.stack_pointer = VirtAddr::new(
-                        stack_ptr as u64 + crate::gdt::KERNEL_RETURN_STACK.len() as u64
-                    );
-                });
+            // Проверяем, что user-буфер можно писать.
+            if !user_range_valid(buf as u64, len, true) {
+                crate::println!(
+                    "  ipc_recv: invalid user buffer at 0x{:x}",
+                    buf as u64
+                );
+                regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
+            } else {
+                let mut kbuf = [0u8; crate::process_manager::IPC_MSG_SIZE];
+                if let Some((from_pid, n)) = crate::process_manager::ipc_recv(&mut kbuf) {
+                    // Копируем данные в user space.
+                    let copy_len = n.min(len);
+                    if copy_to_user(kbuf.as_ptr(), buf as u64, copy_len) {
+                        // Возвращаем from_pid в rax, длину в rdx (как
+                        // дополнительный результат). Процесс знает, от кого
+                        // пришло сообщение и сколько байт скопировано.
+                        regs.rax = from_pid as u64;
+                        regs.rdx = copy_len as u64;
+                    } else {
+                        regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
+                    }
+                } else {
+                    // Нет сообщений — блокируем процесс и переключаемся
+                    // на следующий готовый. При возобновлении процесс
+                    // повторит int 0x80 → ipc_recv снова.
+                    crate::println!("  ipc_recv: blocking (no messages)");
+
+                    // Собираем GPR в правильном порядке (как GprRegs):
+                    // rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15.
+                    let gpr = [
+                        regs.rax, regs.rbx, regs.rcx, regs.rdx,
+                        regs.rsi, regs.rdi, regs.rbp,
+                        regs.r8, regs.r9, regs.r10, regs.r11,
+                        regs.r12, regs.r13, regs.r14, regs.r15,
+                    ];
+                    let rip = frame.instruction_pointer.as_u64();
+                    let rsp = frame.stack_pointer.as_u64();
+                    let cs = frame.code_segment.0 as u64;
+                    let ss = frame.stack_segment.0 as u64;
+                    let rflags = frame.cpu_flags.bits() as u64;
+
+                    match crate::process_manager::block_current_and_switch(
+                        &gpr, rip, rsp, cs, ss, rflags,
+                    ) {
+                        Some((_next_idx, info)) => {
+                            // Восстанавливаем GPR следующего процесса в regs.
+                            regs.rax = info.rax;
+                            regs.rbx = info.rbx;
+                            regs.rcx = info.rcx;
+                            regs.rdx = info.rdx;
+                            regs.rsi = info.rsi;
+                            regs.rdi = info.rdi;
+                            regs.rbp = info.rbp;
+                            regs.r8 = info.r8;
+                            regs.r9 = info.r9;
+                            regs.r10 = info.r10;
+                            regs.r11 = info.r11;
+                            regs.r12 = info.r12;
+                            regs.r13 = info.r13;
+                            regs.r14 = info.r14;
+                            regs.r15 = info.r15;
+
+                            // Переключаем CR3 на P4 следующего процесса.
+                            unsafe {
+                                let phys_frame = PhysFrame::containing_address(PhysAddr::new(info.cr3));
+                                Cr3::write(phys_frame, Cr3Flags::empty());
+                            }
+
+                            // Модифицируем IRET-фрейм для входа в ring 3.
+                            unsafe {
+                                let mut m = frame.as_mut();
+                                m.update(|f| {
+                                    f.instruction_pointer = VirtAddr::new(info.rip);
+                                    f.code_segment = SegmentSelector::new(
+                                        (info.cs as u16) >> 3,
+                                        PrivilegeLevel::Ring3,
+                                    );
+                                    f.stack_segment = SegmentSelector::new(
+                                        (info.ss as u16) >> 3,
+                                        PrivilegeLevel::Ring3,
+                                    );
+                                    f.stack_pointer = VirtAddr::new(info.rsp);
+                                    f.cpu_flags = x86_64::registers::rflags::RFlags::from_bits_truncate(info.rflags);
+                                });
+                            }
+                            // iretq в syscall_entry → переход в следующий процесс.
+                        }
+                        None => {
+                            // Нет готовых процессов — нельзя блокировать.
+                            crate::println!("  ipc_recv: no ready process, returning -1");
+                            regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EAGAIN
+                        }
+                    }
+                }
             }
-            // После возврата в syscall_entry pop'ы восстановят регистры,
-            // затем iretq использует модифицированный фрейм: CPU переходит
-            // в ring 0 на kernel_return_to_shell с kernel стеком.
+        }
+        60 => {
+            // exit(code) — завершение процесса.
+            // Если есть другой готовый процесс — переключаемся на него.
+            // Иначе — возврат в kernel shell.
+            let code = arg1;
+            crate::println!("  exit({})", code);
+            regs.rax = 0;
+
+            let next_idx = crate::process_manager::terminate_current();
+
+            match next_idx {
+                Some(idx) => {
+                    // Есть готовый процесс — переключаемся на него.
+                    let info = crate::process_manager::switch_to_next_after_exit(idx);
+
+                    // Восстанавливаем GPR следующего процесса в regs.
+                    regs.rax = info.rax;
+                    regs.rbx = info.rbx;
+                    regs.rcx = info.rcx;
+                    regs.rdx = info.rdx;
+                    regs.rsi = info.rsi;
+                    regs.rdi = info.rdi;
+                    regs.rbp = info.rbp;
+                    regs.r8 = info.r8;
+                    regs.r9 = info.r9;
+                    regs.r10 = info.r10;
+                    regs.r11 = info.r11;
+                    regs.r12 = info.r12;
+                    regs.r13 = info.r13;
+                    regs.r14 = info.r14;
+                    regs.r15 = info.r15;
+
+                    // Переключаем CR3 на P4 следующего процесса
+                    unsafe {
+                        let phys_frame = PhysFrame::containing_address(PhysAddr::new(info.cr3));
+                        Cr3::write(phys_frame, Cr3Flags::empty());
+                    }
+
+                    // Модифицируем IRET-фрейм для входа в ring 3
+                    unsafe {
+                        let mut m = frame.as_mut();
+                        m.update(|f| {
+                            f.instruction_pointer = VirtAddr::new(info.rip);
+                            f.code_segment = SegmentSelector::new(
+                                (info.cs as u16) >> 3,
+                                PrivilegeLevel::Ring3,
+                            );
+                            f.stack_segment = SegmentSelector::new(
+                                (info.ss as u16) >> 3,
+                                PrivilegeLevel::Ring3,
+                            );
+                            f.stack_pointer = VirtAddr::new(info.rsp);
+                            f.cpu_flags = x86_64::registers::rflags::RFlags::from_bits_truncate(info.rflags);
+                        });
+                    }
+                    // iretq в syscall_entry → переход в следующий процесс
+                }
+                None => {
+                    // Нет готовых процессов — возвращаемся в kernel shell.
+                    let kernel_p4 = crate::paging::kernel_p4_phys();
+                    if kernel_p4 != 0 {
+                        unsafe {
+                            let frame = PhysFrame::containing_address(PhysAddr::new(kernel_p4));
+                            Cr3::write(frame, Cr3Flags::empty());
+                        }
+                    }
+
+                    unsafe {
+                        let mut m = frame.as_mut();
+                        m.update(|f| {
+                            f.instruction_pointer =
+                                VirtAddr::new(kernel_return_to_shell as *const () as u64);
+                            f.code_segment = SegmentSelector::new(
+                                crate::gdt::KERNEL_CODE_SELECTOR >> 3,
+                                PrivilegeLevel::Ring0,
+                            );
+                            f.stack_segment = SegmentSelector::new(
+                                crate::gdt::KERNEL_DATA_SELECTOR >> 3,
+                                PrivilegeLevel::Ring0,
+                            );
+                            let stack_ptr =
+                                core::ptr::addr_of!(crate::gdt::KERNEL_RETURN_STACK) as *const u8;
+                            let stack_top = stack_ptr as u64 + crate::gdt::KERNEL_RETURN_STACK.0.len() as u64;
+                            f.stack_pointer = VirtAddr::new(stack_top & !0xF);
+                        });
+                    }
+                }
+            }
         }
         _ => {
             crate::println!("  Unknown syscall number: {}", syscall_num);

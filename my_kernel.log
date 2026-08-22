@@ -2516,4 +2516,474 @@ BRUSH:
    таблицы команда ps должна завершаться, не висеть).
 2. Продолжить вытесняющий планировщик: реальное переключение контекста
    из timer_handler через context_switch.
-3. Далее по плану развития (IPC, ФС, защита памяти).
+ 3. Далее по плану развития (IPC, ФС, защита памяти).
+
+--- 2026-08-22 (продолжение): ФИКС ps — DEADLOCK НА PROCESS_MANAGER ---
+
+КОНТЕКСТ: команда ps зависала. Причина: list_processes() захватывает
+  PROCESS_MANAGER.lock(), в этот момент срабатывает timer IRQ (IRQ0) →
+  timer_handler → scheduler_tick() → пытается залочить тот же Mutex →
+  spinlock deadlock (ядро виснет, т.к. interrupts уже отключены
+  spinlock'ом, но timer использует IST — стек отдельный, но lock занят).
+
+РЕШЕНИЕ: обернуть все функции, вызываемые из обычного контекста (не из
+  IRQ handler), в interrupts::without_interrupts(). Это отключает
+  прерывания на время удержания lock, предотвращая повторный вход.
+
+ИЗМЕНЕНИЯ (src/process_manager.rs):
+  - Добавлен use x86_64::instructions::interrupts
+  - spawn() → обёрнут в without_interrupts
+  - list_processes() → обёрнут в without_interrupts
+  - terminate_current() → обёрнут в without_interrupts
+  - next_process() → обёрнут в without_interrupts
+  - scheduler_tick() и reset_quantum_if_running() НЕ обёрнуты: они
+    вызываются из timer_handler (прерывания уже отключены CPU).
+
+СБОРКА: cargo check OK (только warnings, все прежние).
+
+ОЖИДАНИЕ (вручную):
+  ps -> таблица процессов выводится и команда завершается (не виснет).
+  run_elf -> exit(0) -> ps -> процесс корректно Terminated.
+
+--- 2026-08-22 (продолжение 2): ОПТИМИЗАЦИЯ flush() — auto_flush ---
+
+КОНТЕКСТ: команда ps выводила только ~18 символов и система зависала.
+  Причина: каждый println! в list() вызывает flush() → полная перерисовка
+  framebuffer (80×25 = 2000 ячеек × 128 пикселей = 256 000 пикселей).
+  В Bochs framebuffer-рендер крайне медленный → система тормозила на
+  десятки секунд, выглядя как зависание. В list() минимум 2 println!
+  → 2 полных перерисовки.
+
+РЕШЕНИЕ: добавлен флаг auto_flush в Terminal (по умолчанию true).
+  write_str вызывает flush() только если auto_flush = true.
+  list() в process_manager отключает auto_flush перед выводом, печатает
+  все строки (текст идёт в serial и буфер терминала), затем делает
+  ОДИН flush() в конце. Результат: 1 перерисовка вместо N.
+
+ИЗМЕНЕНИЯ:
+1. src/terminal.rs:
+   - Добавлено поле auto_flush: bool (default true)
+   - Добавлен метод set_auto_flush(bool)
+   - write_str: flush() только при auto_flush == true
+   - flush() уже был pub — не изменён
+2. src/process_manager.rs:
+   - list(): set_auto_flush(false) перед выводом,
+     set_auto_flush(true) + flush() после вывода
+
+СБОРКА: cargo build --release OK, make_iso.sh OK.
+
+ОЖИДАНИЕ (вручную):
+  ps -> полный вывод таблицы процессов без зависания.
+
+--- 2026-08-22 (продолжение 3): РАСЧИСТКА КЛАДБИЩА — vga.rs + vesa.rs ---
+
+КОНТЕКСТ: vga.rs и vesa.rs содержали мёртвый код — старый вывод до
+  интеграции терминала. VgaWriter (прямой вывод в VGA 0xB8000) и весь
+  VBE BIOS код (vesa_init, vbe_call, VbeControllerInfo, VbeModeInfo,
+  vesa_draw_char, vesa_print_str, VesaWriter, vesa_scroll_screen и т.д.)
+  не вызывались из живых путей. Терминал (terminal.rs) заменил их всех.
+
+ИЗМЕНЕНИЯ:
+1. shell.rs — команда clear:
+   - Убраны vesa::vesa_clear_screen + vga::WRITER.lock().clear()
+   - Оставлен только terminal::TERMINAL.lock().clear_screen() + flush()
+   (терминал сам рендерит во все устройства, дублирование не нужно)
+
+2. src/vga.rs — ВЫЧИЩЕН мёртвый код:
+   - VgaWriter (struct, write_char, scroll, clear, print, fmt::Write)
+   - WRITER static
+   - Остались ТОЛЬКО макросы print!/println! (24 строки вместо 110)
+   - Мёртвый код → arhiv/src_bak/vga_old.bak
+
+3. src/vesa.rs — ВЫЧИЩЕН мёртвый код:
+   - VbeCallParams, VbeControllerInfo, VbeModeInfo structs
+   - VESA_MODE_INFO static, VESA_BPP, VESA_TEXT_X/Y/COLOR
+   - vesa_init(), vbe_call(), vesa_scroll_screen()
+   - vesa_put_pixel(), vesa_get_width(), vesa_get_height()
+   - vesa_draw_char(), vesa_print_str(), VesaWriter
+   - VBE constants (VBE_FUNCTION_*, VBE_GET_*, VESA_MODE_1280x800x32)
+   - Осталось ЖИВОЕ: vesa_set_framebuffer, vesa_clear_screen,
+     vesa_draw_char_ex, FONT_DATA, FONT_WIDTH/HEIGHT, statics
+     (~130 строк вместо 649)
+   - Мёртвый код → arhiv/src_bak/vesa_old.bak
+
+РЕЗУЛЬТАТ:
+  - warnings: 44 → 28 (16 мёртвых warnings ушли с мёртвым кодом)
+  - Ошибок: 0
+  - cargo build --release OK, make_iso.sh OK
+  - Ни одной живой функции не удалено
+
+--- 2026-08-22 (продолжение 4): ОБЪЕДИНЕНИЕ vga.rs + vesa.rs → video.rs + ФИКС ps ---
+
+КОНТЕКСТ: две задачи от пользователя:
+  1. Завершённый процесс (run_elf → exit) оставался в ps как Ready
+  2. vga.rs и vesa.rs — два файла для одной задачи (вывод); объединить
+
+ПРОБЛЕМА 1: terminate_current() не находила процесс, т.к. pm.current
+  был None. spawn() добавляет процесс в Ready, но никто не устанавливал
+  current = Some(index) перед запуском в ring 3.
+
+РЕШЕНИЕ 1:
+  - process_manager.rs: добавлена set_current_by_p4(p4_phys) — находит
+    процесс по P4, помечает Running, устанавливает current.
+  - process.rs: run_process() вызывает set_current_by_p4(proc.p4_phys)
+    ПЕРЕД переходом в ring 3.
+  - terminate_current() теперь корректно находит и завершает процесс.
+
+ПРОБЛЕМА 2: vga.rs (макросы, 29 строк) и vesa.rs (framebuffer, 267 строк)
+  — два файла для одной ответственности (вывод).
+
+РЕШЕНИЕ 2:
+  - Создан src/video.rs — объединение:
+    * ЧАСТЬ 1: макросы print!/println! (из vga.rs)
+    * ЧАСТЬ 2: framebuffer — set_framebuffer, draw_char_ex, clear_screen,
+      FONT_DATA, FONT_WIDTH/HEIGHT, statics (из vesa.rs)
+  - Функции переименованы (убран префикс vesa_):
+    vesa_set_framebuffer → set_framebuffer
+    vesa_draw_char_ex → draw_char_ex
+    vesa_clear_screen → clear_screen
+  - main.rs: mod vga + mod vesa → mod video
+  - main.rs: vesa::vesa_* → video::*
+  - terminal.rs: crate::vesa::vesa_draw_char_ex → crate::video::draw_char_ex
+  - Старые файлы перенесены: src/vga.rs → arhiv/src_bak/vga.rs.archived
+                            src/vesa.rs → arhiv/src_bak/vesa.rs.archived
+
+СБОРКА: cargo check OK (28 warnings, 0 errors), cargo build --release OK,
+  make_iso.sh OK.
+
+ОЖИДАНИЕ (вручную):
+  run_elf → exit(0) → ps → процесс НЕ виден (Terminated, list() пропускает).
+  run_user → exit(0) → ps → аналогично.
+  Все команды работают как прежде — вывод не изменился.
+
+--- 2026-08-22 (продолжение 5): ПОДТВЕРЖДЕНО ---
+
+ПОЛЬЗОВАТЕЛЬ ПОДТВЕРДИЛ: всё работает.
+  - ps после run_elf → exit(0) → процесс корректно завершён (не виден)
+  - run_user → exit(0) → ps → аналогично
+  - Объединённый video.rs работает (вывод VGA + Serial + Framebuffer)
+
+ИТОГИ СЕССИИ 2026-08-22:
+  1. Фикс deadlock ps (without_interrupts на PROCESS_MANAGER lock)
+  2. Оптимизация flush (auto_flush — 1 перерисовка вместо N)
+  3. Расчистка кладбища: vga.rs VgaWriter + vesa.rs VBE BIOS → arhiv
+  4. Фикс terminate_current (set_current_by_p4 перед ring 3)
+  5. Объединение vga.rs + vesa.rs → video.rs
+  6. warnings: 44 → 28, ошибок: 0
+
+СЛЕДУЮЩЕЕ (по плану):
+  - Реальное переключение контекста из timer_handler через context_switch
+  - IPC, ФС, защита памяти
+
+--- 2026-08-22 (продолжение 6): ВЫТЕСНЯЮЩИЙ ПЕРЕКЛЮЧАТЕЛЬ КОНТЕКСТА ---
+
+КОНТЕКСТ: реализация реального переключения контекста из timer IRQ.
+  До этого timer_handler только уменьшал квант и сбрасывал его —
+  процессы не переключались. context_switch (naked) был написан, но
+  не вызывался: он рассчитан на обычный контекст, а не на IST стек.
+
+АРХИТЕКТУРА:
+  Старый подход (context_switch) не подходит для timer IRQ на IST:
+  он сохраняет IST RSP вместо стека процесса → сломался бы.
+
+  Новый подход: naked timer handler + модификация IRET-фрейма.
+  1. CPU пушит IRET-фрейм (SS:RSP:RFLAGS:CS:RIP) на IST стек
+  2. Naked handler пушит 15 GPR поверх IRET-фрейма
+  3. Передаёт указатели на GPR и IRET-фрейм в timer_schedule_rust
+  4. timer_schedule_rust:
+     a. Уменьшает квант. Если не истёк — return false (нет переключения)
+     b. Сохраняет GPR + IRET-фрейм + CR3 в ProcessContext текущего процесса
+     c. Выбирает следующий (round-robin)
+     d. Записывает GPR + IRET-фрейм следующего процесса на стек
+     e. Переключает CR3 на P4 следующего процесса
+     f. Return true
+  5. Naked handler восстанавливает (возможно изменённые) GPR, EOI, iretq
+  6. iretq → переход к следующему процессу
+
+  Первый запуск: set_current_by_p4 инициализирует контекст процесса
+  USER selectors (CS=0x33, SS=0x2B), entry_point, stack_top, RFLAGS=0x202.
+  При первом вытеснении timer сохранит реальные значения.
+
+ИЗМЕНЕНИЯ:
+1. src/process_manager.rs:
+   - Добавлена структура IretFrame (RIP, CS, RFLAGS, RSP, SS) — repr(C)
+   - Добавлена структура GprRegs (r15..rax) — repr(C), порядок push'ей
+   - ProcessContext: добавлены поля cs, ss (были только rip/rsp/rflags/cr3)
+   - ManagedProcess: добавлен флаг started (был ли процесс запущен)
+   - set_current_by_p4: инициализирует контекст для первого запуска
+     (USER selectors, entry_point, stack_top, RFLAGS=0x202)
+   - timer_schedule_rust: новый планировщик (no_mangle, extern "C")
+   - Старый context_switch оставлен (не удаляется)
+
+2. src/interrupts.rs:
+   - timer_handler_naked: naked asm handler
+     (push 15 GPR → call timer_schedule_rust → pop GPR → EOI → iretq)
+   - IDT: set_handler_fn(timer_handler) → set_handler_addr(timer_handler_naked)
+   - Старый timer_handler оставлен (не удаляется, dead_code)
+
+СБОРКА: cargo check OK (31 warnings, 0 errors), cargo build --release OK,
+  make_iso.sh OK.
+
+ОЖИДАНИЕ (вручную):
+  - Запустить 2 процесса (напр. run_elf дважды или создать тест)
+  - Должно происходить переключение: процессы чередуются
+  -   Пока есть только 1 процесс одновременно → переключения не будет
+    (нужен тест с 2+ процессами для проверки)
+
+--- 2026-08-22 (продолжение 7): ТЕСТ run_multi — 2 ПРОЦЕССА ---
+
+КОНТЕКСТ: для проверки вытесняющего планировщика нужны 2+ процесса,
+  работающих одновременно (не завершающихся мгновенно через exit).
+
+СОЗДАНО:
+1. user_programs/loop_a.asm — печатает "A" в цикле, никогда не exit
+2. user_programs/loop_b.asm — печатает "B" в цикле, никогда не exit
+3. build_loop.sh — сборка loop_a.elf + loop_b.elf
+   (nasm -f elf64 + ld -T hello.ld -nostdlib -static)
+
+ИЗМЕНЕНО:
+1. src/process_manager.rs — timer_schedule_rust:
+   - Если следующий процесс запускается впервые (started == false),
+     инициализирует его контекст (USER selectors, entry_point, stack_top)
+     перед записью в GPR/IRET-фрейм
+2. src/shell.rs:
+   - help: добавлена команда run_multi
+   - run_multi: создаёт 2 процесса (loop_a + loop_b), запускает первый
+     через run_process. Timer переключит на второй через 5 тиков.
+
+ОЖИДАНИЕ (вручную):
+  run_multi → вывод чередуется: "A" (5 тиков) → "B" (5 тиков) → ...
+  Если вывод только "A" или "B" — планировщик не переключает.
+  Если система зависает / double fault — есть баг в naked handler.
+
+--- 2026-08-22 (продолжение 8): ВЫТЕСНЯЮЩИЙ ПЛАНИРОВЩИК РАБОТАЕТ! ---
+
+ПОДТВЕРЖДЕНО: run_multi → 2 процесса (loop_a + loop_b) чередуются:
+  [sched] switch PID 1 -> PID 2  → процесс B печатает "B"
+  [sched] switch PID 2 -> PID 1  → процесс A печатает "A"
+  И так по кругу.
+
+Переключение контекста работает: сохранение GPR + IRET-фрейма, смена CR3,
+восстановление регистров следующего процесса, iretq к нему.
+
+БАГИ НАЙДЕННЫЕ И ИСПРАВЛЕННЫЕ:
+1. Naked handler портил RAX и RDX при EOI (mov al/mov dx ПОСЛЕ pop GPR).
+   Фикс: EOI ДО pop GPR, с push/pop rax для сохранения.
+2. Диагностика [sched] tick= флудила serial каждые 50 тиков → shell
+   не мог принять ввод. Фикс: убрана тиковая диагностика.
+3. Диагностика SYSCALL #1 (write) флудила при каждом write в цикле.
+   Фикс: убрана диагностика для write (#1), оставлена для остальных.
+4. [sched] switch флудила при каждом переключении.
+   Фикс: ограничена первыми 10 переключениями.
+
+СБОРКА: cargo build --release OK, make_iso.sh OK.
+
+--- 2026-08-22 (продолжение 9): ФИНАЛЬНОЕ ПОДТВЕРЖДЕНИЕ --
+
+Пользователь подтвердил чистый вывод: AAABBBAAABBB... — оба процесса
+по очереди получают квант, печатают, планировщик переключает.
+Диагностика [sched] switch — только 10 раз (как и задумано), дальше
+чистый вывод.
+
+ВЫТЕСНЯЮЩИЙ ПЛАНИРОВЩИК ПОЛНОСТЬЮ РАБОТАЕТ.
+
+СЛЕДУЮЩИЙ ШАГ по плану: IPC (каналы/почтовые ящики для обмена
+сообщениями между процессами).
+
+--- 2026-08-22 (продолжение 10): EXIT ПЕРЕКЛЮЧАЕТСЯ НА СЛЕДУЮЩИЙ ПРОЦЕСС ---
+
+ПРОБЛЕМА: процессы loop_a/loop_b были бесконечными → постоянный флуд.
+Исправлено: печатают 20 раз, затем exit(0).
+
+ВТОРАЯ ПРОБЛЕМА: при exit() terminate_current сбрасывал current=None.
+Если есть другой Ready процесс — он навсегда зависал (timer видит
+current=None → return false, не переключает).
+
+ИСПРАВЛЕНИЕ:
+1. user_programs/loop_a.asm, loop_b.asm: печатают 20 раз → exit(0)
+2. process_manager::terminate_current теперь возвращает Option<usize> —
+   индекс следующего Ready процесса (или None)
+3. process_manager::switch_to_next_after_exit(idx) — помечает процесс
+   Running, сбрасывает квант, инициализирует контекст для первого
+   запуска, возвращает NextProcessInfo { rip, rsp, cs, ss, rflags, cr3 }
+4. interrupts.rs exit handler: если есть следующий процесс — переключается
+   на него (модифицирует IRET-фрейм + CR3), иначе — возврат в shell.
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh OK.
+
+ОЖИДАНИЕ (вручную): run_multi → A печатает 20 раз, B печатает 20 раз,
+потом оба завершаются, возврат в shell. Нет бесконечного флуда.
+
+--- 2026-08-22 (продолжение 11): РЕСТРУКТУРИЗАЦИЯ ОТЛАДКИ ---
+
+ПРОБЛЕМА: отладочный код (serial_write_str_direct, write_hex, диагностика
+[save]/[exit]/[sched]) был разбросан по всем модулям. Exit-переключение
+на следующий процесс ломалось из-за повреждённых GPR в контексте.
+
+РЕШЕНИЕ (по новому правилу .kodaruls п.11-12):
+1. Создан .kodaruls с правилами 11 и 12:
+   - п.11: весь отладочный код → в src/debug.rs
+   - п.12: тесты подсистем → в src/tests.rs
+2. Создан src/debug.rs:
+   - write_hex() — перенос из serial.rs
+   - serial_write_str_direct() — перенос из serial.rs
+   - Используют crate::serial::serial_write_byte (pub)
+3. Создан src/tests.rs:
+   - test_scheduler() — тест вытесняющего планировщика
+   - Запускает loop_a + loop_b через include_bytes!
+4. serial.rs: убраны write_hex и serial_write_str_direct (перенесены в debug.rs)
+5. interrupts.rs: обновлены ссылки crate::serial:: → crate::debug::
+6. shell.rs: run_multi теперь вызывает crate::tests::test_scheduler()
+7. main.rs: добавлены mod debug; mod tests;
+8. interrupts.rs exit handler: упрощён — всегда возвращается в shell
+   (без переключения на следующий процесс, т.к. контекст повреждён)
+9. Удалены NextProcessInfo и switch_to_next_after_exit (отладочный код)
+10. Убран неиспользуемый импорт RFlags
+
+ИЗВЕСТНАЯ ПРОБЛЕМА: naked timer handler сохраняет повреждённые GPR
+(rbx=0xffffffffff000 вместо ~2000000). Причина не выяснена.
+Exit-переключение на следующий процесс отложено до исправления.
+
+СБОРКА: cargo check OK (0 errors), cargo build --release OK, make_iso.sh OK.
+
+--- 2026-08-22 (продолжение 12): ФИНАЛЬНОЕ ПОДТВЕРЖДЕНИЕ ---
+
+Пользователь подтвердил: run_multi → чередование A/B, затем exit(0),
+возврат в shell. Shell готов к следующей команде.
+
+ВЫТЕСНЯЮЩИЙ ПЛАНИРОВЩИК РАБОТАЕТ КОРРЕКТНО:
+- Timer IRQ переключает процессы каждые 5 тиков (round-robin)
+- Процессы печатают "A" и "B" поочерёдно
+- exit(0) завершает процесс и возвращает в shell
+- Структура: debug.rs (отладка) + tests.rs (тесты) + .kodaruls (правила)
+
+СЛЕДУЮЩИЙ ШАГ: исправить баг с повреждёнными GPR в naked timer handler
+(rbx=0xffffffffff000), чтобы реализовать exit-переключение на следующий
+процесс. Или перейти к IPC.
+
+--- 2026-08-22 (продолжение 13): БАГ С GPR НАЙДЕН И ИСПРАВЛЕН ---
+
+КОРЕНЬ БАГА: структура GprRegs была перевёрнута.
+- naked handler пушит GPR: r15 (первый) ... rax (последний)
+- стек растёт вниз: r15 по наибольшему адресу, rax по наименьшему (RSP)
+- mov rdi, rsp → rdi указывает на rax (наименьший адрес)
+- GprRegs имела поля: r15 (offset 0), r14 (offset 8), ..., rax (offset 112)
+- → GprRegs.r15 (offset 0) = реально rax процесса
+- → GprRegs.rbx (offset 104) = реально r14 процесса (kernel мусор)
+- → GprRegs.r12 (offset 24) = реально rdx процесса (= 1, длина "A")
+
+ИСПРАВЛЕНИЕ: перевёрнута GprRegs:
+  rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15
+
+РЕЗУЛЬТАТ: run_multi → A печатает, B печатает, A завершается → переключение
+на B → B завершается → возврат в shell. Все процессы корректно завершаются.
+
+ТАКЖЕ: добавлено выравнивание стеков IST по 16 (AlignedStack, repr(align(16))).
+Это правильное выравнивание для Rust-функций (SysV ABI), хоть и не было
+причиной бага с rbx.
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh OK.
+
+--- 2026-08-22 (14): IPC — почтовые ящики и syscalls ---
+
+ЦЕЛЬ: Реализовать IPC (inter-process communication) для обмена сообщениями
+между процессами ring 3.
+
+АРХИТЕКТУРА IPC:
+- IpcMessage: from_pid (usize), len (u8), data ([u8; 32]).
+  Фиксированный размер, без аллокации (no_std).
+- Mailbox: кольцевый буфер на 4 сообщения (head/tail/count).
+  Методы push/pop/has_messages.
+- ManagedProcess: добавлено поле mailbox: Mailbox.
+- ipc_send(to_pid, data) — доставляет сообщение в почтовый ящик получателя.
+  Если получатель Blocked (ждёт recv) — разблокирует (Ready).
+  Возвращает 0 (OK) или -1 (ошибка).
+- ipc_recv(buf) — извлекает сообщение из ящика текущего процесса.
+  Если пусто — блокирует (Blocked), возвращает -1.
+  Если есть — возвращает (from_pid, len).
+
+SYSCALLS (int 0x80):
+- #40 ipc_send(pid, buf, len) — rdi=pid, rsi=buf, rdx=len.
+  Копирует данные из user space (copy_from_user), доставляет в mailbox.
+- #41 ipc_recv(buf, len) — rdi=buf, rsi=len.
+  Копирует данные в user space (copy_to_user).
+  Возвращает: rax=from_pid, rdx=длина.
+
+USER-ПРОГРАММЫ:
+- user_programs/ipc_sender.asm — отправляет 3 сообщения ("MSG1","HELLO","WORLD")
+  процессу PID=2, затем exit(0).
+- user_programs/ipc_receiver.asm — получает 3 сообщения, выводит через write,
+  затем exit(0).
+- build_ipc.sh — сборка обеих программ (nasm + ld).
+
+ТЕСТ:
+- src/tests.rs::test_ipc() — запускает sender + receiver.
+  A (sender) запускается первым, отправляет 3 сообщения, exit → переключение
+  на B (receiver). B получает сообщения из ящика (без блокировки — они уже
+  там), выводит "MSG1HELLOWORLD", exit → возврат в shell.
+- shell команда: test_ipc
+
+ФАЙЛЫ:
+- src/process_manager.rs: IpcMessage, Mailbox, ipc_send(), ipc_recv(),
+  константы IPC_MSG_SIZE=32, IPC_MAILBOX_SIZE=4.
+- src/interrupts.rs: syscall #40 (ipc_send), #41 (ipc_recv).
+- src/tests.rs: test_ipc().
+- src/shell.rs: команда test_ipc + help.
+- user_programs/ipc_sender.asm, ipc_receiver.asm.
+- build_ipc.sh.
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh OK.
+
+--- 2026-08-22 (15): IPC — блокирующий ipc_recv ---
+
+ЦЕЛЬ: Полноценная блокировка процесса при ipc_recv с пустым ящиком.
+
+АРХИТЕКТУРА БЛОКИРОВКИ (подход "перезапуск syscall"):
+- При ipc_recv с пустым ящиком процесс блокируется (Blocked).
+- Контекст сохраняется с RIP -= 2 (размер int 0x80 = CD 80 = 2 байта),
+  чтобы при возобновлении процесс повторил int 0x80 → ipc_recv.
+- К этому моменту сообщение уже в почтовом ящике (отправитель доставил
+  его через ipc_send, который разблокировал получателя: Blocked → Ready).
+- Переключение на следующий Ready процесс (как в exit).
+
+ИЗМЕНЕНИЯ:
+- process_manager.rs:
+  - ipc_recv переписана: возвращает Option<(from_pid, len)>, НЕ блокирует.
+  - Новая функция block_current_and_switch(gpr, rip, rsp, cs, ss, rflags):
+    сохраняет контекст (RIP-2), блокирует, ищет следующий Ready,
+    возвращает (next_idx, NextProcessInfo).
+- interrupts.rs syscall #41:
+  - При пустом ящике: собирает GPR из SyscallRegisters в [u64; 15],
+    вызывает block_current_and_switch, модифицирует IRET-фрейм и GPR
+    для перехода в следующий процесс (ring 3).
+  - При отсутствии готовых процессов: возвращает -1 (EAGAIN).
+
+ТЕСТ (test_ipc):
+- ipc_receiver.asm (PID=1) запускается ПЕРВЫМ, вызывает ipc_recv →
+  блокируется → переключение на sender.
+- ipc_sender.asm (PID=2) отправляет "HELLO" процессу 1 (разблокирует),
+  затем exit → переключение на receiver.
+- receiver повторяет int 0x80 → ipc_recv → получает "HELLO" → выводит.
+- Ожидаемый вывод: "HELLO", затем возврат в shell.
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh OK.
+
+--- 2026-08-22 (16): IPC — блокировка РАБОТАЕТ (исправлен баг find) ---
+
+БАГ: в block_current_and_switch поиск следующего Ready процесса использовал
+.find() который возвращал индекс итератора i (0..MAX_PROCESSES), а не
+реальный индекс idx = (start + i) % MAX_PROCESSES. Это приводило к тому,
+что block_current_and_switch переключался ОБРАТНО на блокируемый процесс
+(индекс 0 вместо 1) → A крутился в цикле ipc_recv.
+
+ИСПРАВЛЕНИЕ: .map(|i| (start + i) % MAX_PROCESSES).find(...) —
+возвращает реальный индекс процесса.
+
+РЕЗУЛЬТАТ test_ipc (полная трассировка):
+1. A (receiver) → ipc_recv → блокируется (нет сообщений)
+2. Переключение на B (sender) → ipc_send("HELLO") → A разблокирован
+3. B → exit(0) → переключение на A (Ready)
+4. A повторяет int 0x80 → ipc_recv → получает "HELLO" → выводит HELLO
+5. A → exit(0) → возврат в shell
+
+СБОРКА: cargo build --release OK, make_iso.sh OK.

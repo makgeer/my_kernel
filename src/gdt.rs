@@ -44,18 +44,28 @@ pub const USER_CODE_SELECTOR: u16 = 0x30 | 0x03; // index 6, RPL=3
    16 КБ для #DF (нужен запас при диагностике), по 8 КБ для IRQ0/IRQ1.
    Размещаются в .bss ядра (higher-half, отображён в page tables).
    CPU переключается на них при входе в обработчик через IST и
-   возвращается на прежний RSP при iretq. */
-static mut DOUBLE_FAULT_STACK: [u8; 16384] = [0; 16384];
-static mut TIMER_STACK: [u8; 8192] = [0; 8192];
-static mut KEYBOARD_STACK: [u8; 8192] = [0; 8192];
-static mut PAGE_FAULT_STACK: [u8; 8192] = [0; 8192];
+   возвращается на прежний RSP при iretq.
+
+   ВАЖНО: стеки выравнены по 16 (align(16)) — naked timer handler
+   вызывает Rust-функцию timer_schedule_rust, которая по SysV ABI
+   требует RSP ≡ 8 mod 16 (SSE-инструкции упадут с #GP при
+   невыровненном RSP). Без align(16) Rust static для [u8; N] может
+   быть размещён по невыровненному адресу → баг. */
+
+/// Тип-обёртка для 16-байтного выравнивания стека IST.
+#[repr(C, align(16))]
+pub struct AlignedStack<const N: usize>(pub [u8; N]);
+
+static mut DOUBLE_FAULT_STACK: AlignedStack<16384> = AlignedStack([0; 16384]);
+static mut TIMER_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
+static mut KEYBOARD_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
+static mut PAGE_FAULT_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 
 /// Kernel stack для возврата из user mode (ring 3 → ring 0).
 /// При int 0x80 из user mode CPU переключается на TSS.rsp0 — этот стек.
 /// После модификации IRET-фрейма в syscall_handler, iretq возвращает
 /// нас в kernel mode на этом стеке.
-pub static mut KERNEL_RETURN_STACK: [u8; 16384] = [0; 16384];
-
+pub static mut KERNEL_RETURN_STACK: AlignedStack<16384> = AlignedStack([0; 16384]);
 /* GDT и TSS живут в static mut — append() требует &mut self, load() требует
    &'static self. init_gdt() вызывается один раз при старте ядра — data race
    невозможна. */
@@ -71,20 +81,20 @@ pub fn init_gdt() {
         // Заполняем TSS: каждый IST-слот указывает на ВЕРХ своего стека
         // (стек растёт вниз, при входе в обработчик RSP = вершина).
         TSS.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            VirtAddr::new(DOUBLE_FAULT_STACK.as_ptr() as u64 + DOUBLE_FAULT_STACK.len() as u64);
+            VirtAddr::new(DOUBLE_FAULT_STACK.0.as_ptr() as u64 + DOUBLE_FAULT_STACK.0.len() as u64);
         TSS.interrupt_stack_table[TIMER_IST_INDEX as usize] =
-            VirtAddr::new(TIMER_STACK.as_ptr() as u64 + TIMER_STACK.len() as u64);
+            VirtAddr::new(TIMER_STACK.0.as_ptr() as u64 + TIMER_STACK.0.len() as u64);
         TSS.interrupt_stack_table[KEYBOARD_IST_INDEX as usize] =
-            VirtAddr::new(KEYBOARD_STACK.as_ptr() as u64 + KEYBOARD_STACK.len() as u64);
+            VirtAddr::new(KEYBOARD_STACK.0.as_ptr() as u64 + KEYBOARD_STACK.0.len() as u64);
         TSS.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] =
-            VirtAddr::new(PAGE_FAULT_STACK.as_ptr() as u64 + PAGE_FAULT_STACK.len() as u64);
+            VirtAddr::new(PAGE_FAULT_STACK.0.as_ptr() as u64 + PAGE_FAULT_STACK.0.len() as u64);
 
         // RSP0 — стек для перехода из ring 3 в ring 0 (int 0x80, прерывания).
         // Без RSP0 при int из user mode CPU использует RSP=0 → page fault.
         // В x86_64 crate TSS.rsp0 называется privilege_stack_table[0].
         // Указываем на вершину KERNEL_RETURN_STACK (стек растёт вниз).
         TSS.privilege_stack_table[0] = VirtAddr::new(
-            KERNEL_RETURN_STACK.as_ptr() as u64 + KERNEL_RETURN_STACK.len() as u64
+            KERNEL_RETURN_STACK.0.as_ptr() as u64 + KERNEL_RETURN_STACK.0.len() as u64
         );
 
         // Добавляем 64-битный сегмент кода (kernel_code_segment)
@@ -163,7 +173,7 @@ pub fn kernel_panic(msg: &str) -> ! {
     // внутри shell, что соответствует ABI.
     unsafe {
         let stack_top = (core::ptr::addr_of!(KERNEL_RETURN_STACK) as *const u8 as u64
-            + KERNEL_RETURN_STACK.len() as u64) & !0xF;
+            + KERNEL_RETURN_STACK.0.len() as u64) & !0xF;
         core::arch::asm!(
             "cli",
             "mov rsp, {sp}",   // чистый kernel стек

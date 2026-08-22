@@ -353,6 +353,11 @@ pub fn run_process(proc: &Process) {
         USER_STACK_PTR = proc.stack_top;
     }
 
+    // Отмечаем процесс как Running в менеджере процессов.
+    // Без этого terminate_current() при exit() не найдёт процесс →
+    // он останется в состоянии Ready и будет виден в ps после завершения.
+    crate::process_manager::set_current_by_p4(proc.p4_phys);
+
     // iretq → user_mode_entry (kernel функция).
     // user_mode_entry переключит CR3 и перейдёт к user code.
     // order (снизу вверх): SS, RSP, RFLAGS, CS, RIP
@@ -362,8 +367,8 @@ pub fn run_process(proc: &Process) {
     // user_mode_entry сама создаст IRETQ-фрейм с USER selectors.
     unsafe {
         // Берём вершину KERNEL_RETURN_STACK для iretq
-        let kernel_stack = crate::gdt::KERNEL_RETURN_STACK.as_ptr() as u64
-            + crate::gdt::KERNEL_RETURN_STACK.len() as u64;
+        let kernel_stack = crate::gdt::KERNEL_RETURN_STACK.0.as_ptr() as u64
+            + crate::gdt::KERNEL_RETURN_STACK.0.len() as u64;
         core::arch::asm!(
             "push {ss}",
             "push {sp}",

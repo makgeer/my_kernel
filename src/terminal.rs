@@ -100,6 +100,10 @@ pub struct Terminal {
     csi_len: usize,
     /// Приватный модификатор CSI ('?' перед параметрами, напр. ?25l).
     csi_private: bool,
+    /// Авто-flush: вызывать flush() при обнаружении '\n' в write_str.
+    /// По умолчанию true. Отключается для пакетного вывода (напр. list()
+    /// в process_manager) — чтобы избежать N полных перерисовок экрана.
+    auto_flush: bool,
 }
 
 impl Terminal {
@@ -116,6 +120,7 @@ impl Terminal {
             csi_params: [0; 8],
             csi_len: 0,
             csi_private: false,
+            auto_flush: true,
         }
     }
 
@@ -443,6 +448,13 @@ impl Terminal {
         self.draw_fb();
         self.advance_blink();
     }
+
+    /// Включает или отключает авто-flush при '\n' в write_str.
+    /// При отключении вызывающий код должен сам вызвать flush() после
+    /// завершения пакетного вывода — иначе текст не появится на экране.
+    pub fn set_auto_flush(&mut self, enabled: bool) {
+        self.auto_flush = enabled;
+    }
 }
 
 /// Счётчик мигания курсора: меняет фазу примерно каждые 5 перерисовок.
@@ -569,7 +581,7 @@ impl Terminal {
                 }
                 let x = c * 9;
                 let y = r * 16;
-                crate::vesa::vesa_draw_char_ex(
+                crate::video::draw_char_ex(
                     cell.ch as char,
                     x,
                     y,
@@ -613,9 +625,9 @@ impl fmt::Write for Terminal {
             }
             self.put_char(c);
         }
-        if need_flush {
-            self.flush();
-        }
+    if need_flush && self.auto_flush {
+        self.flush();
+    }
         Ok(())
     }
 }
