@@ -312,6 +312,21 @@ pub unsafe extern "C" fn enter_ring3(entry: u64, stack: u64) -> ! {
     );
 }
 
+/// Загружает программу из VFS по пути и создаёт процесс.
+///
+/// Читает ELF-файл из initrd (см. fs_initrd.rs), затем создаёт
+/// процесс через create_elf_process. Это позволяет shell запускать
+/// программы по имени (run hello.elf) вместо жёстко зашитых
+/// include_bytes в tests.rs.
+pub fn load_program_from_fs(path: &str) -> Result<Process, &'static str> {
+    let data = crate::fs::read_file(path)
+        .ok_or("fs: file not found")?;
+    if data.is_empty() {
+        return Err("fs: empty file");
+    }
+    create_elf_process(data)
+}
+
 /// Запускает процесс: переключает адресное пространство и переходит в ring 3.
 ///
 /// Это высокоуровневая обёртка над enter_ring3:

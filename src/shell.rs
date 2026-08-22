@@ -104,6 +104,9 @@ pub fn shell() {
                 println!("  run_syscall - ELF with read/write syscalls (multi-segment)");
                 println!("  run_multi  - run 2 processes (loop_a + loop_b) for preemptive scheduler test");
                 println!("  test_ipc   - run 2 processes (ipc_sender + ipc_receiver) for IPC test");
+                println!("  ls         - list files in VFS (initrd)");
+                println!("  cat <file> - print file contents");
+                println!("  run <file> - load and run ELF program from VFS");
             }
             "about" => {
                 println!("Malinka v0.1.0");
@@ -593,6 +596,67 @@ pub fn shell() {
                         // Убираем кавычки, если они есть
                         let code = code.trim_matches('"');
                         crate::script::run_script(code);
+                    }
+                } else if cmd == "ls" || cmd.starts_with("ls ") {
+                    // ls [path] — список файлов в VFS (initrd).
+                    let path = if cmd.len() > 3 { cmd[3..].trim() } else { "/" };
+                    match crate::fs::read_dir(path) {
+                        Some(children) => {
+                            println!("  {} ({} entries):", path, children.len());
+                            for node in children {
+                                let typ = match node.node_type {
+                                    crate::fs::FsNodeType::File => "FILE",
+                                    crate::fs::FsNodeType::Directory => "DIR ",
+                                };
+                                println!("  {} {:10} {} bytes", typ, node.name, node.size());
+                            }
+                        }
+                        None => {
+                            println!("  ls: '{}' not found or not a directory", path);
+                        }
+                    }
+                } else if cmd.starts_with("cat ") {
+                    // cat <file> — вывод содержимого файла из VFS.
+                    let path = cmd[4..].trim();
+                    match crate::fs::read_file(path) {
+                        Some(data) => {
+                            if data.is_empty() {
+                                println!("  (empty file)");
+                            } else {
+                                // Выводим байты как символы (непечатные → '.')
+                                for &b in data.iter() {
+                                    let c = match b {
+                                        b'\n' | b'\r' | 0x20..=0x7e => b as char,
+                                        _ => '.',
+                                    };
+                                    crate::print!("{}", c);
+                                }
+                                println!();
+                            }
+                        }
+                        None => {
+                            println!("  cat: '{}' not found", path);
+                        }
+                    }
+                } else if cmd.starts_with("run ") {
+                    // run <file> — загрузка и запуск ELF из VFS (initrd).
+                    let path = cmd[4..].trim();
+                    // Если путь не начинается с /, добавляем /bin/
+                    let full_path = if path.starts_with('/') {
+                        alloc::string::String::from(path)
+                    } else {
+                        alloc::format!("/bin/{}", path)
+                    };
+                    println!("Loading '{}' from VFS...", full_path);
+                    match crate::process::load_program_from_fs(&full_path) {
+                        Ok(proc) => {
+                            println!("ELF loaded: entry=0x{:016x}, P4=0x{:x}", proc.entry_point, proc.p4_phys);
+                            crate::process::run_process(&proc);
+                            // noreturn — возврат через kernel_return_to_shell
+                        }
+                        Err(e) => {
+                            println!("  FAILED: {}", e);
+                        }
                     }
                 } else {
                     println!("Unknown command: {}", cmd);

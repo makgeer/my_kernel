@@ -12,7 +12,7 @@ dependencies = [
  "const-random",
  "once_cell",
  "version_check",
- "zerocopy",
+ "zerocopy 0.8.56",
 ]
 
 [[package]]
@@ -44,9 +44,29 @@ checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
 
 [[package]]
 name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
+name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+
+[[package]]
+name = "btrfs-no-std"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17520a045de9153b190a12383777fff718c70a725ec92ae573e61501be914b43"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "num_enum",
+ "static_assertions",
+ "strum",
+ "zerocopy 0.6.6",
+]
 
 [[package]]
 name = "bumpalo"
@@ -194,6 +214,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "heck"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d621efb26863f0e9924c6ac577e8275e5e6b77455db64ffa6c65c904e9e132c"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -244,6 +273,7 @@ dependencies = [
 name = "malinka"
 version = "0.1.0"
 dependencies = [
+ "btrfs-no-std",
  "heapless",
  "limine",
  "linked_list_allocator",
@@ -267,6 +297,26 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "num_enum"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f646caf906c20226733ed5b1374287eb97e3c2a5c227ce668c1f2ce20ae57c9"
+dependencies = [
+ "num_enum_derive",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcbff9bc912032c62bf65ef1d5aea88983b420f4f839db1e9b0c281a25c9c799"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -315,7 +365,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd4dd0f8c36625202a4ba553c416c19b719947cd2a31d1bda06126e4a5727daf"
 dependencies = [
  "ahash",
- "bitflags",
+ "bitflags 2.13.1",
  "core-error",
  "hashbrown",
  "libm",
@@ -337,7 +387,7 @@ checksum = "3cd3a7535e50bf36857e7be7bec276d334e8c2dfa469c2201226fd01638ea5ca"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -421,6 +471,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strum"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cae14b91c7d11c9a851d3fbc80a963198998c2a64eec840477fa92d8ce9b70bb"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5bb0dc7ee9c15cea6199cde9a127fa16a4c5819af85395457ad72d68edc85a38"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "syn"
+version = "1.0.109"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -451,6 +534,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "version_check"
@@ -508,7 +597,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
  "wasm-bindgen-shared",
 ]
 
@@ -538,10 +627,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be4ec631e1a81d50e46c35a4a00322bd076c47491b64c2fb10a7ffa89002c697"
 dependencies = [
  "bit_field",
- "bitflags",
+ "bitflags 2.13.1",
  "const_fn",
  "rustversion",
  "volatile 0.4.6",
+]
+
+[[package]]
+name = "zerocopy"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "854e949ac82d619ee9a14c66a1b674ac730422372ccb759ce0c39cabcf2bf8e6"
+dependencies = [
+ "byteorder",
+ "zerocopy-derive 0.6.6",
 ]
 
 [[package]]
@@ -550,7 +649,18 @@ version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
 dependencies = [
- "zerocopy-derive",
+ "zerocopy-derive 0.8.56",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "125139de3f6b9d625c39e2efdd73d41bdac468ccd556556440e322be0e1bbd91"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -561,5 +671,5 @@ checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]

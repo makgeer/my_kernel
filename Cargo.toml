@@ -11,6 +11,9 @@ limine = "0.6.5"
 volatile = "0.6.1"
 linked_list_allocator = "0.10"
 
+# BTRFS дисковый формат (no_std) — для файловой системы, похожей на btrfs
+btrfs-no-std = "0.2"
+
 # Rhai (no_std, встроенный скриптовый движок)
 rhai = { version = "1.25.1", default-features = false, features = ["no_std"] }
 

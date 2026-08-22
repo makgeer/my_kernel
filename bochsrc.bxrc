@@ -29,6 +29,10 @@ vgaromimage: file=/usr/local/share/bochs/VGABIOS-lgpl-latest
 ata0: enabled=1, ioaddr1=0x1f0, ioaddr2=0x3f0, irq=14
 ata0-master: type=cdrom, path="boot.iso", status=inserted
 
+# Btrfs-диск на ATA канале 1 (secondary, 0x170)
+ata1: enabled=1, ioaddr1=0x170, ioaddr2=0x370, irq=15
+ata1-master: type=disk, path="btrfs.img", mode=flat
+
 # Serial COM1 — socket-server для интерактивного ввода/вывода.
 # Bochs слушает порт 8888, подключение через: nc localhost 8888
 # Вывод ядра (serial) идёт в сокет → виден в nc.

@@ -24,6 +24,10 @@ mod script;
 mod brush;
 mod debug;
 mod tests;
+mod fs;
+mod fs_initrd;
+mod ata;
+mod btrfs;
 
 use core::panic::PanicInfo;
 use crate::scheduler::{add_task};
@@ -48,6 +52,10 @@ pub extern "C" fn _start_rust() -> ! {
     // Инициализируем пейджинг — запоминаем HHDM offset для доступа к page tables.
     // map_page/unmap_page используют HHDM для модификации таблиц страниц.
     paging::init();
+
+    // Монтируем initrd (встроенный образ ФС) в VFS.
+    // После этого shell может загружать user-программы из /bin.
+    fs_initrd::mount();
 
     println!("=== KERNEL START ===");
     

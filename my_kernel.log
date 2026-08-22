@@ -2987,3 +2987,31 @@ USER-ПРОГРАММЫ:
 5. A → exit(0) → возврат в shell
 
 СБОРКА: cargo build --release OK, make_iso.sh OK.
+
+--- 2026-08-22 (17): VFS + initrd + shell-команды ФС ---
+
+ЦЕЛЬ: Файловая система и пространство пользователя (Фаза 1 — VFS + initrd).
+
+АРХИТЕКТУРА:
+- src/fs.rs — VFS: FsNode (имя, тип, данные, дети), FsNodeType (File/Directory).
+  Функции: lookup(path), read_dir(path), read_file(path), mount_root(children).
+- src/fs_initrd.rs — initrd: статическое дерево VFS из include_bytes!
+  user_programs/*.elf. Каталог /bin с программами. mount() вызывается
+  при старте ядра.
+- src/process.rs — load_program_from_fs(path): читает ELF из VFS,
+  создаёт процесс через create_elf_process. Заменяет include_bytes!
+  в tests.rs для загрузки программ по имени.
+- src/main.rs — вызов fs_initrd::mount() после paging::init().
+
+SHELL-КОМАНДЫ:
+- ls [path] — список файлов в VFS (initrd). Показывает тип, имя, размер.
+- cat <file> — вывод содержимого файла (непечатные → '.').
+- run <file> — загрузка и запуск ELF из VFS. Если путь без /, ищет в /bin/.
+
+ДОСТУПНЫЕ ФАЙЛЫ В /bin:
+  hello.elf, loop_a.elf, loop_b.elf, syscall_test.elf,
+  ipc_sender.elf, ipc_receiver.elf
+
+ФАЗА 2 (будущее): настоящий диск (ATA PIO + FAT32/ext2) вместо initrd.
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh OK.

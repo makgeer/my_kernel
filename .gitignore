@@ -17,3 +17,5 @@ bochs-2.8.tar.gz
 # Артефакты сборки и отладочные логи (генерируются при запуске)
 /boot.iso
 /qemu*.log
+# Btrfs-образ диска (создаётся mkfs.btrfs, не в git)
+/btrfs.img
