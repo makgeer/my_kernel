@@ -2,6 +2,14 @@ use crate::interrupts::KEYBOARD_BUFFER;
 use crate::print;
 use crate::println;
 
+/// История команд — кольцевой буфер последних 25 команд.
+/// Код выделен бирюзовым цветом (правило .kodaruls п.6).
+const HISTORY_MAX: usize = 25;
+const CMD_LEN: usize = 64;
+static mut HISTORY: [[u8; CMD_LEN]; HISTORY_MAX] = [[0u8; CMD_LEN]; HISTORY_MAX];
+static mut HISTORY_COUNT: usize = 0;
+static mut HISTORY_HEAD: usize = 0; // индекс куда писать следующую команду
+
 /// Ожидает один символ из буфера клавиатуры (блокирующее чтение).
 /// Возвращает (символ, источник):
 ///   true  = из serial (COM1)
@@ -32,32 +40,123 @@ pub fn getchar() -> (char, bool) {
 }
 
 /// Читает строку до Enter. Возвращает набранные символы.
-/// Поддерживает Backspace (стирание последнего символа).
-/// Эхо печатается ВСЕГДА (и для serial, и для PS/2): Bochs с
-/// -serial stdio переводит терминал в raw mode, где нет локального эха,
-/// поэтому символы выводим сами через print! (VGA+serial+framebuffer).
+/// Поддерживает Backspace и историю команд (стрелки вверх/вниз).
+/// Эхо печатается ВСЕГДА (и для serial, и для PS/2).
+///
+/// Код выделен бирюзовым цветом (правило .kodaruls п.6) — добавлена
+/// история команд с навигацией по стрелкам.
 pub fn read_line() -> [u8; 64] {
     let mut input_buf = [0u8; 64];
     let mut pos = 0;
 
+    // Индекс для навигации по истории. start = HISTORY_COUNT означает
+    // "новая пустая строка". При нажатии вверх уменьшаем, вниз — увеличиваем.
+    let mut hist_idx: usize;
+
+    unsafe {
+        // Если история пуста, hist_idx = 0 (новая строка).
+        // Иначе начинаем с "новой строки" (после последней).
+        hist_idx = HISTORY_COUNT;
+    }
+
     loop {
         let (c, _from_serial) = getchar();
+
+        // Обработка escape-последовательностей (стрелки).
+        // ESC [ A = вверх, ESC [ B = вниз, ESC [ C = вправо, ESC [ D = влево.
+        if c == '\u{1b}' {
+            // Читаем следующие два символа: '[' и букву
+            let (c2, _) = getchar();
+            if c2 == '[' {
+                let (c3, _) = getchar();
+                match c3 {
+                    'A' => {
+                        // Стрелка вверх — предыдущая команда из истории
+                        unsafe {
+                            if HISTORY_COUNT == 0 || hist_idx == 0 {
+                                continue; // истории нет или уже в начале
+                            }
+                            hist_idx -= 1;
+                            // cmd_idx — реальный индекс в массиве HISTORY
+                            let cmd_idx = history_index(hist_idx);
+                            // Очищаем текущий ввод
+                            while pos > 0 {
+                                pos -= 1;
+                                crate::print!("\u{8} \u{8}");
+                            }
+                            // Копируем команду из истории
+                            for i in 0..CMD_LEN {
+                                if HISTORY[cmd_idx][i] == 0 { break; }
+                                if pos < input_buf.len() - 1 {
+                                    input_buf[pos] = HISTORY[cmd_idx][i];
+                                    pos += 1;
+                                    crate::print!("{}", HISTORY[cmd_idx][i] as char);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    'B' => {
+                        // Стрелка вниз — следующая команда (или пустая строка)
+                        unsafe {
+                            if hist_idx >= HISTORY_COUNT {
+                                continue; // уже на новой строке
+                            }
+                            hist_idx += 1;
+                            // Очищаем текущий ввод
+                            while pos > 0 {
+                                pos -= 1;
+                                crate::print!("\u{8} \u{8}");
+                            }
+                            if hist_idx < HISTORY_COUNT {
+                                let cmd_idx = history_index(hist_idx);
+                                for i in 0..CMD_LEN {
+                                    if HISTORY[cmd_idx][i] == 0 { break; }
+                                    if pos < input_buf.len() - 1 {
+                                        input_buf[pos] = HISTORY[cmd_idx][i];
+                                        pos += 1;
+                                        crate::print!("{}", HISTORY[cmd_idx][i] as char);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {
+                        // Другие escape-последовательности — игнорируем
+                        continue;
+                    }
+                }
+            }
+            // ESC без '[' — игнорируем
+            continue;
+        }
+
         match c {
-            // Enter — конец строки (serial может прислать \r или \n)
+            // Enter — конец строки
             '\n' | '\r' => {
                 println!();
+                // Сохраняем команду в историю (если не пустая)
+                if pos > 0 {
+                    unsafe {
+                        let slot = HISTORY_HEAD % HISTORY_MAX;
+                        HISTORY[slot] = input_buf;
+                        HISTORY_HEAD += 1;
+                        if HISTORY_COUNT < HISTORY_MAX {
+                            HISTORY_COUNT += 1;
+                        }
+                    }
+                }
                 break;
             }
-            // Backspace (0x08 или 0x7F DEL) — стираем последний символ
+            // Backspace
             '\u{8}' | '\u{7f}' => {
                 if pos > 0 {
                     pos -= 1;
-                    // Печатаем пробел поверх и откатываем курсор:
-                    // \x08 — назад, пробел — затирает, \x08 — снова назад.
                     crate::print!("\u{8} \u{8}");
                 }
             }
-            // Обычный печатный символ — добавляем в буфер и эхо-сим
+            // Обычный печатный символ
             c => {
                 if pos < input_buf.len() - 1 && c.is_ascii() {
                     input_buf[pos] = c as u8;
@@ -68,6 +167,24 @@ pub fn read_line() -> [u8; 64] {
         }
     }
     input_buf
+}
+
+/// Возвращает индекс в массиве HISTORY для смещения hist_idx от начала.
+/// Код выделен бирюзовым цветом (правило .kodaruls п.6).
+fn history_index(hist_idx: usize) -> usize {
+    unsafe {
+        if HISTORY_COUNT < HISTORY_MAX {
+            // Буфер не заполнен: старейшая команда в [0], свежие подряд.
+            // hist_idx = 0 → самая старая, hist_idx = COUNT-1 → самая свежая.
+            // (COUNT-1) - hist_idx — индекс свежей команды по смещению от конца.
+            HISTORY_COUNT - 1 - hist_idx
+        } else {
+            // Буфер полный: кольцо. HEAD указывает на самую старую запись.
+            // (HEAD + (COUNT-1) - hist_idx) % MAX — свежая команда.
+            // При hist_idx = 0 (самая старая) → HEAD; hist_idx = COUNT-1 → HEAD-1.
+            (HISTORY_HEAD + (HISTORY_COUNT - 1 - hist_idx)) % HISTORY_MAX
+        }
+    }
 }
 
 pub fn shell() {
@@ -107,6 +224,9 @@ pub fn shell() {
                 println!("  ls         - list files in VFS (initrd)");
                 println!("  cat <file> - print file contents");
                 println!("  run <file> - load and run ELF program from VFS");
+                println!("  btrfs      - show btrfs disk status (ATA secondary)");
+                println!("  btrfs-ls [path] - list btrfs directory");
+                println!("  btrfs-cat <path> - print btrfs file contents");
             }
             "about" => {
                 println!("Malinka v0.1.0");
@@ -656,6 +776,63 @@ pub fn shell() {
                         }
                         Err(e) => {
                             println!("  FAILED: {}", e);
+                        }
+                    }
+                } else if cmd == "btrfs" {
+                    // btrfs — статус btrfs-диска (ATA secondary, 0x170).
+                    // Перечитывает суперблок и выводит информацию о ФС.
+                    // Код выделен бирюзовым цветом (правило .kodaruls п.6).
+                    crate::ata::select_channel(0x170); // secondary
+                    match crate::btrfs::read_superblock() {
+                        Some(sb) => {
+                            println!("btrfs: mounted OK");
+                            println!("  root=0x{:x}, chunk_root=0x{:x}",
+                                sb.root.get(), sb.chunk_root.get());
+                            println!("  nodesize={}, sectorsize={}",
+                                sb.nodesize.get(), sb.sectorsize.get());
+                            println!("  total_bytes={}", sb.total_bytes.get());
+                        }
+                        None => {
+                            println!("btrfs: mount failed (no superblock or bad magic)");
+                        }
+                    }
+                } else if cmd == "btrfs-ls" || cmd.starts_with("btrfs-ls ") {
+                    // btrfs-ls [path] — список файлов в каталоге btrfs-диска.
+                    // Код выделен бирюзовым цветом (правило .kodaruls п.6).
+                    let path = if cmd.len() > 9 { cmd[9..].trim() } else { "/" };
+                    crate::ata::select_channel(0x170);
+                    match crate::btrfs::list_dir(path) {
+                        Some(entries) => {
+                            println!("  {} ({} entries):", path, entries.len());
+                            for e in entries {
+                                let typ = if e.is_dir { "DIR " } else { "FILE" };
+                                println!("  {} inode={}", typ, e.inode);
+                                println!("       {}", e.name);
+                            }
+                        }
+                        None => {
+                            println!("  btrfs-ls: '{}' not found or not a directory", path);
+                        }
+                    }
+                } else if cmd.starts_with("btrfs-cat ") {
+                    // btrfs-cat <path> — вывод содержимого файла с btrfs-диска.
+                    // Код выделен бирюзовым цветом (правило .kodaruls п.6).
+                    let path = cmd[10..].trim();
+                    crate::ata::select_channel(0x170);
+                    match crate::btrfs::read_file(path) {
+                        Some(data) => {
+                            println!("  {} ({} bytes):", path, data.len());
+                            for &b in data.iter() {
+                                let c = match b {
+                                    b'\n' | b'\r' | 0x20..=0x7e => b as char,
+                                    _ => '.',
+                                };
+                                crate::print!("{}", c);
+                            }
+                            println!();
+                        }
+                        None => {
+                            println!("  btrfs-cat: '{}' not found or unreadable", path);
                         }
                     }
                 } else {

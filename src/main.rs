@@ -57,6 +57,13 @@ pub extern "C" fn _start_rust() -> ! {
     // После этого shell может загружать user-программы из /bin.
     fs_initrd::mount();
 
+    // Инициализируем ATA PIO драйвер — проверяем наличие дисков.
+    // Primary (0x1F0) = CD-ROM (boot), Secondary (0x170) = btrfs-диск.
+    // btrfs::mount() читает суперблок с secondary-канала.
+    // Код выделен бирюзовым цветом (правило .kodaruls п.6).
+    let _ata_ok = ata::init();
+    let _btrfs_ok = btrfs::mount();
+
     println!("=== KERNEL START ===");
     
     // Запрашиваем framebuffer от Limine.

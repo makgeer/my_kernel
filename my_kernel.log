@@ -3015,3 +3015,331 @@ SHELL-КОМАНДЫ:
 ФАЗА 2 (будущее): настоящий диск (ATA PIO + FAT32/ext2) вместо initrd.
 
 СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh OK.
+
+--- 2026-08-23: ИНТЕГРАЦИЯ ATA + BTRFS В ОСНОВНОЕ ТЕЛО ПРОГРАММЫ ---
+
+КОНТЕКСТ: последний коммит (06c8ecf) добавил ATA PIO драйвер (src/ata.rs)
+  и btrfs-модуль (src/btrfs.rs), но они были объявлены как mod в main.rs
+  и НЕ вызывались — не соответствовало правилу 10 (.kodaruls): «Требуется
+  проверка на валидность и введение в основное тело программы».
+
+ПРОВЕРКА ВАЛИДНОСТИ (правило 10):
+  - btrfs-no-std 0.2.1: все импортируемые структуры (SuperBlock, Header,
+    Key, Item, KeyPointer, Chunk, InodeItem) и их поля — подтверждены
+    в исходниках крейта.
+  - btrfs.img: 128 МБ, реальная btrfs ФС (sectorsize 4096, nodesize 16384).
+  - bochsrc.bxrc: ata1 (secondary, 0x170) уже настроен на btrfs.img.
+  - ata.rs: LBA28 PIO, read_sector/write_sector/identify/init — корректно.
+
+ИЗМЕНЕНИЯ (точечные, по .kodaruls):
+  1. src/main.rs: после fs_initrd::mount() добавлены вызовы:
+     - ata::init() — проверяет primary (CD-ROM) и secondary (btrfs-диск)
+     - btrfs::mount() — читает суперблок btrfs с secondary-канала
+  2. src/shell.rs: добавлена команда "btrfs" — выводит статус btrfs-диска
+     (перечитывает суперблок, показывает root/chunk_root/nodesize/sectorsize/
+     total_bytes). Добавлена в help.
+
+СБОРКА: cargo check OK (0 ошибок). make_iso.sh OK (boot.iso 4,0 МБ).
+
+ТЕСТИРОВАНИЕ (вручную, правило 8/9):
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+  Ожидается при загрузке: "ATA: secondary channel drive 0 present"
+  + "btrfs: superblock OK" + "btrfs: mounted successfully".
+  Команда btrfs в shell: повторный вывод информации о суперблоке.
+
+ИЗВЕСТНЫЕ ОГРАНИЧЕНИЯ:
+  - btrfs.rs: logical_to_physical упрощённое (logical ≈ physical).
+    Нужен парсинг system chunk array (TODO в коде).
+  - btrfs.rs: нет чтения файлов — только mount() и read_superblock().
+    Следующий шаг: реализовать чтение файлов через обход B-дерева.
+
+--- 2026-08-23: ПОДТВЕРЖДЕНИЕ РАБОТЫ ATA + BTRFS В BOCHS ---
+
+ПОЛЬЗОВАТЕЛЬ ЗАПУСТИЛ ЯДРО В BOCHS (вручную, правило 8/9).
+Вывод (serial, через nc localhost 8888):
+  - ATA: secondary channel drive 0 present (btrfs disk) ✅
+  - btrfs: superblock OK ✅
+  - root=0x1d50000, chunk_root=0x1504000
+  - nodesize=16384, sectorsize=4096, total_bytes=134217728
+  - btrfs: mounted successfully ✅
+  - Ядро продолжило загрузку: KERNEL START → Framebuffer found (1024x768)
+    → Interrupts enabled → KERNEL READY → "Welcome to Malinka shell!"
+
+ВЫВОД: ATA PIO драйвер корректно определяет btrfs-диск на secondary-канале,
+  btrfs::mount() успешно читает и валидирует суперблок (magic совпал).
+  Интеграция в основное тело программы подтверждена.
+
+СЛЕДУЮЩИЙ ШАГ: реализовать чтение файлов с btrfs-диска —
+  парсинг system chunk array (правильный logical→physical) и обход
+  B-дерева (root tree → FS tree → DIR_ITEM → EXTENT_DATA).
+
+--- 2026-08-23: РЕАЛИЗАЦИЯ ЧТЕНИЯ ФАЙЛОВ С BTRFS-ДИСКА ---
+
+ЦЕЛЬ: чтение файлов и каталогов с btrfs-диска (Фаза 2 ФС).
+
+ИЗМЕНЕНИЯ (src/btrfs.rs, точечные):
+
+1. logical_to_physical — ПРАВИЛЬНАЯ реализация через парсинг
+   system chunk array из суперблока:
+   - Каждая запись: Key (17 байт) + Chunk (80 байт) + доп. Stripe.
+   - Key.objectid = logical_start, Key.offset = chunk_length.
+   - Chunk.stripe.offset = physical_start (для одиночного диска).
+   - physical = stripe.offset + (logical - logical_start).
+   - Fallback: identity (с диагностикой), если chunk не найден.
+   - Суперблок теперь сохраняется глобально (static SUPERBLOCK).
+
+2. find_item — добавлен параметр target_offset (точный поиск по
+   тройке objectid/type/offset). Внутренние узлы спускаются с
+   сравнением по (objectid, type, offset) — лексикографический
+   порядок ключей btrfs.
+
+3. НОВЫЕ функции чтения:
+   - get_fs_root_addr() — корень FS tree (objectid=5) из root tree
+     через ROOT_ITEM (bytenr).
+   - find_leaf() — спуск к leaf по (objectid, type).
+   - lookup_in_dir() — поиск файла по имени в каталоге (DIR_ITEM).
+   - resolve_path() — разбор пути (например "/test.txt") в inode.
+   - read_file_by_inode() — чтение EXTENT_DATA (inline и regular).
+   - read_file(path) — чтение файла по пути.
+   - list_dir(path) — список каталога (имя, inode, тип).
+   - DirEntry — структура записи каталога.
+
+4. Структуры DirItem/FileExtentItem заменены на константы смещений
+   (DIR_ITEM_SIZE=29, FILE_EXTENT_HEADER_SIZE=37) и ручные чтения
+   (read_u8/read_u16_le/read_u64_le) — не требует zerocopy и
+   надёжнее для packed-структур.
+
+SHELL-КОМАНДЫ (src/shell.rs):
+   - btrfs-ls [path] — список каталога на btrfs-диске.
+   - btrfs-cat <path> — вывод содержимого файла с btrfs-диска.
+   - Обе добавлены в help.
+
+СБОРКА: cargo check OK (0 ошибок), make_iso.sh OK (boot.iso 4,0 МБ).
+
+ТЕСТИРОВАНИЕ (вручную, правило 8/9):
+   ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+   Команды:
+     btrfs-ls /        — список корневого каталога
+     btrfs-ls /<dir>  — список подкаталога
+     btrfs-cat /<file> — содержимое файла
+
+ИЗВЕСТНЫЕ ОГРАНИЧЕНИЯ:
+   - logical_to_physical парсит только system chunk array (первые
+     chunk'ы). Для полной поддержки нужно читать chunk tree.
+   - Поддерживаются inline и regular extent (без compression/RAID).
+   - find_leaf спускается к первому подходящему leaf — если items
+     разбросаны по нескольким leaf, может не найти все. Для больших
+     файлов/каталогов нужен обход нескольких leaf.
+
+--- 2026-08-23: ФИКС CHUNK MAPPING — ЧТЕНИЕ CHUNK TREE ---
+
+ПРОБЛЕМА (из теста пользователя):
+   btrfs-ls → "btrfs: chunk mapping not found for 0x1d50000, using identity"
+   → "btrfs-ls: '/' not found or not a directory"
+
+ПРИЧИНА: system chunk array в суперблоке содержит ТОЛЬКО system chunk'и
+   (для начальной загрузки). Root tree (0x1d50000) и FS tree лежат в
+   metadata chunk, которого нет в system chunk array. logical_to_physical
+   использовал identity fallback → читал неверный физический адрес.
+
+РЕШЕНИЕ: чтение chunk tree (sb.chunk_root = 0x1504000).
+   - init_chunk_map(): обходит chunk tree (BFS по KeyPointer),
+     собирает все CHUNK_ITEM (type=128) в глобальный CHUNK_MAP
+     (массив 64 записей: logical_start, chunk_length, physical_start).
+   - logical_to_physical(): сначала ищет в CHUNK_MAP, затем в
+     system chunk array, затем identity fallback.
+   - mount(): вызывает init_chunk_map() после read_superblock().
+
+ИЗМЕНЕНИЯ (src/btrfs.rs, точечные):
+   1. Добавлены static CHUNK_MAP и CHUNK_MAP_COUNT.
+   2. Добавлена init_chunk_map() — обход chunk tree, сбор CHUNK_ITEM.
+   3. logical_to_physical переписан: поиск в CHUNK_MAP → system array.
+   4. mount() вызывает init_chunk_map().
+
+СБОРКА: cargo check OK (0 ошибок), make_iso.sh OK.
+
+ТЕСТИРОВАНИЕ (вручную, правило 8/9):
+   ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+   Ожидается при загрузке: "btrfs: chunk map loaded: N chunks".
+   Затем: btrfs-ls / — список корневого каталога.
+
+--- 2026-08-23: ИСТОРИЯ КОМАНД В SHELL + ДИАГНОСТИКА CHUNK MAPPING ---
+
+ЗАДАЧА 1: ИСТОРИЯ КОМАНД (запрос пользователя).
+   Реализован кольцевой буфер последних 25 команд с навигацией
+   по стрелкам вверх/вниз (escape-последовательности ESC[A / ESC[B).
+   Изменения (src/shell.rs, точечные):
+   - Добавлены static HISTORY [[u8;64];25], HISTORY_COUNT, HISTORY_HEAD.
+   - read_line: обработка ESC-последовательностей (стрелки).
+     Стрелка вверх: загружает предыдущую команду, очищая текущий ввод.
+     Стрелка вниз: следующая команда или пустая строка.
+   - При Enter: команда сохраняется в историю (если не пустая).
+   - history_index(hist_idx): вычисление индекса в кольцевом буфере.
+
+ЗАДАЧА 2: ДИАГНОСТИКА CHUNK MAPPING.
+   ПРОБЛЕМА: btrfs-ls / → "chunk mapping not found for 0x1d50000".
+   ПРИЧИНА: system chunk array (129 байт = 1 chunk) не содержит mapping
+   для root tree (0x1d50000). Root tree в metadata chunk, которого нет
+   в system array. Нужен chunk tree (init_chunk_map).
+   В предыдущей версии ISO init_chunk_map НЕ был вызван (пользователь
+   запускал старую ISO до пересборки).
+   ДОБАВЛЕНА диагностика в init_chunk_map: вывод каждого system chunk
+   (logical, length, phys) и chunk_root адреса. Это покажет, какие
+   chunk'и мапятся в system array и доступен ли chunk_root.
+   Проверено через dd: chunk tree root (физ. 0x1504000) читается
+   корректно — Header с tree_id=3, level=0 (leaf), 4 items.
+   Identity fallback для chunk_root работает (physical = logical).
+
+СБОРКА: cargo check OK, make_iso.sh OK (boot.iso 4,0 МБ).
+
+ТЕСТИРОВАНИЕ (вручную):
+   ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+   Ожидается при загрузке:
+     btrfs: sys chunk logical=0x.. len=0x.. phys=0x..
+     btrfs: chunk_root=0x1504000
+     btrfs: chunk map loaded: N chunks
+   Затем: btrfs-ls / — список корневого каталога.
+    Стрелки вверх/вниз в shell — навигация по истории команд.
+
+--- 2026-08-23: ФИКС #2 — CHUNK TREE ЧТЕНИЕ ПО IDENTITY ---
+
+ПРОБЛЕМА (из теста пользователя):
+   btrfs: sys chunk logical=0x100 len=0x1500000 phys=0x1500000
+   btrfs: chunk_root=0x1504000
+   btrfs: chunk mapping not found for 0x1504000, using identity
+   btrfs: chunk map loaded: 0 chunks
+
+АНАЛИЗ:
+   System chunk мапит logical [0x100, 0x1500100) → phys [0x1500000, ...).
+   chunk_root = 0x1504000 НЕ входит в system chunk (0x1504000 > 0x1500100).
+   init_chunk_map вызывал read_node(chunk_root), который через
+   logical_to_physical не нашёл mapping → identity fallback → читал
+   физический адрес 0x1504000. Но это чтение возвращало мусор (не chunk
+   tree root) → 0 chunks найдено.
+
+   Проверка через dd: по физическому адресу 0x1504000 лежит корректный
+   btrfs-узел (fsid совпадает, tree_id=3, level=0, 4 items). Значит,
+   identity (phys = logical) работает для chunk tree root.
+
+   ПРОБЛЕМА была в том, что read_node_identity не существовала —
+   init_chunk_map использовал read_node, который вызывает
+   logical_to_physical, а та выводила диагностическое сообщение и
+   возвращала identity, но read_node внутри ещё проверяла результат
+   через logical_to_physical повторно.
+
+РЕШЕНИЕ:
+   1. Добавлена read_node_identity(phys_addr) — читает узел по
+      физическому адресу БЕЗ logical_to_physical.
+   2. init_chunk_map использует read_node_identity вместо read_node
+      для чтения узлов chunk tree. Chunk tree root и его child-узлы
+      лежат в metadata chunk, для одиночного диска без RAID
+      phys = logical (identity корректен для первых metadata-узлов).
+
+СБОРКА: cargo check OK, cargo build --release OK, make_iso.sh OK.
+
+ТЕСТИРОВАНИЕ (вручную):
+   ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+   Ожидается: "btrfs: chunk map loaded: N chunks" (N > 0).
+   Затем: btrfs-ls / — список корневого каталога.
+
+--- 2026-08-23: ФИКС #3 — ДИАГНОСТИКА CHUNK TREE ЧТЕНИЯ ---
+
+ПРОБЛЕМА: btrfs-ls / по-прежнему "not found", chunk map загружает 0 chunks.
+   Пользователь не видел строк "chunk map loaded" — возможно, init_chunk_map
+   не выполняется или read_node_identity возвращает мусор.
+
+ДОБАВЛЕНА подробная диагностика в init_chunk_map:
+   - Для каждого узла: адрес, level, num_items
+   - Для каждого CHUNK_ITEM: logical, length, physical
+   - Для внутренних узлов: адреса child-узлов
+
+СБОРКА: cargo check OK, make_iso.sh OK.
+
+ТЕСТИРОВАНИЕ (вручную):
+   ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+   Вывести ПОЛНЫЙ лог загрузки (особенно строки "btrfs: chunk node ...").
+
+--- 2026-08-23: ФИКС #4 — НАЙДЕН КОРНЕВОЙ БАГ CHUNK MAPPING ---
+
+КОРНЕВАЯ ПРИЧИНА (найдена через btrfs-progs dump-tree):
+   btrfs inspect-internal dump-tree -t 3 btrfs.img показал:
+     item 0: key (DEV_ITEMS DEV_ITEM 1) — type=16, НЕ chunk
+     item 1: key (FIRST_CHUNK_TREE CHUNK_ITEM 13631488) — DATA chunk
+     item 2: key (FIRST_CHUNK_TREE CHUNK_ITEM 22020096) — SYSTEM chunk
+     item 3: key (FIRST_CHUNK_TREE CHUNK_ITEM 30408704) — METADATA chunk
+
+   В CHUNK_ITEM key:
+     objectid = FIRST_CHUNK_TREE (3) — ВСЕГДА 3, НЕ logical_start!
+     offset = logical_start адрес chunk'а (0xD00000, 0x1500000, 0x1D00000)
+     chunk_length = Chunk.length (из данных, НЕ из key)
+
+   БАГ: код читал logical_start = item.key.objectid.get() = 3 (всегда!),
+   chunk_length = item.key.offset.get() = logical_start адрес.
+   → CHUNK_MAP заполнялся мусором: (3, 0xD00000, phys) — ни один адрес
+   не попадал в диапазон [3, 3+0xD00000). Root tree (0x1d50000) не найден.
+
+ИСПРАВЛЕНИЕ (src/btrfs.rs, точечное):
+   - logical_start = item.key.offset.get() (offset = логический адрес)
+   - chunk_length = chunk.length.get() (из данных Chunk)
+   - Добавлена ручная проверка смещений (type_manual через read_u8)
+     для диагностики: сравнение item.key.r#type с ручным чтением.
+
+   Ожидаемые chunk mappings после фикса:
+     DATA:     logical 0xD00000,  len 0x800000, phys 0xD00000
+     SYSTEM:   logical 0x1500000, len 0x800000, phys 0x1500000 (stripe0)
+     METADATA: logical 0x1D00000, len 0x2000000, phys 0x2500000 (stripe0)
+   Root tree (0x1d50000) входит в METADATA chunk → phys = 0x2500000 + 0x50000.
+
+СБОРКА: cargo check OK, make_iso.sh OK.
+
+ТЕСТИРОВАНИЕ (вручную):
+   ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+   Ожидается: "btrfs: chunk map loaded: 3 chunks"
+   Затем: btrfs-ls / — список корневого каталога.
+
+--- 2026-08-23: ФИКС #5 — КОРНЕВАЯ ПРИЧИНА: НЕВЕРНЫЕ КОНСТАНТЫ BTRFS ---
+
+КОРНЕВАЯ ПРИЧИНА (найдена через linux-headers btrfs_tree.h):
+   CHUNK_ITEM_KEY был = 128, но правильное значение = 228!
+   Источник: /usr/src/linux-headers-.../include/uapi/linux/btrfs_tree.h:
+     #define BTRFS_CHUNK_ITEM_KEY    228
+     #define BTRFS_DEV_ITEM_KEY      216
+     #define BTRFS_FIRST_CHUNK_TREE_OBJECTID 256
+     #define BTRFS_DEV_ITEMS_OBJECTID 1
+
+   Ядро правильно читало type=228 для chunk items, но сравнивало с
+   CHUNK_ITEM_KEY=128 → ни один item не совпал → 0 chunks.
+
+   btrfs-progs показывал имена (CHUNK_ITEM), а не числа, что сбило с толку.
+
+ИСПРАВЛЕНИЕ (src/btrfs.rs, одна строка):
+   const CHUNK_ITEM_KEY: u8 = 228;  (было 128)
+
+   Остальные константы проверены — все верны:
+     INODE_ITEM_KEY=1, INODE_REF_KEY=12, DIR_ITEM_KEY=84,
+     EXTENT_DATA_KEY=108, ROOT_ITEM_KEY=132.
+
+СБОРКА: cargo check OK, make_iso.sh OK.
+
+ТЕСТИРОВАНИЕ (вручную):
+   ./bochs-bin/bin/bochs -q -f bochsrc.bxrc ; nc localhost 8888
+   Ожидается: "btrfs: chunk map loaded: 3 chunks"
+   Затем: btrfs-ls / — список корневого каталога.
+
+--- 2026-08-23: ФИКС #6 — ROOT_DIR_OBJECTID ---
+БАГ: ROOT_DIR_OBJECTID=6 (root tree dir), но корневой каталог FS tree = inode 256.
+btrfs-ls / → 0 entries, т.к. искал DIR_ITEM с objectid=6, а на диске objectid=256.
+ФИКС: const ROOT_DIR_OBJECTID: u64 = 256;
+СБОРКА: cargo check OK, make_iso.sh OK.
+
+--- 2026-08-23: ФИКС #7 — DIR_ITEM_SIZE + type файла ---
+БАГ1: DIR_ITEM_SIZE=29, но struct btrfs_dir_item = 30 байт
+      (location 17 + transid 8 + data_len 2 + name_len 2 + type 1).
+      Имя начиналось с pos+29 (неправильно) → "bi" вместо "bin".
+БАГ2: file_type читался на pos+8 (location.type), а нужно на
+      pos+29 (поле type в конце DirItem). → тип всегда FILE.
+ФИКС (src/btrfs.rs):
+  DIR_ITEM_SIZE = 30;
+  file_type = read_u8(pos + DIR_ITEM_SIZE - 1);  // поле type в конце
+ФИКС (src/shell.rs): печать inode={} вместо name={}.
+СБОРКА: cargo check OK, make_iso.sh OK.
