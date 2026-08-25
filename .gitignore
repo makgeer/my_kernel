@@ -19,3 +19,15 @@ bochs-2.8.tar.gz
 /qemu*.log
 # Btrfs-образ диска (создаётся mkfs.btrfs, не в git)
 /btrfs.img
+# User-программы — исходники, бинарники и скрипты сборки (не нужны в ядре)
+user_programs/*.elf
+user_programs/*.asm
+user_programs/*.ld
+user_programs/build_*.sh
+# Логи и временные файлы
+acpidump.log
+btrfs.img.lock
+build_init.sh
+# ISO и бинарник ядра (генерируются при сборке)
+/boot.iso
+iso/kernel.elf
