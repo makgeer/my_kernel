@@ -10,6 +10,20 @@ static mut HISTORY: [[u8; CMD_LEN]; HISTORY_MAX] = [[0u8; CMD_LEN]; HISTORY_MAX]
 static mut HISTORY_COUNT: usize = 0;
 static mut HISTORY_HEAD: usize = 0; // индекс куда писать следующую команду
 
+/// Специальные клавиши, распознаваемые из PS/2 scancodes.
+enum SpecialKey {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Scancodes стрелок PS/2.
+const SCAN_UP: u8 = 0x48;
+const SCAN_DOWN: u8 = 0x50;
+const SCAN_LEFT: u8 = 0x4B;
+const SCAN_RIGHT: u8 = 0x4D;
+
 /// Ожидает один символ из буфера клавиатуры (блокирующее чтение).
 /// Возвращает (символ, источник):
 ///   true  = из serial (COM1)
@@ -39,6 +53,69 @@ pub fn getchar() -> (char, bool) {
     }
 }
 
+/// Читает одну «клавишу»: PS/2 scancode или serial байт.
+/// Возвращает результат:
+///   Ok(Char(c)) — печатный символ / управляющий (Enter, Backspace, ESC)
+///   Ok(Special(SpecialKey::Up/Down/Left/Right)) — стрелка PS/2
+///   Ok(Eof) — EOF (serial закрывается)
+///
+/// Проверяет ОБА источника: serial ПЕРВЫМ (там escape-последовательности),
+/// затем PS/2 scancodes (стрелки в Bochs идут как scancodes).
+fn read_key() -> Result<char, SpecialKey> {
+    // Источник 1: serial (COM1) — проверяем ПЕРВЫМ, чтобы поймать
+    // escape-последовательности ESC [ A/B/C/D
+    if crate::serial::serial_has_data() {
+        let byte = crate::serial::serial_read();
+        return Ok(byte as char);
+    }
+    // Источник 2: PS/2 клавиатура — проверяем scancodes стрелок
+    let mut buffer = KEYBOARD_BUFFER.lock();
+    if let Some(&byte) = buffer.first() {
+        buffer.remove(0);
+        match byte {
+            SCAN_UP => Err(SpecialKey::Up),
+            SCAN_DOWN => Err(SpecialKey::Down),
+            SCAN_LEFT => Err(SpecialKey::Left),
+            SCAN_RIGHT => Err(SpecialKey::Right),
+            _ => Ok(byte as char),
+        }
+    } else {
+        // Пустой буфер — небольшая пауза и повторный опрос serial
+        for _ in 0..500 {
+            unsafe { core::arch::asm!("nop"); }
+        }
+        if crate::serial::serial_has_data() {
+            let byte = crate::serial::serial_read();
+            Ok(byte as char)
+        } else {
+            // Ничего нет — бесконечно ждём
+            drop(buffer);
+            loop {
+                if crate::serial::serial_has_data() {
+                    let byte = crate::serial::serial_read();
+                    return Ok(byte as char);
+                }
+                {
+                    let mut buf = KEYBOARD_BUFFER.lock();
+                    if let Some(&byte) = buf.first() {
+                        buf.remove(0);
+                        match byte {
+                            SCAN_UP => return Err(SpecialKey::Up),
+                            SCAN_DOWN => return Err(SpecialKey::Down),
+                            SCAN_LEFT => return Err(SpecialKey::Left),
+                            SCAN_RIGHT => return Err(SpecialKey::Right),
+                            _ => return Ok(byte as char),
+                        }
+                    }
+                }
+                for _ in 0..500 {
+                    unsafe { core::arch::asm!("nop"); }
+                }
+            }
+        }
+    }
+}
+
 /// Читает строку до Enter. Возвращает набранные символы.
 /// Поддерживает Backspace и историю команд (стрелки вверх/вниз).
 /// Эхо печатается ВСЕГДА (и для serial, и для PS/2).
@@ -48,121 +125,94 @@ pub fn getchar() -> (char, bool) {
 pub fn read_line() -> [u8; 64] {
     let mut input_buf = [0u8; 64];
     let mut pos = 0;
+    let mut input_len = 0;
 
     // Индекс для навигации по истории. start = HISTORY_COUNT означает
     // "новая пустая строка". При нажатии вверх уменьшаем, вниз — увеличиваем.
     let mut hist_idx: usize;
 
     unsafe {
-        // Если история пуста, hist_idx = 0 (новая строка).
-        // Иначе начинаем с "новой строки" (после последней).
         hist_idx = HISTORY_COUNT;
     }
 
     loop {
-        let (c, _from_serial) = getchar();
-
-        // Обработка escape-последовательностей (стрелки).
-        // ESC [ A = вверх, ESC [ B = вниз, ESC [ C = вправо, ESC [ D = влево.
-        // ВАЖНО: при вводе через COM1 (serial) нужно читать следующие
-        // байты напрямую из serial-порта, минуя getchar(), который
-        // проверяет PS/2 буфер ПЕРВЫМ — если между ESC и '['/'A'
-        // сработает IRQ клавиатуры, PS/2 буфер не пуст и getchar()
-        // вернёт PS/2-байт вместо serial-байта → escape не распознается.
-        if c == '\u{1b}' {
-            // Пытаемся прочитать '[' и букву напрямую из serial.
-            // ВАЖНО: при вводе через COM1 (socket-server) между
-            // чтением ESC и '['/'A' есть сетевая задержка — Bochs
-            // com1 ещё не получил следующие байты из TCP-соединения.
-            // Даем небольшую задержку перед чтением следующих байтов.
-            for _ in 0..5000 {
-                unsafe { core::arch::asm!("nop"); }
-            }
-            let (c2, c3) = if let Some(b1) = crate::serial::serial_read_nonblocking() {
-                if b1 == b'[' {
-                    for _ in 0..5000 {
-                        unsafe { core::arch::asm!("nop"); }
+        let c = match read_key() {
+            Ok(c) => c,
+            Err(SpecialKey::Up) => {
+                unsafe {
+                    if HISTORY_COUNT == 0 || hist_idx == 0 {
+                        continue;
                     }
-                    if let Some(b2) = crate::serial::serial_read_nonblocking() {
-                        (b1 as char, b2 as char)
-                    } else {
-                        ('[', '\0')
+                    hist_idx -= 1;
+                    let cmd_idx = history_index(hist_idx);
+                    while pos > 0 {
+                        pos -= 1;
+                        crate::print!("\u{8} \u{8}");
                     }
-                } else {
-                    ('[', '\0')
-                }
-            } else {
-                ('[', '\0')
-            };
-            if c2 == '[' {
-                match c3 {
-                    'A' => {
-                        // Стрелка вверх — предыдущая команда из истории
-                        unsafe {
-                            if HISTORY_COUNT == 0 || hist_idx == 0 {
-                                continue; // истории нет или уже в начале
-                            }
-                            hist_idx -= 1;
-                            // cmd_idx — реальный индекс в массиве HISTORY
-                            let cmd_idx = history_index(hist_idx);
-                            // Очищаем текущий ввод
-                            while pos > 0 {
-                                pos -= 1;
-                                crate::print!("\u{8} \u{8}");
-                            }
-                            // Копируем команду из истории
-                            for i in 0..CMD_LEN {
-                                if HISTORY[cmd_idx][i] == 0 { break; }
-                                if pos < input_buf.len() - 1 {
-                                    input_buf[pos] = HISTORY[cmd_idx][i];
-                                    pos += 1;
-                                    crate::print!("{}", HISTORY[cmd_idx][i] as char);
-                                }
-                            }
+                    input_len = 0;
+                    for i in 0..CMD_LEN {
+                        if HISTORY[cmd_idx][i] == 0 { break; }
+                        if pos < input_buf.len() - 1 {
+                            input_buf[pos] = HISTORY[cmd_idx][i];
+                            pos += 1;
+                            input_len += 1;
+                            crate::print!("{}", HISTORY[cmd_idx][i] as char);
                         }
-                        continue;
-                    }
-                    'B' => {
-                        // Стрелка вниз — следующая команда (или пустая строка)
-                        unsafe {
-                            if hist_idx >= HISTORY_COUNT {
-                                continue; // уже на новой строке
-                            }
-                            hist_idx += 1;
-                            // Очищаем текущий ввод
-                            while pos > 0 {
-                                pos -= 1;
-                                crate::print!("\u{8} \u{8}");
-                            }
-                            if hist_idx < HISTORY_COUNT {
-                                let cmd_idx = history_index(hist_idx);
-                                for i in 0..CMD_LEN {
-                                    if HISTORY[cmd_idx][i] == 0 { break; }
-                                    if pos < input_buf.len() - 1 {
-                                        input_buf[pos] = HISTORY[cmd_idx][i];
-                                        pos += 1;
-                                        crate::print!("{}", HISTORY[cmd_idx][i] as char);
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    _ => {
-                        // Другие escape-последовательности — игнорируем
-                        continue;
                     }
                 }
+                continue;
             }
-            // ESC без '[' — игнорируем
-            continue;
-        }
+            Err(SpecialKey::Down) => {
+                unsafe {
+                    if hist_idx >= HISTORY_COUNT {
+                        while pos > 0 {
+                            pos -= 1;
+                            crate::print!("\u{8} \u{8}");
+                        }
+                        input_len = 0;
+                        continue;
+                    }
+                    hist_idx += 1;
+                    while pos > 0 {
+                        pos -= 1;
+                        crate::print!("\u{8} \u{8}");
+                    }
+                    input_len = 0;
+                    if hist_idx < HISTORY_COUNT {
+                        let cmd_idx = history_index(hist_idx);
+                        for i in 0..CMD_LEN {
+                            if HISTORY[cmd_idx][i] == 0 { break; }
+                            if pos < input_buf.len() - 1 {
+                                input_buf[pos] = HISTORY[cmd_idx][i];
+                                pos += 1;
+                                input_len += 1;
+                                crate::print!("{}", HISTORY[cmd_idx][i] as char);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(SpecialKey::Left) => {
+                if pos > 0 {
+                    pos -= 1;
+                    crate::print!("\u{8}");
+                }
+                continue;
+            }
+            Err(SpecialKey::Right) => {
+                if pos < input_len {
+                    crate::print!("{}", input_buf[pos] as char);
+                    pos += 1;
+                }
+                continue;
+            }
+        };
 
         match c {
             // Enter — конец строки
             '\n' | '\r' => {
                 println!();
-                // Сохраняем команду в историю (если не пустая)
                 if pos > 0 {
                     unsafe {
                         let slot = HISTORY_HEAD % HISTORY_MAX;
@@ -179,7 +229,98 @@ pub fn read_line() -> [u8; 64] {
             '\u{8}' | '\u{7f}' => {
                 if pos > 0 {
                     pos -= 1;
+                    input_len -= 1;
                     crate::print!("\u{8} \u{8}");
+                }
+            }
+            // ESC [ A/B/C/D — serial escape-последовательности
+            '\u{1b}' => {
+                for _ in 0..5000 {
+                    unsafe { core::arch::asm!("nop"); }
+                }
+                let c2 = if let Some(b1) = crate::serial::serial_read_nonblocking() {
+                    if b1 == b'[' {
+                        for _ in 0..5000 {
+                            unsafe { core::arch::asm!("nop"); }
+                        }
+                        if let Some(b2) = crate::serial::serial_read_nonblocking() {
+                            b2 as char
+                        } else {
+                            '\0'
+                        }
+                    } else {
+                        '\0'
+                    }
+                } else {
+                    '\0'
+                };
+                match c2 {
+                    'A' => {
+                        unsafe {
+                            if HISTORY_COUNT == 0 || hist_idx == 0 {
+                                continue;
+                            }
+                            hist_idx -= 1;
+                            let cmd_idx = history_index(hist_idx);
+                            while pos > 0 {
+                                pos -= 1;
+                                crate::print!("\u{8} \u{8}");
+                            }
+                            input_len = 0;
+                            for i in 0..CMD_LEN {
+                                if HISTORY[cmd_idx][i] == 0 { break; }
+                                if pos < input_buf.len() - 1 {
+                                    input_buf[pos] = HISTORY[cmd_idx][i];
+                                    pos += 1;
+                                    input_len += 1;
+                                    crate::print!("{}", HISTORY[cmd_idx][i] as char);
+                                }
+                            }
+                        }
+                    }
+                    'B' => {
+                        unsafe {
+                            if hist_idx >= HISTORY_COUNT {
+                                while pos > 0 {
+                                    pos -= 1;
+                                    crate::print!("\u{8} \u{8}");
+                                }
+                                input_len = 0;
+                                continue;
+                            }
+                            hist_idx += 1;
+                            while pos > 0 {
+                                pos -= 1;
+                                crate::print!("\u{8} \u{8}");
+                            }
+                            input_len = 0;
+                            if hist_idx < HISTORY_COUNT {
+                                let cmd_idx = history_index(hist_idx);
+                                for i in 0..CMD_LEN {
+                                    if HISTORY[cmd_idx][i] == 0 { break; }
+                                    if pos < input_buf.len() - 1 {
+                                        input_buf[pos] = HISTORY[cmd_idx][i];
+                                        pos += 1;
+                                        input_len += 1;
+                                        crate::print!("{}", HISTORY[cmd_idx][i] as char);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    'D' => {
+                        if pos > 0 {
+                            pos -= 1;
+                            crate::print!("\u{8}");
+                        }
+                    }
+                    'C' => {
+                        if pos < input_len {
+                            crate::print!("{}", input_buf[pos] as char);
+                            pos += 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
             // Обычный печатный символ
@@ -187,6 +328,7 @@ pub fn read_line() -> [u8; 64] {
                 if pos < input_buf.len() - 1 && c.is_ascii() {
                     input_buf[pos] = c as u8;
                     pos += 1;
+                    input_len += 1;
                     crate::print!("{}", c);
                 }
             }
@@ -254,6 +396,9 @@ pub fn shell() {
                 println!("  run_syscall - ELF with read/write syscalls (multi-segment)");
                 println!("  run_multi  - run 2 processes (loop_a + loop_b) for preemptive scheduler test");
                 println!("  test_ipc   - run 2 processes (ipc_sender + ipc_receiver) for IPC test");
+                println!("  arrow_test - log all keyboard bytes (hex) to debug Bochs arrows");
+                println!("  ps         - list all processes (PID, state, name)");
+                println!("  kill <pid> - terminate a process by PID");
                 println!("  ls         - list files in VFS (initrd)");
                 println!("  cat <file> - print file contents");
                 println!("  run <file> - load and run ELF program from VFS");
@@ -313,6 +458,31 @@ pub fn shell() {
             "ps" => {
                 // Список процессов в менеджере процессов (вытесняющий планировщик)
                 crate::process_manager::list_processes();
+            }
+            "kill" => {
+                // Завершение процесса по PID (для отладки планировщика).
+                // Аргумент: PID (число). Возвращает в shell.
+                if cmd.len() > 5 {
+                    let pid_str = cmd[5..].trim();
+                    match pid_str.parse::<usize>() {
+                        Ok(pid) => {
+                            // PID = индекс + 1 (next_pid начинается с 1)
+                            let idx = pid.saturating_sub(1);
+                            if idx < crate::process_manager::MAX_PROCESSES {
+                                crate::process_manager::PROCESS_MANAGER.lock()
+                                    .terminate(idx);
+                                println!("  Process PID={} terminated", pid);
+                            } else {
+                                println!("  kill: invalid PID {} (max={})", pid, crate::process_manager::MAX_PROCESSES);
+                            }
+                        }
+                        Err(_) => {
+                            println!("  Usage: kill <pid>");
+                        }
+                    }
+                } else {
+                    println!("  Usage: kill <pid>");
+                }
             }
             "cursor" => {
                 // Диагностика: выводим логическую позицию курсора терминала.
@@ -697,6 +867,20 @@ pub fn shell() {
                 // Ожидаемый вывод: "MSG1HELLOWORLD", затем возврат в shell.
                 crate::tests::test_ipc();
                 // test_ipc не возвращается (run_process noreturn).
+            }
+            "arrow_test" => {
+                // Тест клавиатуры: читает stdin, логирует hex-байты.
+                static ELF: &[u8] = include_bytes!("../user_programs/arrow_test.elf");
+                println!("Loading arrow_test ({} bytes)...", ELF.len());
+                match crate::process::create_elf_process(ELF) {
+                    Ok(proc) => {
+                        println!("Launching arrow_test ring 3...");
+                        crate::process::run_process(&proc);
+                    }
+                    Err(e) => {
+                        println!("  FAILED: {}", e);
+                    }
+                }
             }
             "color" => {
                 // Демонстрация 16-цветной палитры ANSI SGR.

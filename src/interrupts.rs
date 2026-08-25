@@ -39,6 +39,11 @@ pub fn init_idt() {
         // IRQ1 — клавиатура (вектор 0x21, PIC offset), свой стек IST 3
         let k = idt[0x21].set_handler_fn(keyboard_handler);
         unsafe { k.set_stack_index(crate::gdt::KEYBOARD_IST_INDEX) };
+        // IRQ4 — serial COM1 (вектор 0x24, PIC offset), собственный IST 5.
+        // Собирает байты из UART и кладёт в KEYBOARD_BUFFER —
+        // это пробуждает sys_read из sti;hlt.
+        let s = idt[0x24].set_handler_fn(serial_irq_handler);
+        unsafe { s.set_stack_index(crate::gdt::SERIAL_IST_INDEX) };
         // #PF — page fault, нужен для диагностики проблем с маппингами
         // в user mode (отсутствует обработчик → DOUBLE FAULT).
         // Собственный IST-стек (IST 4): #PF может возникнуть в ring 3,
@@ -166,11 +171,9 @@ pub fn init_pic() {
     // ICW4: режим 8086
     outb(PIC1_DATA, 0x01);
     outb(PIC2_DATA, 0x01);
-    // Маска master: 0xFC = 0b11111100 — разрешаем ТОЛЬКО IRQ0 (таймер)
-    // и IRQ1 (клавиатура). Остальные маскируем: без маски после init
-    // все IRQ открыты, а IRQ8 (RTC) периодически срабатывает сам по себе
-    // → непокрытое прерывание → #GP → DOUBLE FAULT.
-    outb(PIC1_DATA, 0xFC);
+    // Маска master: 0xEF = 0b11101111 — разрешаем IRQ0 (таймер),
+    // IRQ1 (клавиатура) и IRQ4 (serial COM1). Остальные маскируем.
+    outb(PIC1_DATA, 0xEF);
     // Маска slave: 0xFF — маскируем все IRQ 8-15 (в т.ч. RTC IRQ8,
     // spurious IRQ15). Обработчики для них не зарегистрированы.
     outb(PIC2_DATA, 0xFF);
@@ -295,6 +298,28 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
         }
     }
     
+    outb(PIC1, 0x20);
+}
+
+/// Обработчик IRQ4 (serial COM1) — читает принятые байты из UART и
+/// кладёт в KEYBOARD_BUFFER. Это пробуждает sys_read, который спит
+/// в sti; hlt: когда байт попадает в буфер, цикл read_loop находит
+/// его и возвращается в user-процесс.
+extern "x86-interrupt" fn serial_irq_handler(_stack_frame: InterruptStackFrame) {
+    const COM1: u16 = 0x3F8;
+    // Пока есть принятые байты в UART FIFO — читаем все
+    loop {
+        let lsr = unsafe { Port::<u8>::new(COM1 + 5).read() };
+        if (lsr & 0x01) == 0 {
+            break; // нет данных
+        }
+        let byte = unsafe { Port::<u8>::new(COM1).read() };
+        let mut buffer = KEYBOARD_BUFFER.lock();
+        if buffer.push(byte).is_err() {
+            // буфер переполнен — байт теряется
+        }
+        drop(buffer);
+    }
     outb(PIC1, 0x20);
 }
 

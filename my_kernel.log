@@ -3425,4 +3425,37 @@ make_iso.sh no-fb OK (boot.iso 4,0 МБ).
 === 2026-08-24: Логирование ===
 Исправление btrfs-cat: двойное header_size в read_file_by_inode
 Исправление: data_start = item.offset (без + header_size)
-Сборка: cargo check OK, ISO собран (no-fb)
+Сборка: cargo check ✅ 0 ошибок, 49 warnings
+
+Добавлена команда shell `kill <pid>`:
+  - Завершает процесс по PID через process_manager::terminate()
+  - Добавлена в help (строка 257-258)
+  - Проверка валидности PID (0..MAX_PROCESSES)
+
+Обновлён plan.txt:
+  - Пункт 5 "Планировщик процессов + IPC" отмечен как [СДЕЛАНО]
+  - Перечислены все компоненты: ProcessManager, timer_handler_naked,
+    context_switch, syscall (read/write/ipc_send/ipc_recv/exit),
+    IPC Mailbox, block/terminate/switch, kernel_return_to_shell,
+    shell команды (ps, run_multi, test_ipc)
+
+=== 2026-08-25: Исправление бесконечного цикла sys_read ===
+Проблема: arrow_test.elf зависал в бесконечном цикле — sys_read блокируется
+на sti; hlt, serial COM1 не генерирует прерывания, IRQ4 маскирован.
+
+Причина:
+- sys_read блокирующий: ждёт байт из KEYBOARD_BUFFER, если пусто — sti; hlt
+- Serial COM1 работает через polling (serial_has_data), но НЕ через прерывания
+- PIC mask = 0xFC — IRQ4 (serial) маскирован
+- Процесс вечно спит в hlt, не просыпается от ввода через nc localhost:8888
+
+Решение — 4 изменения:
+1. src/interrupts.rs: добавлен serial_irq_handler (IRQ4, вектор 0x24)
+   - Читает все байты из UART FIFO (port 0x3F8/0x3FD)
+   - Кладёт в KEYBOARD_BUFFER — пробуждает sys_read
+2. src/interrupts.rs: регистрация в IDT, вектор 0x24
+3. src/interrupts.rs: PIC mask изменён с 0xFC на 0xEF (разрешён IRQ4)
+4. src/serial.rs: включены прерывания UART (RDI bit 0 = 1)
+
+Сборка: cargo check ✅  cargo build ✅  boot.iso ✅ 4.0M
+Ожидает тестирования в Bochs: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc

@@ -17,6 +17,11 @@ pub const KEYBOARD_IST_INDEX: u16 = 3;
 /// через TSS.rsp0 fails). IST гарантирует валидный стек для #PF handler.
 pub const PAGE_FAULT_IST_INDEX: u16 = 4;
 
+/// IST для serial IRQ4 — собственный стек, независимый от TSS.rsp0.
+/// Позволяет безопасно читать байты из UART и класть в KEYBOARD_BUFFER
+/// без риска DOUBLE FAULT при переполнении стека.
+pub const SERIAL_IST_INDEX: u16 = 5;
+
 /// Селекторы сегментов (индексы в GDT).
 /// Каждый селектор = индекс * 8 + DPL (0=kernel, 3=user).
 ///
@@ -60,6 +65,7 @@ static mut DOUBLE_FAULT_STACK: AlignedStack<16384> = AlignedStack([0; 16384]);
 static mut TIMER_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 static mut KEYBOARD_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 static mut PAGE_FAULT_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
+static mut SERIAL_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 
 /// Kernel stack для возврата из user mode (ring 3 → ring 0).
 /// При int 0x80 из user mode CPU переключается на TSS.rsp0 — этот стек.
@@ -88,6 +94,8 @@ pub fn init_gdt() {
             VirtAddr::new(KEYBOARD_STACK.0.as_ptr() as u64 + KEYBOARD_STACK.0.len() as u64);
         TSS.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] =
             VirtAddr::new(PAGE_FAULT_STACK.0.as_ptr() as u64 + PAGE_FAULT_STACK.0.len() as u64);
+        TSS.interrupt_stack_table[SERIAL_IST_INDEX as usize] =
+            VirtAddr::new(SERIAL_STACK.0.as_ptr() as u64 + SERIAL_STACK.0.len() as u64);
 
         // RSP0 — стек для перехода из ring 3 в ring 0 (int 0x80, прерывания).
         // Без RSP0 при int из user mode CPU использует RSP=0 → page fault.

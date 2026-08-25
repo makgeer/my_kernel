@@ -50,10 +50,16 @@
    - user_programs/syscall_test (2 PT_LOAD сегмента), команда run_syscall
    - ОЖИДАЕТ ТЕСТИРОВАНИЯ В BOCHS
 
-5. [СЛЕДУЮЩЕЕ] ПЛАНИРОВЩИК ПРОЦЕССОВ + IPC (по запросу пользователя)
-   - переключение контекста между ring 3 процессами
-   - список процессов, round-robin
-   - IPC: каналы/почтовые ящики для обмена сообщениями
+5. [СДЕЛАНО] ПЛАНИРОВЩИК ПРОЦЕССОВ + IPC
+    - ProcessManager: round-robin, MAX_PROCESSES=16
+    - timer_handler_naked → timer_schedule_rust (вытесняющее переключение)
+    - context_switch (naked asm, сохранение/восстановление GPR + IRET-фрейм)
+    - syscall: read(#0), write(#1), ipc_send(#40), ipc_recv(#41), exit(#60)
+    - IPC: Mailbox (кольцевой буфер), IpcMessage, ipc_send/ipc_recv
+    - block_current_and_switch — блокировка при ipc_recv
+    - terminate_current + switch_to_next_after_exit — завершение процесса
+    - kernel_return_to_shell — возврат в shell
+    - shell: ps, run_multi, test_ipc
 
 6. [НОВОЕ ЗАПРОШЕНО] РАЗВИТИЕ USER-SPACE
    - Rhai: скриптовый движок в ядре (no_std) — for скриптов/автоматизации

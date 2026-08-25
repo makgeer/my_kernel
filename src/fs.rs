@@ -5,6 +5,7 @@
 //! список содержимого каталога, создание/удаление файлов и каталогов.
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -20,7 +21,7 @@ pub enum FsNodeType {
 /// Узел ФС (inode).
 pub struct FsNode {
     /// Имя файла/каталога (без пути).
-    pub name: &'static str,
+    pub name: String,
     /// Тип узла.
     pub node_type: FsNodeType,
     /// Данные файла (для initrd — байты в памяти). Для каталога — пустой.
@@ -32,7 +33,7 @@ pub struct FsNode {
 impl Clone for FsNode {
     fn clone(&self) -> Self {
         Self {
-            name: self.name,
+            name: self.name.clone(),
             node_type: self.node_type,
             data: self.data.clone(),
             children: Mutex::new(self.children.lock().clone()),
@@ -42,9 +43,9 @@ impl Clone for FsNode {
 
 impl FsNode {
     /// Создаёт файл.
-    pub fn file(name: &'static str, data: &'static [u8]) -> Self {
+    pub fn file(name: &str, data: &[u8]) -> Self {
         Self {
-            name,
+            name: name.into(),
             node_type: FsNodeType::File,
             data: data.into(),
             children: Mutex::new(Vec::new()),
@@ -52,9 +53,9 @@ impl FsNode {
     }
 
     /// Создаёт каталог.
-    pub fn dir(name: &'static str) -> Self {
+    pub fn dir(name: &str) -> Self {
         Self {
-            name,
+            name: name.into(),
             node_type: FsNodeType::Directory,
             data: Box::new([]),
             children: Mutex::new(Vec::new()),
@@ -91,28 +92,25 @@ pub fn lookup(path: &str) -> Option<FsNode> {
         return Some(ROOT.lock().as_ref()?.clone());
     }
 
-    let mut current = ROOT.lock();
-    let mut node = current.as_mut()?;
+    // Начинаем с корневого узла
+    let mut node = ROOT.lock().as_ref()?.clone();
     
     for comp in path.split('/').filter(|c| !c.is_empty()) {
         if node.node_type != FsNodeType::Directory {
             return None;
         }
-        let children = node.children.lock();
-        let found = children.iter().find(|c| c.name == comp).cloned();
-        drop(children);
-        drop(current);
-        
+        // Блокируем children, ищем, сразу разблокируем
+        let found = {
+            let children = node.children.lock();
+            children.iter().find(|c| c.name == comp).cloned()
+        };
         match found {
-            Some(child) => {
-                current = child.children.lock();
-                node = current.as_mut()?;
-            }
+            Some(child) => node = *child,
             None => return None,
         }
     }
     
-    Some(node.clone())
+    Some(node)
 }
 
 /// Возвращает содержимое каталога (список дочерних узлов).

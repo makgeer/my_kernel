@@ -12,7 +12,7 @@ pub const COM1: u16 = 0x3F8;
 /// Инициализация UART 16550 (последовательность из OSDev Wiki / Blog OS)
 pub fn init() {
     unsafe {
-        // Отключаем прерывания UART
+        // Отключаем прерывания UART (сброс)
         Port::<u8>::new(COM1 + 1).write(0x00);
         // DLAB = 1 — переходим к установке делителя частоты
         Port::<u8>::new(COM1 + 3).write(0x80);
@@ -25,6 +25,8 @@ pub fn init() {
         Port::<u8>::new(COM1 + 2).write(0xC7);
         // DTR, RTS, OUT2 — сигналы готовности модема
         Port::<u8>::new(COM1 + 4).write(0x0B);
+        // Включаем прерывания приёма (RDI, bit 0) — UART генерирует IRQ4
+        Port::<u8>::new(COM1 + 1).write(0x01);
     }
 }
 

@@ -638,9 +638,9 @@ pub fn read_file_by_inode(inode: u64) -> Option<alloc::vec::Vec<u8>> {
         }
 
         let extent_type = read_u8(&leaf_buf, data_start)?;
-        let disk_bytenr = read_u64_le(&leaf_buf, data_start + 5)?;
-        let disk_num_bytes = read_u64_le(&leaf_buf, data_start + 13)?;
-        let num_bytes = read_u64_le(&leaf_buf, data_start + 21)?;
+        let disk_bytenr = read_u64_le(&leaf_buf, data_start + 1)?;
+        let disk_num_bytes = read_u64_le(&leaf_buf, data_start + 9)?;
+        let num_bytes = read_u64_le(&leaf_buf, data_start + 17)?;
 
         // Диагностика extent (правило .kodaruls п.6)
         crate::println!("btrfs: extent obj=0x{:x} type={} item_size={} disk_bytenr=0x{:x} disk_num_bytes={} num_bytes={}",
