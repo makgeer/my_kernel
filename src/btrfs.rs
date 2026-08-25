@@ -47,42 +47,55 @@ const MAX_CHUNKS: usize = 64;
 static mut CHUNK_MAP: [(u64, u64, u64); MAX_CHUNKS] = [(0, 0, 0); MAX_CHUNKS];
 static mut CHUNK_MAP_COUNT: usize = 0;
 
+/// Кэш адреса FS tree root (вычисляется один раз, правило .kodaruls п.6).
+static mut FS_ROOT_ADDR: u64 = 0;
+
 /// Типы файловых записей в DIR_ITEM (btrfs_dir_item.type).
 /// Код выделен бирюзовым цветом (правило .kodaruls п.6).
 const DIR_TYPE_UNKNOWN: u8 = 0;
 const DIR_TYPE_REGULAR: u8 = 1;
 const DIR_TYPE_DIRECTORY: u8 = 2;
 
+/// Размер DirItem в leaf B-дерева btrfs (30 байт).
+const DIR_ITEM_SIZE: usize = 30;
+
+/// Размер заголовка FileExtentItem (37 байт) — данные inline следуют сразу после.
+const FILE_EXTENT_HEADER_SIZE: usize = 37;
+
 /// Типы EXTENT_DATA (btrfs_file_extent_item.type).
-/// Код выделен бирюзовым цветом (правило .kodaruls п.6).
 const EXTENT_TYPE_INLINE: u8 = 0;
 const EXTENT_TYPE_REGULAR: u8 = 1;
 const EXTENT_TYPE_PREALLOC: u8 = 2;
 
-/// Размер заголовка FileExtentItem (37 байт) — данные inline следуют сразу после.
-/// Код выделен бирюзовым цветом (правило .kodaruls п.6).
-const FILE_EXTENT_HEADER_SIZE: usize = 37;
+/// Возвращает логический адрес корня FS tree (подтом objectid=5).
+/// Кэширует результат для повторных вызовов.
+fn get_fs_root_addr() -> Option<u64> {
+    unsafe {
+        if FS_ROOT_ADDR != 0 {
+            return Some(FS_ROOT_ADDR);
+        }
+    }
 
-/// Смещения полей DirItem (btrfs_dir_item, repr(C, packed)):
-///   0:  Key location (17 байт)
-///  17:  transid (u64 LE)
-///  25:  data_len (u16 LE)
-///  27:  name_size (u16 LE)
-///  29:  name (name_size байт)
-/// Код выделен бирюзовым цветом (правило .kodaruls п.6).
-const DIR_ITEM_SIZE: usize = 30; // location(17)+transid(8)+data_len(2)+name_len(2)+type(1)
+    let sb = unsafe { SUPERBLOCK? };
+    let root_addr = sb.root.get();
 
-/// Смещения полей FileExtentItem (btrfs_file_extent_item, repr(C, packed)):
-///   0:  type (u8)
-///   1:  compression (u8)
-///   2:  encryption (u8)
-///   3:  other_encoding (u16 LE)
-///   5:  disk_bytenr (u64 LE)
-///  13:  disk_num_bytes (u64 LE)
-///  21:  num_bytes (u64 LE)
-///  29:  ram_bytes (u64 LE)
-///  37:  данные (для inline) / padding+stripes (для regular)
-/// Код выделен бирюзовым цветом (правило .kodaruls п.6).
+    // Ищем ROOT_ITEM_KEY (132) с objectid=FS_TREE_OBJECTID (5), offset=0
+    let (_key, data_off, data_sz, leaf_buf) =
+        find_item(root_addr, FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0)?;
+
+    if data_sz < core::mem::size_of::<btrfs_no_std::RootItem>() {
+        crate::println!("btrfs: ROOT_ITEM too small ({})", data_sz);
+        return None;
+    }
+
+    let root_item = unsafe {
+        &*(leaf_buf.as_ptr().add(data_off) as *const btrfs_no_std::RootItem)
+    };
+    let fs_root = root_item.bytenr.get();
+    unsafe { FS_ROOT_ADDR = fs_root; }
+    crate::println!("btrfs: FS tree root at 0x{:x}", fs_root);
+    Some(fs_root)
+}
 
 /// Читает u64 LE из среза по смещению (правило .kodaruls п.6).
 fn read_u64_le(buf: &[u8], offset: usize) -> Option<u64> {
@@ -310,7 +323,7 @@ fn logical_to_physical(logical: u64) -> Option<u64> {
         }
     }
 
-    // 2. Ищем в system chunk array суперблока
+    // 2. Ищем в system chunk array суперблок
     let sb = unsafe { SUPERBLOCK? };
     let array = &sb.sys_chunk_array;
     let array_size = sb.sys_chunk_array_size.get() as usize;
@@ -473,31 +486,6 @@ pub fn mount() -> bool {
 // Код выделен бирюзовым цветом (правило .kodaruls п.6).
 // ============================================================================
 
-/// Возвращает логический адрес корня FS tree (подтом objectid=5).
-///
-/// Читает root tree (sb.root), ищет ROOT_ITEM с objectid=5 (FS_TREE_OBJECTID).
-/// RootItem.bytenr = логический адрес корня FS tree.
-fn get_fs_root_addr() -> Option<u64> {
-    let sb = unsafe { SUPERBLOCK? };
-    let root_addr = sb.root.get();
-
-    // Ищем ROOT_ITEM_KEY (132) с objectid=FS_TREE_OBJECTID (5), offset=0
-    let (_key, data_off, data_sz, leaf_buf) =
-        find_item(root_addr, FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0)?;
-
-    if data_sz < core::mem::size_of::<btrfs_no_std::RootItem>() {
-        crate::println!("btrfs: ROOT_ITEM too small ({})", data_sz);
-        return None;
-    }
-
-    let root_item = unsafe {
-        &*(leaf_buf.as_ptr().add(data_off) as *const btrfs_no_std::RootItem)
-    };
-    let fs_root = root_item.bytenr.get();
-    crate::println!("btrfs: FS tree root at 0x{:x}", fs_root);
-    Some(fs_root)
-}
-
 /// Находит leaf, содержащий items с заданным (objectid, type).
 ///
 /// Обходит B-tree от корня, спускается к leaf.
@@ -643,8 +631,7 @@ pub fn read_file_by_inode(inode: u64) -> Option<alloc::vec::Vec<u8>> {
 
         if obj != inode || typ != EXTENT_DATA_KEY { continue; }
 
-        let data_start = item.offset.get() as usize + header_size;
-        let data_size = item.size.get() as usize;
+        let data_start = item.offset.get() as usize; // offset уже включает header_size (из find_item)
 
         if data_start + FILE_EXTENT_HEADER_SIZE > leaf_buf.len() {
             break;
@@ -655,30 +642,54 @@ pub fn read_file_by_inode(inode: u64) -> Option<alloc::vec::Vec<u8>> {
         let disk_num_bytes = read_u64_le(&leaf_buf, data_start + 13)?;
         let num_bytes = read_u64_le(&leaf_buf, data_start + 21)?;
 
+        // Диагностика extent (правило .kodaruls п.6)
+        crate::println!("btrfs: extent obj=0x{:x} type={} item_size={} disk_bytenr=0x{:x} disk_num_bytes={} num_bytes={}",
+            obj, extent_type, item.size.get(), disk_bytenr, disk_num_bytes, num_bytes);
+
+        // Диагностика: выводим первые 40 байт extent_struct
+        let dump_len = (data_start + 40).min(leaf_buf.len());
+        if dump_len > data_start {
+            crate::println!("btrfs:   extent_struct bytes:");
+            for i in data_start..dump_len {
+                crate::print!(" {:02x}", leaf_buf[i]);
+            }
+            crate::println!();
+        }
+
         match extent_type {
             EXTENT_TYPE_INLINE => {
-                // Inline: данные следуют сразу после заголовка (37 байт)
+                // Inline: данные файла следуют сразу после extent_struct (37 байт)
+                // num_bytes — размер данных файла (для inline)
+                // item.size — размер Item в leaf B-дерева (включает extent_struct + данные)
                 let inline_start = data_start + FILE_EXTENT_HEADER_SIZE;
-                let inline_len = data_size.saturating_sub(FILE_EXTENT_HEADER_SIZE);
-                if inline_start + inline_len <= leaf_buf.len() {
+                let inline_len = (item.size.get() as usize).saturating_sub(FILE_EXTENT_HEADER_SIZE);
+
+                crate::println!("btrfs:   inline: start=0x{:x} len={} (item_size=53 - 37)",
+                    inline_start, inline_len);
+
+                if inline_len > 0 && inline_start + inline_len <= leaf_buf.len() {
                     result.extend_from_slice(&leaf_buf[inline_start..inline_start + inline_len]);
                 }
             }
             EXTENT_TYPE_REGULAR => {
                 // Regular: данные на диске по логическому адресу
-                let dn = disk_num_bytes as usize;
-                let nn = num_bytes as usize;
+                // disk_bytenr — физический адрес на диске (через chunk mapping)
+                // disk_num_bytes — размер на диске
+                // num_bytes — размер в памяти (RAM)
+                // num_bytes — это размер данных файла, который нужно вернуть!
 
-                if disk_bytenr == 0 || nn == 0 { continue; }
+                if disk_bytenr == 0 || num_bytes == 0 { continue; }
 
                 // Читаем с диска (через chunk mapping)
-                let mut buf = alloc::vec![0u8; dn];
+                let mut buf = alloc::vec![0u8; disk_num_bytes as usize];
                 let phys = logical_to_physical(disk_bytenr)?;
                 if !read_disk(phys, &mut buf) {
                     crate::println!("btrfs: failed to read extent at 0x{:x}", disk_bytenr);
                     continue;
                 }
-                result.extend_from_slice(&buf[..nn.min(buf.len())]);
+                // Берём num_bytes байт (размер файла), а не disk_num_bytes
+                let take = num_bytes.min(buf.len() as u64) as usize;
+                result.extend_from_slice(&buf[..take]);
             }
             _ => {
                 crate::println!("btrfs: unknown extent type {}", extent_type);

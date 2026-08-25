@@ -129,6 +129,21 @@ pub extern "C" fn _start_rust() -> ! {
     println!("=== KERNEL READY ===");
     println!("Commands: help, echo, clear, reboot, hlt");
     
+    // Запускаем init.elf — первый пользовательский процесс (Ring 3).
+    // Init проверяет ФС и завершается, передавая управление shell.
+    println!("Loading /bin/init.elf...");
+    match crate::process::load_program_from_fs("/bin/init.elf") {
+        Ok(proc) => {
+            println!("Init loaded: entry=0x{:016x}", proc.entry_point);
+            crate::process::run_process(&proc);
+            // Сюда не вернёмся — run_process noreturn,
+            // возврат идёт через kernel_return_to_shell.
+        }
+        Err(e) => {
+            println!("Failed to load init.elf: {}", e);
+        }
+    }
+    
     // Запускаем shell (читает клавиатуру через IRQ1).
     // run_scheduler() вызывается из команды "tasks" — по одной итерации,
     // чтобы shell оставался отзывчивым. Бесконечный цикл планировщика

@@ -2,56 +2,68 @@
 //!
 //! Абстракция над конкретными ФС (initrd, позже — FAT32/ext2).
 //! Предоставляет единый интерфейс: поиск файла по пути, чтение,
-//! список содержимого каталога.
-//!
-//! Узлы ФС (FsNode) — это «inode»: имя, тип, размер и данные.
-//! Для initrd данные — это просто байты в памяти (встроенный образ).
-//! Позже для дисковых ФС данные будут читаться с блочного устройства.
+//! список содержимого каталога, создание/удаление файлов и каталогов.
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use spin::Mutex;
 
 /// Тип узла ФС.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsNodeType {
-    /// Обычный файл (можно читать).
+    /// Обычный файл (можно читать/писать).
     File,
     /// Каталог (можно перечислять содержимое).
     Directory,
 }
 
 /// Узел ФС (inode).
-///
-/// Для initrd: файл содержит ссылку на свои данные в памяти.
-/// Размер — длина данных.
-#[derive(Clone, Copy)]
 pub struct FsNode {
     /// Имя файла/каталога (без пути).
     pub name: &'static str,
     /// Тип узла.
     pub node_type: FsNodeType,
     /// Данные файла (для initrd — байты в памяти). Для каталога — пустой.
-    pub data: &'static [u8],
+    pub data: Box<[u8]>,
     /// Список дочерних узлов (для каталога).
-    pub children: &'static [&'static FsNode],
+    pub children: Mutex<Vec<Box<FsNode>>>,
+}
+
+impl Clone for FsNode {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name,
+            node_type: self.node_type,
+            data: self.data.clone(),
+            children: Mutex::new(self.children.lock().clone()),
+        }
+    }
 }
 
 impl FsNode {
     /// Создаёт файл.
-    pub const fn file(name: &'static str, data: &'static [u8]) -> Self {
+    pub fn file(name: &'static str, data: &'static [u8]) -> Self {
         Self {
             name,
             node_type: FsNodeType::File,
-            data,
-            children: &[],
+            data: data.into(),
+            children: Mutex::new(Vec::new()),
         }
     }
 
     /// Создаёт каталог.
-    pub const fn dir(name: &'static str, children: &'static [&'static FsNode]) -> Self {
+    pub fn dir(name: &'static str) -> Self {
         Self {
             name,
             node_type: FsNodeType::Directory,
-            data: &[],
-            children,
+            data: Box::new([]),
+            children: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Добавляет дочерний узел в каталог.
+    pub fn add_child(&self, child: Box<FsNode>) {
+        self.children.lock().push(child);
     }
 
     /// Возвращает размер файла.
@@ -61,45 +73,60 @@ impl FsNode {
 }
 
 /// Корневой каталог VFS.
-///
-/// Включает все смонтированные ФС. Сейчас — только initrd.
-/// Позже добавится корень диска (FAT32/ext2).
-static ROOT: FsNode = FsNode::dir("/", &[]);
+static ROOT: Mutex<Option<FsNode>> = Mutex::new(None);
+
+/// Инициализирует корневой каталог VFS.
+fn init_root() {
+    let mut root = ROOT.lock();
+    if root.is_none() {
+        *root = Some(FsNode::dir("/"));
+    }
+}
 
 /// Ищет узел по пути (например "/bin/hello" или "hello").
-///
-/// Путь разбивается на компоненты по '/'. Пустой путь или "/" → корень.
-/// Возвращает None если узел не найден.
-pub fn lookup(path: &str) -> Option<&'static FsNode> {
-    // Пустой путь → корень
+pub fn lookup(path: &str) -> Option<FsNode> {
+    init_root();
+    
     if path.is_empty() || path == "/" {
-        return Some(&ROOT);
+        return Some(ROOT.lock().as_ref()?.clone());
     }
 
-    // Ищем от корня, проходя по компонентам пути
-    let mut node = &ROOT;
+    let mut current = ROOT.lock();
+    let mut node = current.as_mut()?;
+    
     for comp in path.split('/').filter(|c| !c.is_empty()) {
-        let found = node.children.iter().find(|c| c.name == comp);
+        if node.node_type != FsNodeType::Directory {
+            return None;
+        }
+        let children = node.children.lock();
+        let found = children.iter().find(|c| c.name == comp).cloned();
+        drop(children);
+        drop(current);
+        
         match found {
-            Some(child) => node = child,
+            Some(child) => {
+                current = child.children.lock();
+                node = current.as_mut()?;
+            }
             None => return None,
         }
     }
-    Some(node)
+    
+    Some(node.clone())
 }
 
 /// Возвращает содержимое каталога (список дочерних узлов).
-pub fn read_dir(path: &str) -> Option<&'static [&'static FsNode]> {
+pub fn read_dir(path: &str) -> Option<Vec<Box<FsNode>>> {
     let node = lookup(path)?;
     if node.node_type == FsNodeType::Directory {
-        Some(node.children)
+        Some(node.children.lock().clone())
     } else {
         None
     }
 }
 
 /// Читает файл по пути. Возвращает данные файла или None.
-pub fn read_file(path: &str) -> Option<&'static [u8]> {
+pub fn read_file(path: &str) -> Option<Box<[u8]>> {
     let node = lookup(path)?;
     if node.node_type == FsNodeType::File {
         Some(node.data)
@@ -108,14 +135,131 @@ pub fn read_file(path: &str) -> Option<&'static [u8]> {
     }
 }
 
+/// Создаёт файл в каталоге.
+pub fn create_file(parent_path: &str, name: &str, data: &[u8]) -> bool {
+    let parent = match lookup(parent_path) {
+        Some(p) => p,
+        None => return false,
+    };
+    if parent.node_type != FsNodeType::Directory {
+        return false;
+    }
+    if parent.children.lock().iter().any(|c| c.name == name) {
+        return false;
+    }
+    parent.add_child(Box::new(FsNode::file(name, data)));
+    true
+}
+
+/// Создаёт каталог.
+pub fn create_dir(parent_path: &str, name: &str) -> bool {
+    let parent = match lookup(parent_path) {
+        Some(p) => p,
+        None => return false,
+    };
+    if parent.node_type != FsNodeType::Directory {
+        return false;
+    }
+    if parent.children.lock().iter().any(|c| c.name == name) {
+        return false;
+    }
+    parent.add_child(Box::new(FsNode::dir(name)));
+    true
+}
+
+/// Удаляет файл/каталог.
+pub fn remove(path: &str) -> bool {
+    let (parent_path, name) = match path.rfind('/') {
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+        None => return false,
+    };
+    if name.is_empty() { return false; }
+    
+    let parent = match lookup(parent_path) {
+        Some(p) => p,
+        None => return false,
+    };
+    if parent.node_type != FsNodeType::Directory {
+        return false;
+    }
+    
+    let mut children = parent.children.lock();
+    let idx = children.iter().position(|c| c.name == name);
+    match idx {
+        Some(i) => { children.remove(i); true }
+        None => false,
+    }
+}
+
+/// Копирует файл из src в dst.
+pub fn copy(src_path: &str, dst_path: &str) -> bool {
+    let src_data = match read_file(src_path) {
+        Some(data) => data,
+        None => return false,
+    };
+    let (dst_dir, dst_name) = match dst_path.rfind('/') {
+        Some(pos) => (&dst_path[..pos], &dst_path[pos + 1..]),
+        None => (".", dst_path),
+    };
+    create_file(dst_dir, dst_name, &src_data)
+}
+
+/// Перемещает/переименовывает файл/каталог.
+pub fn rename(src_path: &str, dst_path: &str) -> bool {
+    let src_data = read_file(src_path);
+    let src_node = lookup(src_path);
+    let is_dir = src_node.map(|n| n.node_type == FsNodeType::Directory);
+    
+    let (dst_dir, dst_name) = match dst_path.rfind('/') {
+        Some(pos) => (&dst_path[..pos], &dst_path[pos + 1..]),
+        None => (".", dst_path),
+    };
+    
+    let removed = remove(src_path);
+    if !removed { return false; }
+    
+    match is_dir {
+        Some(true) => create_file(dst_dir, dst_name, &[]),
+        _ => match src_data {
+            Some(data) => create_file(dst_dir, dst_name, &data),
+            None => false,
+        },
+    }
+}
+
+/// Записывает данные в файл (создаёт, если не существует).
+pub fn write_file(path: &str, data: &[u8]) -> bool {
+    let (parent_path, name) = match path.rfind('/') {
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+        None => return false,
+    };
+    if name.is_empty() { return false; }
+    
+    let parent = match lookup(parent_path) {
+        Some(p) => p,
+        None => return false,
+    };
+    if parent.node_type != FsNodeType::Directory {
+        return false;
+    }
+    
+    let mut children = parent.children.lock();
+    if let Some(existing) = children.iter_mut().find(|c| c.name == name) {
+        if existing.node_type == FsNodeType::File {
+            existing.data = data.to_vec().into_boxed_slice();
+            return true;
+        }
+        return false;
+    }
+    drop(children);
+    create_file(parent_path, name, data)
+}
+
 /// Монтирует корневой узел (заполняет ROOT).
-///
-/// Пока ROOT — статический пустой каталог. Для initrd мы заменим
-/// его содержимое при монтировании. Используем unsafe static mut,
-/// т.к. монтирование происходит один раз при старте ядра.
-pub fn mount_root(children: &'static [&'static FsNode]) {
-    unsafe {
-        let root_ptr = &ROOT as *const FsNode as *mut FsNode;
-        (*root_ptr).children = children;
+pub fn mount_root(children: Vec<Box<FsNode>>) {
+    init_root();
+    let mut root = ROOT.lock();
+    if let Some(node) = root.as_mut() {
+        node.children.lock().extend(children);
     }
 }

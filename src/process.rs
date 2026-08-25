@@ -324,7 +324,7 @@ pub fn load_program_from_fs(path: &str) -> Result<Process, &'static str> {
     if data.is_empty() {
         return Err("fs: empty file");
     }
-    create_elf_process(data)
+    create_elf_process(&data)
 }
 
 /// Запускает процесс: переключает адресное пространство и переходит в ring 3.

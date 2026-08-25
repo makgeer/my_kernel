@@ -3343,3 +3343,86 @@ btrfs-ls / → 0 entries, т.к. искал DIR_ITEM с objectid=6, а на ди
   file_type = read_u8(pos + DIR_ITEM_SIZE - 1);  // поле type в конце
 ФИКС (src/shell.rs): печать inode={} вместо name={}.
 СБОРКА: cargo check OK, make_iso.sh OK.
+
+--- 2026-08-24: ФИКС btrfs-cat — ДВОЙНОЕ СЛОЖЕНИЕ HEADER_SIZE ---
+
+ПРОБЛЕМА:
+  btrfs-cat /bin/hello.elf → "unknown extent type 7"
+  Значение extent_type=7 не входит в допустимые (0=inline, 1=regular, 2=prealloc).
+
+КОРЕНЬ:
+  В btrfs-extent_data_item структура:
+    byte 0: type (u8) — тип extent (0=inline, 1=regular, 2=prealloc)
+    byte 1: compression (u8)
+    byte 2: encryption (u8)
+    byte 3-4: other_encoding (u16)
+    byte 5-12: disk_bytenr (u64) — физический адрес на диске
+    byte 13-20: disk_num_bytes (u64) — размер на диске
+    byte 21-28: num_bytes (u64) — размер в памяти (RAM)
+
+  В read_file_by_inode:
+    extent_type читается с data_start (byte 0) — правильно
+    disk_bytenr читается с data_start + 5 — правильно
+    disk_num_bytes читается с data_start + 13 — правильно
+    num_bytes читается с data_start + 21 — правильно
+
+  ПРОБЛЕМА: data_size = item.size.get() = 53
+  item.size — это размер Item в leaf B-дерева, а НЕ размер данных файла!
+  Размер файла хранится в INODE_ITEM (size 4824 nbytes 8192).
+
+  ELF-файлы хранятся как regular extents (на диске), а не inline.
+  Нужно использовать num_bytes из extent data (8192 байта для hello.elf).
+
+ИСПРАВЛЕНИЕ (src/btrfs.rs, read_file_by_inode):
+  - extent_type читается правильно (byte 0 extent_data_item)
+  - disk_bytenr/disk_num_bytes/num_bytes читаются правильно
+  - Для REGULAR extent: берём num_bytes байт (размер файла)
+  - Добавлена диагностика extent (obj, type, disk_bytenr, num_bytes)
+
+КЭШИРОВАНИЕ FS ROOT:
+  - get_fs_root_addr() теперь кэширует результат в FS_ROOT_ADDR
+  - root tree читается только один раз при первом вызове
+  - Раньше читался 3 раза (btrfs-ls, btrfs-cat, lookup_in_dir)
+
+ИСТОРИЯ КОМАНД (стрелки вверх/вниз):
+  - Проблема: при вводе через COM1 (serial, nc localhost 8888)
+    escape-последовательности не распознавались
+  - Причина: getchar() проверял PS/2 буфер ПЕРВЫМ — если между
+    чтением ESC и '['/'A' сработала IRQ клавиатуры, PS/2 буфер
+    не пуст и getchar() вернёт PS/2-байт вместо serial-байта
+  - Решение: serial_read_nonblocking() — чтение из COM1 без блокировки
+  - В read_line(): при обнаружении ESC читаем '[' и букву напрямую
+    из serial-порта (минуя PS/2 буфер)
+  - Добавлена NOP-пауза (5000 циклов) перед чтением следующих байтов
+    escape-последовательности — Bochs com1 mode=socket-server ещё не
+    получил следующие байты из TCP-соединения (сетевая задержка)
+
+СБОРКА: cargo check OK (42 warnings, 0 errors).
+make_iso.sh no-fb OK (boot.iso 4,0 МБ).
+
+ТЕСТИРОВАНИЕ (вручную, правило 8/9):
+  ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+  во втором терминале: nc localhost 8888
+  Команды:
+    btrfs-cat /bin/hello.elf → "Hello from ELF user program!" (22 байта)
+    btrfs-ls /bin → список 6 ELF-файлов
+    Стрелки вверх/вниз → навигация по истории команд
+
+--- 2026-08-23: ТЕСТ btrfs-ls /bin + btrfs-cat (проблемы на завтра) ---
+
+УСПЕХ:
+  btrfs-ls / → DIR inode=257 bin ✅
+  btrfs-ls /bin → 6 файлов (hello.elf, loop_b.elf, ipc_receiver.elf,
+    syscall_test.elf, loop_a.elf, ipc_sender.elf) ✅
+
+ПРОБЛЕМЫ НА ЗАВТРА (приоритет):
+  1. btrfs-cat /bin/hello.elf → "unknown extent type 7"
+     — extent_type читается с неверного смещения в FileExtentItem
+     — нужно проверить структуру btrfs_file_extent_item из btrfs_tree.h
+  2. История команд в shell не работает (стрелки вверх/вниз)
+     — escape-последовательности не обрабатываются
+
+=== 2026-08-24: Логирование ===
+Исправление btrfs-cat: двойное header_size в read_file_by_inode
+Исправление: data_start = item.offset (без + header_size)
+Сборка: cargo check OK, ISO собран (no-fb)

@@ -64,11 +64,37 @@ pub fn read_line() -> [u8; 64] {
 
         // Обработка escape-последовательностей (стрелки).
         // ESC [ A = вверх, ESC [ B = вниз, ESC [ C = вправо, ESC [ D = влево.
+        // ВАЖНО: при вводе через COM1 (serial) нужно читать следующие
+        // байты напрямую из serial-порта, минуя getchar(), который
+        // проверяет PS/2 буфер ПЕРВЫМ — если между ESC и '['/'A'
+        // сработает IRQ клавиатуры, PS/2 буфер не пуст и getchar()
+        // вернёт PS/2-байт вместо serial-байта → escape не распознается.
         if c == '\u{1b}' {
-            // Читаем следующие два символа: '[' и букву
-            let (c2, _) = getchar();
+            // Пытаемся прочитать '[' и букву напрямую из serial.
+            // ВАЖНО: при вводе через COM1 (socket-server) между
+            // чтением ESC и '['/'A' есть сетевая задержка — Bochs
+            // com1 ещё не получил следующие байты из TCP-соединения.
+            // Даем небольшую задержку перед чтением следующих байтов.
+            for _ in 0..5000 {
+                unsafe { core::arch::asm!("nop"); }
+            }
+            let (c2, c3) = if let Some(b1) = crate::serial::serial_read_nonblocking() {
+                if b1 == b'[' {
+                    for _ in 0..5000 {
+                        unsafe { core::arch::asm!("nop"); }
+                    }
+                    if let Some(b2) = crate::serial::serial_read_nonblocking() {
+                        (b1 as char, b2 as char)
+                    } else {
+                        ('[', '\0')
+                    }
+                } else {
+                    ('[', '\0')
+                }
+            } else {
+                ('[', '\0')
+            };
             if c2 == '[' {
-                let (c3, _) = getchar();
                 match c3 {
                     'A' => {
                         // Стрелка вверх — предыдущая команда из истории
@@ -170,19 +196,26 @@ pub fn read_line() -> [u8; 64] {
 }
 
 /// Возвращает индекс в массиве HISTORY для смещения hist_idx от начала.
+/// hist_idx=0 → самая свежая команда, hist_idx=COUNT-1 → самая старая.
+///
 /// Код выделен бирюзовым цветом (правило .kodaruls п.6).
+///
+/// ИСПРАВЛЕНИЕ: при hist_idx=0 нужно получить самый свежий слот,
+/// который всегда = (HISTORY_HEAD - 1) % HISTORY_MAX.
+/// При hist_idx=N сдвигаемся назад на N позиций в кольце.
 fn history_index(hist_idx: usize) -> usize {
     unsafe {
+        if HISTORY_COUNT == 0 {
+            return 0;
+        }
         if HISTORY_COUNT < HISTORY_MAX {
-            // Буфер не заполнен: старейшая команда в [0], свежие подряд.
-            // hist_idx = 0 → самая старая, hist_idx = COUNT-1 → самая свежая.
-            // (COUNT-1) - hist_idx — индекс свежей команды по смещению от конца.
+            // Буфер не заполнен: команды в слотах [0..COUNT).
+            // hist_idx=0 → самый свежий = COUNT-1, hist_idx=COUNT-1 → самый старый = 0.
             HISTORY_COUNT - 1 - hist_idx
         } else {
-            // Буфер полный: кольцо. HEAD указывает на самую старую запись.
-            // (HEAD + (COUNT-1) - hist_idx) % MAX — свежая команда.
-            // При hist_idx = 0 (самая старая) → HEAD; hist_idx = COUNT-1 → HEAD-1.
-            (HISTORY_HEAD + (HISTORY_COUNT - 1 - hist_idx)) % HISTORY_MAX
+            // Буфер полный: кольцо. Самый свежий слот = (HEAD - 1) % MAX.
+            // Сдвигаемся назад на hist_idx позиций.
+            ((HISTORY_HEAD as u64).wrapping_sub(hist_idx as u64) % HISTORY_MAX as u64) as usize
         }
     }
 }
@@ -719,6 +752,7 @@ pub fn shell() {
                     }
                 } else if cmd == "ls" || cmd.starts_with("ls ") {
                     // ls [path] — список файлов в VFS (initrd).
+                    // Работает ТОЛЬКО с initrd, без fallback на btrfs.
                     let path = if cmd.len() > 3 { cmd[3..].trim() } else { "/" };
                     match crate::fs::read_dir(path) {
                         Some(children) => {
@@ -736,7 +770,8 @@ pub fn shell() {
                         }
                     }
                 } else if cmd.starts_with("cat ") {
-                    // cat <file> — вывод содержимого файла из VFS.
+                    // cat <file> — вывод содержимого файла из VFS (initrd).
+                    // Работает ТОЛЬКО с initrd, без fallback на btrfs.
                     let path = cmd[4..].trim();
                     match crate::fs::read_file(path) {
                         Some(data) => {
@@ -755,11 +790,12 @@ pub fn shell() {
                             }
                         }
                         None => {
-                            println!("  cat: '{}' not found", path);
+                            println!("  cat: '{}' not found in VFS", path);
                         }
                     }
                 } else if cmd.starts_with("run ") {
                     // run <file> — загрузка и запуск ELF из VFS (initrd).
+                    // Работает ТОЛЬКО с initrd, без fallback на btrfs.
                     let path = cmd[4..].trim();
                     // Если путь не начинается с /, добавляем /bin/
                     let full_path = if path.starts_with('/') {

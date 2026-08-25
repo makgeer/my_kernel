@@ -53,6 +53,16 @@ pub fn serial_read() -> u8 {
     }
 }
 
+/// Считывает байт из COM1, если данные есть (возвращает Option).
+/// Не блокирует — возвращает None, если данных нет.
+pub fn serial_read_nonblocking() -> Option<u8> {
+    if serial_has_data() {
+        Some(serial_read())
+    } else {
+        None
+    }
+}
+
 /// Запись строки в COM1 (переводит '\n' в CRLF для корректного отображения)
 pub fn write_str(s: &str) {
     for b in s.bytes() {
