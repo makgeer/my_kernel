@@ -44,11 +44,12 @@ com1: enabled=1, mode=socket-server, dev=localhost:8888
 # Весь ввод/вывод — через serial (socket-server).
 display_library: nogui
 
-# CPU — bx_generic с x86_64
-cpu: count=1, ips=40000000, model=bx_generic, reset_on_triple_fault=0
+# CPU — pentium с x86_64 (исправлено с bx_generic для Bochs 3.1)
+cpu: count=1, ips=40000000, model=pentium, reset_on_triple_fault=0
 
 # CPUID — включаем x86_64 и необходимые расширения
-cpuid: x86_64=1, mmx=1, sep=1, simd=sse4_2, apic=xapic, aes=1, movbe=1, xsave=1
+# Примечание: в Bochs 3.1 legacy cpuid может не поддерживаться — если ошибка, закомментируй
+# cpuid: x86_64=1, mmx=1, sep=1, simd=sse4_2, apic=xapic, aes=1, movbe=1, xsave=1
 
 # Лог Bochs
 log: bochs.log

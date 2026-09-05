@@ -28,6 +28,10 @@ pub const USER_CODE_BASE: u64 = 0x4000_0000_0000; // 0x0000400000000000
 pub const USER_STACK_TOP: u64 = 0x4000_0001_0000; // 0x0000400000010000
 pub const USER_STACK_SIZE: usize = 4 * 1024; // 4 страницы = 16 KB
 
+/// Guard pages: одна незараплененная страница сверху и снизу стека.
+/// При переполнении — #PF (stack overflow detected), а не silent corruption.
+pub const STACK_GUARD_PAGES: usize = 1;
+
 /// VGA text buffer (0xB8000) — kernel-страница, которую нужно замапить
 /// в P4 процесса. При активной user CR3 обработчики прерываний
 /// (#PF, #DF, syscall) выполняются с ЭТОЙ P4 и вызывают println!,
@@ -126,10 +130,17 @@ pub fn create_process(code: &[u8], entry_offset: u64) -> Result<Process, &'stati
         }
     }
 
-    // 3. Выделяем и мапим стек (растёт вниз от USER_STACK_TOP)
+    // 3. Выделяем и мапим стек (растёт вниз от USER_STACK_TOP).
+    // Guard page сверху (USER_STACK_TOP) — не мапим: при переполнении вверх → #PF.
+    // Stack pages: от USER_STACK_TOP - 4K до USER_STACK_TOP - (stack_pages+1)*4K.
+    // Guard page снизу: USER_STACK_TOP - (stack_pages+2)*4K — не мапим.
     let stack_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     let stack_pages = USER_STACK_SIZE / 4096;
 
+    // Верхний guard page: НЕ мапим (по адресу USER_STACK_TOP)
+    // Это предотвращает переполнение стека вверх (push за пределами stack_top).
+
+    // Мапим stack_pages страниц стека
     for i in 0..stack_pages {
         let phys = pmm::alloc_frame().ok_or("process: OOM for stack page")?;
         // Стек растёт вниз: верхняя страница у USER_STACK_TOP - 4K,
@@ -137,6 +148,9 @@ pub fn create_process(code: &[u8], entry_offset: u64) -> Result<Process, &'stati
         let virt = USER_STACK_TOP - ((i + 1) as u64) * 4096;
         paging::map_page_in_p4(p4_phys, virt, phys, stack_flags)?;
     }
+
+    // Нижний guard page: НЕ мапим (по адресу USER_STACK_TOP - (stack_pages+1)*4096)
+    // Это предотвращает переполнение стека вниз (буферное переполнение).
 
     let entry_point = USER_CODE_BASE + entry_offset;
 
@@ -222,10 +236,13 @@ pub fn create_elf_process(elf_bytes: &[u8]) -> Result<Process, &'static str> {
         }
     }
 
-    // 4. Выделяем и мапим стек (растёт вниз от USER_STACK_TOP)
+    // 4. Выделяем и мапим стек (растёт вниз от USER_STACK_TOP).
+    // Guard page сверху (USER_STACK_TOP) — не мапим: при переполнении → #PF.
+    // Guard page снизу — не мапим.
     let stack_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     let stack_pages = USER_STACK_SIZE / 4096;
 
+    // Мапим stack_pages страниц стека (без guard pages — они НЕ мапятся)
     for i in 0..stack_pages {
         let phys = pmm::alloc_frame().ok_or("create_elf_process: OOM for stack page")?;
         // Стек растёт вниз: верхняя страница у USER_STACK_TOP - 4K,
@@ -233,6 +250,11 @@ pub fn create_elf_process(elf_bytes: &[u8]) -> Result<Process, &'static str> {
         let virt = USER_STACK_TOP - ((i + 1) as u64) * 4096;
         paging::map_page_in_p4(p4_phys, virt, phys, stack_flags)?;
     }
+
+    // Guard pages НЕ мапятся:
+    // - Верхний: USER_STACK_TOP (не мапим)
+    // - Нижний: USER_STACK_TOP - (stack_pages+1)*4096 (не мапим)
+    // При переполнении стека → #PF → можно поймать и обработать.
 
     // 5. Маппим стек в kernel P4
     for i in 0..stack_pages {

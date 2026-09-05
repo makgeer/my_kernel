@@ -423,6 +423,35 @@ impl ProcessManager {
         }
     }
 
+    /// Паника текущего процесса: terminate + switch к следующему.
+    /// Используется для обработки фатальных ошибок (stack overflow,
+    /// illegal instruction, и т.д.) — процесс уничтожается, система
+    /// продолжает работу с другим процессом.
+    pub fn panic_current(&mut self, reason: &str) {
+        if let Some(idx) = self.current {
+            crate::println!("  Terminating process PID={} ({}) reason='{}'",
+                idx + 1,
+                self.processes[idx].as_ref().map_or("unknown", |p| &p.name),
+                reason
+            );
+            self.terminate(idx);
+            // Переключаемся к следующему процессу (standalone функция)
+            if let Some(next) = next_process() {
+                crate::println!("  Switched to PID={}", next + 1);
+                // Сохраняем контекст текущего (уже terminated) и переключаемся
+                unsafe {
+                    let from_ctx = core::ptr::addr_of_mut!(self.processes[idx]).cast::<crate::process_manager::ProcessContext>();
+                    let to_ctx = core::ptr::addr_of_mut!(self.processes[next]).cast::<crate::process_manager::ProcessContext>();
+                    crate::process_manager::context_switch(from_ctx, to_ctx);
+                }
+            } else {
+                // Нет других процессов — возвращаемся в shell
+                crate::println!("  No other processes — returning to shell");
+                crate::process::restore_kernel_cr3();
+            }
+        }
+    }
+
     /// Сбрасывает квант времени для текущего процесса.
     pub fn reset_quantum(&mut self) {
         if let Some(idx) = self.current {

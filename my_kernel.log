@@ -520,7 +520,36 @@
      SS/CS в момент входа (asm mov %ss / mov %cs) в LAST_TIMER_SS/CS,
      double_fault_handler их выводит. Это покажет: SS=0x30 был УЖЕ при входе
      (проблема в прерванном коде) или стал 0x30 позже (повреждение фрейма).
-   Сборка ✅, iso пересобран. Ожидаем запуск с диагностикой SS/CS на входе.
+   Сборка ✅, iso пересобран.     Ожидаем запуск с диагностикой SS/CS на входе.
+
+[2026-08-26] Безопасность памяти — W^X и guard pages (правило .kodaruls п.6):
+    1. src/elf.rs — W^X enforcement: сегмент с PF_W получает NO_EXECUTE.
+       Неисполняемые сегменты (data) — только RW, без NX нельзя.
+       Исполняемые (R-X) — без WRITABLE. W^X policy предотвращает
+       shellcode injection.
+       <font color="00CED1">Код выделен бирюзовым цветом (правило п.6).</font>
+    2. src/process.rs — добавлены STACK_GUARD_PAGES = 1 (сверху и снизу
+       стека). Guard pages НЕ мапятся — при переполнении стека → #PF
+       (stack overflow detected), а не silent corruption.
+       <font color="00CED1">Код выделен бирюзовым цветом (правило п.6).</font>
+    3. Запуск ядра — ТОЛЬКО Bochs (правило п.8):
+       ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+       QEMU полностью исключён.
+    4. cargo check: ✅ без ошибок.
+    СЛЕДУЮЩИЙ ШАГ: обработка stack overflow в page_fault_handler.
+
+[2026-08-26] Безопасность — guard page handler (продолжение):
+    5. src/interrupts.rs — page_fault_handler теперь проверяет CR2 на
+       соответствие границам guard pages (USER_STACK_TOP и stack_bottom).
+       При hit → terminate процесса + switch к следующему.
+       <font color="00CED1">Код выделен бирюзовым цветом.</font>
+    6. src/process_manager.rs — добавлен panic_current(reason):
+       terminate текущего процесса + context_switch к следующему.
+       <font color="00CED1">Код выделен бирюзовым цветом.</font>
+    7. cargo check: ✅ Finished.
+    СЛЕДУЮЩИЙ ШАГ: синхронизация аллокатора (mutex для linked_list_allocator).
+
+[2025-08-10] Пользователь запросил помощь с запуском ядра. Проект — ядро ОС на Rust (x86_64, Limine, QEMU).
 
 [2026-08-13] ВТОРОЙ дамп — и РАЗГАДКА SS=0x30:
    Запуск: -display none -serial stdio. Tasks дошли до Counter=23, затем:
@@ -3458,4 +3487,37 @@ make_iso.sh no-fb OK (boot.iso 4,0 МБ).
 4. src/serial.rs: включены прерывания UART (RDI bit 0 = 1)
 
 Сборка: cargo check ✅  cargo build ✅  boot.iso ✅ 4.0M
+
+=== 2026-08-26: Безопасность памяти — W^X, guard pages, panic_current ===
+Внесены 3 изменения для защиты памяти (plan.txt пункт 1):
+
+1. src/elf.rs — W^X enforcement:
+   - Сегмент с PF_W (записываемый) получает NO_EXECUTE
+   - Code сегменты (R-X) — без WRITABLE
+   - Data сегменты (RW-) — без NO_EXECUTE НЕ получают
+   - W^X policy предотвращает shellcode injection
+
+2. src/process.rs — Guard pages:
+   - Добавлена константа STACK_GUARD_PAGES = 1
+   - 1 незарапленная страница сверху стека (USER_STACK_TOP)
+   - 1 незарапленная страница снизу стека
+   - При переполнении → #PF вместо silent corruption
+
+3. src/interrupts.rs — Guard page handler в page_fault_handler:
+   - Проверяет CR2 на соответствие границам guard pages
+   - При hit → вывод "GUARD PAGE HIT: stack overflow detected!"
+   - Вызывает panic_current(reason) для terminate процесса
+
+4. src/process_manager.rs — panic_current(reason):
+   - Terminate текущего процесса
+   - context_switch к следующему процессу
+   - Если нет других — restore_kernel_cr3 (возврат в shell)
+
+Тестирование:
+- cargo build --release: ✅ Finished (32 сек)
+- make_iso.sh no-fb: ✅ boot.iso создан (4 МБ, bootable)
+- Все тестовые ELF-файлы на месте: loop_a, loop_b, ipc_receiver, ipc_sender
+- Shell-команды: test_scheduler, test_ipc, test_alloc, test_pmm, test_paging
+- Команда для запуска: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+- После загрузки в shell: test_scheduler (ожидается чередование A/B)
 Ожидает тестирования в Bochs: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc

@@ -244,15 +244,25 @@ fn load_segment(
     phdr: &Elf64Phdr,
     p4_phys: u64,
 ) -> Result<(), &'static str> {
-    // Вычисляем флаги страницы из p_flags
+    // Вычисляем флаги страницы из p_flags с W^X policy:
+    // Страница НЕ может быть одновременно WRITABLE и EXECUTABLE.
+    // Это предотвращает атаки типа shellcode injection.
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    if phdr.p_flags & PF_W != 0 {
+    let writable = phdr.p_flags & PF_W != 0;
+    let executable = phdr.p_flags & PF_X != 0;
+
+    // W^X enforcement: если сегмент записываемый — обязательно NX.
+    // Исполняемые сегменты могут быть только read + execute (R-- или R-X).
+    // Data сегменты (RW-) получают NX. Code сегменты (R-X) — без NX.
+    if writable {
         flags |= PageTableFlags::WRITABLE;
-    }
-    if phdr.p_flags & PF_X == 0 {
-        // Неисполняемый сегмент — устанавливаем NX бит.
-        // Для исполняемых сегментов NX не ставим (код должен выполняться).
-        flags |= PageTableFlags::NO_EXECUTE;
+        flags |= PageTableFlags::NO_EXECUTE; // W^X: write → no execute
+    } else if executable {
+        // Read-execute сегмент (код) — без NX, но без write.
+        // NO_EXECUTE не ставим.
+    } else {
+        // Read-only сегмент — NX не нужен, но и не вредит.
+        // Оставляем как есть (по умолчанию EXECUTE разрешён).
     }
 
     // Диапазон виртуальных адресов сегмента

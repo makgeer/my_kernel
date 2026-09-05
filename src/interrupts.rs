@@ -367,6 +367,21 @@ extern "x86-interrupt" fn page_fault_handler(
     // в своей P4. После переключения — возвращаемся в user mode.
     let cs_rpl = stack_frame.code_segment.rpl();
     if cs_rpl == x86_64::PrivilegeLevel::Ring3 {
+        // Проверяем: guard page violation (stack overflow)?
+        // Guard pages НЕ мапятся — если CR2 = USER_STACK_TOP или
+        // USER_STACK_TOP - (USER_STACK_SIZE/4096 + 1)*4096 → overflow.
+        let stack_top = crate::process::USER_STACK_TOP;
+        let stack_size = crate::process::USER_STACK_SIZE;
+        let stack_bottom = stack_top - (stack_size / 4096 + crate::process::STACK_GUARD_PAGES) as u64 * 4096;
+        
+        if cr2 == stack_top || cr2 == stack_bottom {
+            crate::println!("  → GUARD PAGE HIT: stack overflow detected!");
+            crate::println!("  Stack range: 0x{:x}..0x{:x}", stack_bottom, stack_top);
+            // Уничтожаем процесс для защиты системы
+            crate::process_manager::PROCESS_MANAGER.lock().panic_current("Stack overflow");
+            return;
+        }
+
         crate::println!("  → User mode PF, CR3 switch needed");
         // В текущей реализации: run_process переходит через user_mode_entry,
         // который переключает CR3 ДО iretq к user code.
