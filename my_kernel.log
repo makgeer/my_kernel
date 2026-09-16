@@ -3521,3 +3521,5 @@ make_iso.sh no-fb OK (boot.iso 4,0 МБ).
 - Команда для запуска: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
 - После загрузки в shell: test_scheduler (ожидается чередование A/B)
 Ожидает тестирования в Bochs: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+[git] 2026-09-05 15:51:29 — commit 40aebff: feat: W^X policy for ELF segments, stack guard pages, panic_current for fatal process errors (7 файлов: bochsrc.bxrc, iso/kernel.elf, my_kernel.log, src/elf.rs, src/interrupts.rs, src/process.rs, src/process_manager.rs)
+[git] 2026-09-05 15:51:59 — push: 34f1c60..40aebff разработка -> origin/разработка (commit 40aebff опубликован)
