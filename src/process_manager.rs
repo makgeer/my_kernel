@@ -93,6 +93,13 @@ pub const MAX_PROCESSES: usize = 16;
 /// Максимальная длина данных в одном сообщении IPC.
 pub const IPC_MSG_SIZE: usize = 32;
 
+/// Код возврата ipc_send: получатель не найден (EPIPE).
+pub const IPC_NO_RECEIVER: i64 = -1;
+
+/// Код возврата ipc_send: почтовый ящик получателя переполнен.
+/// Блокирующий вариант send должен приостановить отправителя и повторить.
+pub const IPC_FULL: i64 = -2;
+
 /// Количество сообщений в почтовом ящике процесса.
 pub const IPC_MAILBOX_SIZE: usize = 4;
 
@@ -175,6 +182,11 @@ impl Mailbox {
     /// Возвращает true если в почтовом ящике есть сообщения.
     pub fn has_messages(&self) -> bool {
         self.count > 0
+    }
+
+    /// Количество свободных мест в почтовом ящике.
+    pub fn free_slots(&self) -> usize {
+        IPC_MAILBOX_SIZE - self.count
     }
 }
 
@@ -323,6 +335,13 @@ pub struct ManagedProcess {
     pub started: bool,
     /// Почтовый ящик для сообщений IPC.
     pub mailbox: Mailbox,
+    /// IRQ, которого ждёт процесс (None — не ждёт прерывания).
+    /// Используется механизмом доставки прерываний в user space:
+    /// irq_wait блокирует процесс, IRQ-handler будит ожидающего.
+    pub waiting_irq: Option<u8>,
+    /// PID получателя, освобождения ящика которого ждёт процесс
+    /// (блокирующий ipc_send при переполненном ящике).
+    pub waiting_send_to: Option<usize>,
 }
 
 impl ManagedProcess {
@@ -346,6 +365,8 @@ impl ManagedProcess {
             ticks_left: 5,
             started: false,
             mailbox: Mailbox::new(),
+            waiting_irq: None,
+            waiting_send_to: None,
         }
     }
 }
@@ -576,12 +597,25 @@ pub fn terminate_current() -> Option<usize> {
         let mut pm = PROCESS_MANAGER.lock();
         let terminated_idx = pm.current;
         if let Some(idx) = terminated_idx {
-            if let Some(ref mut proc) = pm.processes[idx] {
+            let mut pid = 0;
+            if let Some(proc) = pm.processes[idx].as_mut() {
                 proc.state = ProcessState::Terminated;
+                pid = proc.pid;
                 crate::println!(
                     "  process PID={} ({}) -> Terminated",
                     proc.pid, proc.name
                 );
+            }
+            // Драйвер в user space завершился — возвращаем IRQ ядру,
+            // иначе прерывание больше никто не обслужит.
+            if pid != 0 {
+                for irq in 0..16u8 {
+                    if IRQ_OWNER[irq as usize].load(core::sync::atomic::Ordering::SeqCst) == pid {
+                        IRQ_OWNER[irq as usize]
+                            .store(0, core::sync::atomic::Ordering::SeqCst);
+                        crate::println!("  IRQ{} returned to kernel", irq);
+                    }
+                }
             }
             pm.current = None;
         }
@@ -626,7 +660,7 @@ pub fn ipc_send(to_pid: usize, data: &[u8]) -> i64 {
 
         let recv_idx = match recv_idx {
             Some(idx) => idx,
-            None => return -1, // Получатель не найден
+            None => return IPC_NO_RECEIVER, // Получатель не найден
         };
 
         // Формируем сообщение
@@ -639,8 +673,14 @@ pub fn ipc_send(to_pid: usize, data: &[u8]) -> i64 {
         // Помещаем в почтовый ящик получателя
         let proc = pm.processes[recv_idx].as_mut().unwrap();
         if !proc.mailbox.push(msg) {
-            return -1; // Почтовый ящик переполнен
+            // Почтовый ящик переполнен. Асинхронный send возвращает
+            // ошибку; блокирующий вариант (ipc_send_blocking) спишет
+            // отправителя в ожидание и повторит попытку позже.
+            IPC_FAILED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return IPC_FULL;
         }
+
+        IPC_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         // Если получатель был заблокирован (ждёт recv) — разблокируем
         if proc.state == ProcessState::Blocked {
@@ -662,12 +702,49 @@ pub fn ipc_recv(buf: &mut [u8]) -> Option<(usize, usize)> {
     interrupts::without_interrupts(|| {
         let mut pm = PROCESS_MANAGER.lock();
         let cur_idx = pm.current?;
+        let recv_pid = pm.processes[cur_idx].as_ref()?.pid;
         let proc = pm.processes[cur_idx].as_mut()?;
         let msg = proc.mailbox.pop()?;
         let copy_len = (msg.len as usize).min(buf.len());
         buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
+
+        IPC_RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+        // Освободилось место в ящике — будим отправителей, которые
+        // ждали именно этого получателя (блокирующий ipc_send).
+        for i in 0..MAX_PROCESSES {
+            if let Some(p) = pm.processes[i].as_mut() {
+                if p.waiting_send_to == Some(recv_pid) && p.state == ProcessState::Blocked {
+                    p.waiting_send_to = None;
+                    p.state = ProcessState::Ready;
+                }
+            }
+        }
+
         Some((msg.from_pid, copy_len))
     })
+}
+
+/// Помечает текущий процесс как ждущий освобождения ящика получателя.
+/// Вызывается перед block_current_and_switch при IPC_FULL.
+pub fn set_waiting_send(to_pid: usize) {
+    let mut pm = PROCESS_MANAGER.lock();
+    if let Some(idx) = pm.current {
+        if let Some(proc) = pm.processes[idx].as_mut() {
+            proc.waiting_send_to = Some(to_pid);
+        }
+    }
+}
+
+/// Печатает статистику IPC (команда shell `ipcstat`).
+pub fn print_ipc_stats() {
+    use core::sync::atomic::Ordering;
+    crate::println!(
+        "IPC: sent={}, received={}, failed={}",
+        IPC_SENT.load(Ordering::Relaxed),
+        IPC_RECV.load(Ordering::Relaxed),
+        IPC_FAILED.load(Ordering::Relaxed)
+    );
 }
 
 /// Блокирует текущий процесс и ищет следующий готовый.
@@ -777,6 +854,379 @@ pub fn block_current_and_switch(
     Some((next_idx, info))
 }
 
+/// Возвращает PID текущего процесса (None — если активно ядро/shell).
+///
+/// PID — это номер процесса для user space (syscall getpid #39),
+/// а не индекс слота в таблице.
+pub fn current_pid() -> Option<usize> {
+    interrupts::without_interrupts(|| {
+        let pm = PROCESS_MANAGER.lock();
+        pm.current
+            .and_then(|idx| pm.processes[idx].as_ref().map(|p| p.pid))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Доставка прерываний в user space (основа для выноса драйверов).
+//
+// Ядро больше не обязано само обслуживать устройство: драйвер-процесс
+// заявляет владение IRQ (claim_irq), ждёт прерывание (irq_wait) и читает
+// порты через sys_io_in. Ядро в этом случае только считает прерывания
+// и будит ожидающего — минимальная работа, как в микроядре.
+// ---------------------------------------------------------------------------
+
+/// Счётчики непрочитанных прерываний по номерам IRQ (0..15).
+/// Инкрементируется в IRQ-handler, декрементируется в irq_wait.
+static IRQ_PENDING: [core::sync::atomic::AtomicU32; 16] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 16];
+
+/// Сколько всего раз срабатывал каждый IRQ (диагностика: живой ли IRQ4).
+static IRQ_TOTAL: [core::sync::atomic::AtomicU64; 16] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// PID процесса-владельца IRQ (0 — IRQ обслуживается ядром).
+static IRQ_OWNER: [core::sync::atomic::AtomicUsize; 16] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
+
+/// Общее количество прерываний, доставленных в user space.
+pub static IRQ_DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Возвращает, сколько раз срабатывал IRQ (всего).
+pub fn irq_total(irq: u8) -> u64 {
+    if irq >= 16 {
+        return 0;
+    }
+    IRQ_TOTAL[irq as usize].load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Возвращает количество необработанных прерываний в счётчике.
+pub fn irq_pending_count(irq: u8) -> u32 {
+    if irq >= 16 {
+        return 0;
+    }
+    IRQ_PENDING[irq as usize].load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Статистика IPC — для диагностики и команды `ipcstat`.
+pub static IPC_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static IPC_RECV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static IPC_FAILED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Сохранённый контекст ядра (shell), вытесненного таймером.
+///
+/// Это «idle-поток» микроядерной модели: когда планировщику нечего
+/// запускать, управление возвращается ровно в ту точку shell, где его
+/// прервал таймер. Без этого возврат шёл бы через kernel_return_to_shell,
+/// который заново вызывает shell() — рекурсия на каждый блок процесса.
+#[derive(Clone, Copy)]
+struct IdleContext {
+    gpr: GprRegs,
+    iret: IretFrame,
+    cr3: u64,
+}
+
+static mut IDLE_CTX: IdleContext = IdleContext {
+    gpr: GprRegs {
+        rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
+        r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+    },
+    iret: IretFrame { rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0 },
+    cr3: 0,
+};
+
+/// Валиден ли сохранённый контекст ядра.
+static IDLE_CTX_VALID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Сохраняет контекст ядра перед переключением на user-процесс.
+/// Вызывается из таймера, когда shell вытесняется впервые.
+///
+/// # Safety
+/// Вызывается только из обработчика прерывания (монопольный доступ
+/// к статике через addr_of_mut, без создания ссылок на static mut).
+unsafe fn save_idle_context(regs: *const GprRegs, frame: *const IretFrame) {
+    let ctx = core::ptr::addr_of_mut!(IDLE_CTX);
+    (*ctx).gpr = *regs;
+    (*ctx).iret = *frame;
+    (*ctx).cr3 = crate::paging::kernel_p4_phys();
+    IDLE_CTX_VALID.store(true, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Возвращает сохранённый контекст ядра, если он есть.
+/// Используется обработчиком syscall, когда процесс заблокировался,
+/// а других готовых процессов нет: iretq вернёт управление в shell
+/// ровно туда, где его прервал таймер.
+pub fn take_idle_context() -> Option<(GprRegs, IretFrame, u64)> {
+    // Забираем контекст ровно один раз: после возврата в shell он устарел,
+    // при следующем вытеснении таймер сохранит новый.
+    if IDLE_CTX_VALID.swap(false, core::sync::atomic::Ordering::SeqCst) == false {
+        return None;
+    }
+    let ctx = core::ptr::addr_of!(IDLE_CTX);
+    // SAFETY: читаем неизменяемую копию структуры; поля — Copy.
+    let gpr = unsafe { (*ctx).gpr };
+    let iret = unsafe { (*ctx).iret };
+    let cr3 = unsafe { (*ctx).cr3 };
+    Some((gpr, iret, cr3))
+}
+
+/// Сбрасывает сохранённый контекст ядра (например, при запуске
+/// процесса напрямую из shell через run_process).
+pub fn invalidate_idle_context() {
+    IDLE_CTX_VALID.store(false, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Есть ли сохранённый контекст ядра.
+pub fn idle_context_valid() -> bool {
+    IDLE_CTX_VALID.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Регистрирует процесс как владельца IRQ. После этого ядро перестаёт
+/// само обслуживать устройство и только уведомляет драйвер.
+///
+/// Возвращает true при успехе.
+pub fn claim_irq(irq: u8, pid: usize) -> bool {
+    if irq >= 16 || pid == 0 {
+        return false;
+    }
+    IRQ_OWNER[irq as usize].store(pid, core::sync::atomic::Ordering::SeqCst);
+    true
+}
+
+/// Возвращает PID владельца IRQ (None — IRQ обслуживает ядро).
+pub fn irq_owner(irq: u8) -> Option<usize> {
+    if irq >= 16 {
+        return None;
+    }
+    match IRQ_OWNER[irq as usize].load(core::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+/// Снимает владение IRQ со стороны процесса (например, при завершении
+/// драйвера). После этого IRQ снова обслуживается ядром.
+pub fn release_irq_owner(pid: usize) {
+    if pid == 0 {
+        return;
+    }
+    for irq in 0..16 {
+        let _ = IRQ_OWNER[irq].compare_exchange(
+            pid,
+            0,
+            core::sync::atomic::Ordering::SeqCst,
+            core::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+/// Вызывается из IRQ-handler: учитывает прерывание и будит процесс,
+/// который его ждёт (если такой есть).
+///
+/// Возвращает true, если прерывание кому-то доставлено (есть владелец
+/// или ожидающий процесс) — ядру в этом случае не нужно обслуживать
+/// устройство самому.
+pub fn notify_irq(irq: u8) -> bool {
+    if irq >= 16 {
+        return false;
+    }
+    IRQ_TOTAL[irq as usize].fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    IRQ_PENDING[irq as usize].fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+    // ВАЖНО: обработчик прерывания не должен блокироваться на мьютексе —
+    // если ядро уже держит PROCESS_MANAGER, try_lock вернёт None, и
+    // ожидающего разбудит таймер (wake_irq_waiters вызывается из
+    // планировщика). Счётчик прерывания уже увеличен, поэтому
+    // прерывание не потеряется.
+    let mut delivered = false;
+    if let Some(mut pm) = PROCESS_MANAGER.try_lock() {
+        for i in 0..MAX_PROCESSES {
+            if let Some(proc) = pm.processes[i].as_mut() {
+                if proc.waiting_irq == Some(irq) && proc.state == ProcessState::Blocked {
+                    proc.waiting_irq = None;
+                    proc.state = ProcessState::Ready;
+                    delivered = true;
+                }
+            }
+        }
+    }
+    if delivered {
+        IRQ_DELIVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    delivered
+}
+
+/// Будит процессы, ожидающие прерываний, по которым уже есть
+/// необработанные счётчики. Вызывается из планировщика (таймер) —
+/// это страховка на случай, когда notify_irq не смог взять лок.
+pub fn wake_irq_waiters() {
+    let mut pm = PROCESS_MANAGER.lock();
+    for i in 0..MAX_PROCESSES {
+        let pending_irq = match pm.processes[i].as_ref() {
+            Some(p) if p.state == ProcessState::Blocked => p.waiting_irq,
+            _ => None,
+        };
+        if let Some(irq) = pending_irq {
+            if irq < 16
+                && IRQ_PENDING[irq as usize].load(core::sync::atomic::Ordering::SeqCst) > 0
+            {
+                if let Some(p) = pm.processes[i].as_mut() {
+                    p.waiting_irq = None;
+                    p.state = ProcessState::Ready;
+                }
+            }
+        }
+    }
+}
+
+/// Пытается забрать одно прерывание из счётчика (неблокирующе).
+/// Возвращает true, если прерывание было (счётчик уменьшен).
+pub fn irq_try_consume(irq: u8) -> bool {
+    if irq >= 16 {
+        return false;
+    }
+    let counter = &IRQ_PENDING[irq as usize];
+    let mut cur = counter.load(core::sync::atomic::Ordering::SeqCst);
+    while cur > 0 {
+        match counter.compare_exchange(
+            cur,
+            cur - 1,
+            core::sync::atomic::Ordering::SeqCst,
+            core::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+    false
+}
+
+/// Помечает текущий процесс как ожидающий указанный IRQ.
+/// Вызывается перед block_current_and_switch из sys_irq_wait.
+pub fn set_waiting_irq(irq: u8) {
+    let mut pm = PROCESS_MANAGER.lock();
+    if let Some(idx) = pm.current {
+        if let Some(proc) = pm.processes[idx].as_mut() {
+            proc.waiting_irq = Some(irq);
+        }
+    }
+}
+
+/// Снимает ожидание IRQ с текущего процесса.
+pub fn clear_waiting_irq() {
+    let mut pm = PROCESS_MANAGER.lock();
+    if let Some(idx) = pm.current {
+        if let Some(proc) = pm.processes[idx].as_mut() {
+            proc.waiting_irq = None;
+        }
+    }
+}
+
+/// Добровольная передача кванта (syscall yield #24).
+///
+/// В отличие от block_current_and_switch, текущий процесс НЕ блокируется:
+/// он остаётся Ready и будет выбран снова в следующем раунде. RIP
+/// сохраняется без вычитания 2 — syscall уже выполнен, при возобновлении
+/// процесс продолжит со следующей инструкции после int 0x80.
+///
+/// Возвращает (next_idx, NextProcessInfo) для переключения.
+/// None — других готовых процессов нет, текущий продолжает работу.
+pub fn yield_current_and_switch(
+    gpr: &[u64; 15],
+    rip: u64,
+    rsp: u64,
+    cs: u64,
+    ss: u64,
+    rflags: u64,
+) -> Option<(usize, NextProcessInfo)> {
+    let mut pm = PROCESS_MANAGER.lock();
+
+    let cur_idx = pm.current?;
+
+    // Ищем следующий Ready процесс (round-robin начиная с cur_idx+1).
+    let start = cur_idx + 1;
+    let next_idx = (0..MAX_PROCESSES)
+        .map(|i| (start + i) % MAX_PROCESSES)
+        .find(|&idx| {
+            pm.processes[idx]
+                .as_ref()
+                .map(|p| p.state == ProcessState::Ready)
+                .unwrap_or(false)
+        })?;
+
+    // Сохраняем контекст текущего процесса. Состояние — Ready, а не
+    // Blocked: процесс готов продолжить, как только до него дойдёт очередь.
+    {
+        let proc = pm.processes[cur_idx].as_mut()?;
+        proc.state = ProcessState::Ready;
+        proc.started = true;
+
+        proc.context.rax = gpr[0];
+        proc.context.rbx = gpr[1];
+        proc.context.rcx = gpr[2];
+        proc.context.rdx = gpr[3];
+        proc.context.rsi = gpr[4];
+        proc.context.rdi = gpr[5];
+        proc.context.rbp = gpr[6];
+        proc.context.r8 = gpr[7];
+        proc.context.r9 = gpr[8];
+        proc.context.r10 = gpr[9];
+        proc.context.r11 = gpr[10];
+        proc.context.r12 = gpr[11];
+        proc.context.r13 = gpr[12];
+        proc.context.r14 = gpr[13];
+        proc.context.r15 = gpr[14];
+
+        proc.context.rip = rip;
+        proc.context.rsp = rsp;
+        proc.context.cs = cs;
+        proc.context.ss = ss;
+        proc.context.rflags = rflags;
+        proc.context.cr3 = proc.p4_phys;
+    }
+
+    let info = {
+        let proc = pm.processes[next_idx].as_mut()?;
+        proc.state = ProcessState::Running;
+        proc.ticks_left = proc.quantum;
+        if !proc.started {
+            proc.context.rip = proc.entry_point;
+            proc.context.rsp = proc.stack_top;
+            proc.context.cs = crate::gdt::USER_CODE_SELECTOR as u64;
+            proc.context.ss = crate::gdt::USER_DATA_SELECTOR as u64;
+            proc.context.rflags = 0x202;
+            proc.context.cr3 = proc.p4_phys;
+            proc.started = true;
+        }
+        NextProcessInfo {
+            rax: proc.context.rax,
+            rbx: proc.context.rbx,
+            rcx: proc.context.rcx,
+            rdx: proc.context.rdx,
+            rsi: proc.context.rsi,
+            rdi: proc.context.rdi,
+            rbp: proc.context.rbp,
+            r8: proc.context.r8,
+            r9: proc.context.r9,
+            r10: proc.context.r10,
+            r11: proc.context.r11,
+            r12: proc.context.r12,
+            r13: proc.context.r13,
+            r14: proc.context.r14,
+            r15: proc.context.r15,
+            rip: proc.context.rip,
+            rsp: proc.context.rsp,
+            cs: proc.context.cs,
+            ss: proc.context.ss,
+            rflags: proc.context.rflags,
+            cr3: proc.p4_phys,
+        }
+    };
+
+    pm.current = Some(next_idx);
+    Some((next_idx, info))
+}
+
 /// Находит процесс по физическому адресу P4 и помечает его как Running.
 /// Устанавливает current = Some(index).
 /// Вызывается из run_process ПЕРЕД переходом в ring 3 — чтобы
@@ -861,9 +1311,128 @@ pub extern "C" fn timer_schedule_rust(
     crate::interrupts::TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     let mut pm = PROCESS_MANAGER.lock();
+
+    // ДИАГНОСТИКА (временно): раз в 200 тиков печатаем состояние
+    // планировщика и IRQ4 напрямую в COM1 (без lock терминала).
+    let ticks = crate::interrupts::TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    if ticks % 200 == 0 {
+        crate::debug::serial_write_str_direct("\n[T] tick=");
+        crate::debug::write_hex(ticks as u64);
+        crate::debug::serial_write_str_direct(" cur=");
+        match pm.current {
+            Some(idx) => crate::debug::write_hex(idx as u64),
+            None => crate::debug::serial_write_str_direct("none"),
+        }
+        crate::debug::serial_write_str_direct(" idle=");
+        crate::debug::write_hex(idle_context_valid() as u64);
+        crate::debug::serial_write_str_direct(" i4=");
+        crate::debug::write_hex(irq_total(4));
+        crate::debug::serial_write_str_direct(" p4=");
+        crate::debug::write_hex(irq_pending_count(4) as u64);
+        crate::debug::serial_write_str_direct(" o4=");
+        match irq_owner(4) {
+            Some(pid) => crate::debug::write_hex(pid as u64),
+            None => crate::debug::serial_write_str_direct("none"),
+        }
+        crate::debug::serial_write_str_direct(" ");
+    }
+
+    // Страховка для доставки прерываний в user space: если IRQ-handler
+    // не смог взять лок (был занят), ожидающий процесс будится здесь.
+    for i in 0..MAX_PROCESSES {
+        let pending_irq = match pm.processes[i].as_ref() {
+            Some(p) if p.state == ProcessState::Blocked => p.waiting_irq,
+            _ => None,
+        };
+        if let Some(irq) = pending_irq {
+            if irq < 16
+                && IRQ_PENDING[irq as usize].load(core::sync::atomic::Ordering::SeqCst) > 0
+            {
+                if let Some(p) = pm.processes[i].as_mut() {
+                    p.waiting_irq = None;
+                    p.state = ProcessState::Ready;
+                }
+            }
+        }
+    }
+
     let current_idx = match pm.current {
         Some(idx) => idx,
-        None => return false, // ядро работает — не переключаемся
+        None => {
+            // Ядро (shell) работает. Если появился готовый процесс —
+            // например, IRQ разбудил user-space драйвер, — запускаем его.
+            // Это idle-цикл микроядерной модели: shell остаётся
+            // «фоновым» потоком ядра, а сервисы получают CPU по событиям.
+            let next_idx = match pm.select_next() {
+                Some(idx) => idx,
+                None => return false,
+            };
+            let proc = match pm.processes[next_idx].as_mut() {
+                Some(p) => p,
+                None => return false,
+            };
+            proc.state = ProcessState::Running;
+            proc.ticks_left = proc.quantum;
+            if !proc.started {
+                proc.context.rip = proc.entry_point;
+                proc.context.rsp = proc.stack_top;
+                proc.context.cs = crate::gdt::USER_CODE_SELECTOR as u64;
+                proc.context.ss = crate::gdt::USER_DATA_SELECTOR as u64;
+                proc.context.rflags = 0x202;
+                proc.context.cr3 = proc.p4_phys;
+                proc.started = true;
+            }
+            let ctx = proc.context;
+
+            // КРИТИЧНО: сохраняем контекст ядра ДО переключения, чтобы
+            // вернуться в ту же точку shell, а не запускать shell() заново.
+            unsafe {
+                save_idle_context(regs, frame);
+            }
+
+            // ДИАГНОСТИКА (временно): кто и куда запускается из idle.
+            {
+                static IDLE_SWITCHES: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                if IDLE_SWITCHES
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                    < 6
+                {
+                    crate::debug::serial_write_str_direct("\n[TS] idle->pidx=");
+                    crate::debug::write_hex(next_idx as u64);
+                    crate::debug::serial_write_str_direct(" rip=0x");
+                    crate::debug::write_hex(ctx.rip);
+                    crate::debug::serial_write_str_direct(" rflags=0x");
+                    crate::debug::write_hex(ctx.rflags);
+                    crate::debug::serial_write_str_direct(" ");
+                }
+            }
+
+            unsafe {
+                let r = &mut *regs;
+                r.rax = ctx.rax; r.rbx = ctx.rbx; r.rcx = ctx.rcx; r.rdx = ctx.rdx;
+                r.rsi = ctx.rsi; r.rdi = ctx.rdi; r.rbp = ctx.rbp;
+                r.r8 = ctx.r8; r.r9 = ctx.r9; r.r10 = ctx.r10; r.r11 = ctx.r11;
+                r.r12 = ctx.r12; r.r13 = ctx.r13; r.r14 = ctx.r14; r.r15 = ctx.r15;
+
+                let f = &mut *frame;
+                f.rip = ctx.rip;
+                f.cs = ctx.cs;
+                f.rflags = ctx.rflags;
+                f.rsp = ctx.rsp;
+                f.ss = ctx.ss;
+            }
+            unsafe {
+                let phys = x86_64::PhysAddr::new(ctx.cr3);
+                let phys_frame = x86_64::structures::paging::PhysFrame::containing_address(phys);
+                x86_64::registers::control::Cr3::write(
+                    phys_frame,
+                    x86_64::registers::control::Cr3Flags::empty(),
+                );
+            }
+            pm.current = Some(next_idx);
+            return true;
+        }
     };
 
     // Уменьшаем квант текущего процесса. Если не истёк — продолжаем его.

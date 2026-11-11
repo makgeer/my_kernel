@@ -21,9 +21,9 @@ boot: cdrom
 # VGA — VBE включён (Limine требует VBE для framebuffer)
 vga: extension=vbe
 
-# ROM images — стандартные BIOS Bochs
-romimage: file=/usr/local/share/bochs/BIOS-bochs-latest
-vgaromimage: file=/usr/local/share/bochs/VGABIOS-lgpl-latest
+# ROM images — Bochs 3.1, собранный локально (./bochs-bin, см. make_bochs.sh)
+romimage: file=bochs-bin/share/bochs/BIOS-bochs-latest
+vgaromimage: file=bochs-bin/share/bochs/VGABIOS-lgpl-latest.bin
 
 # CD-ROM на ATA канале 0
 ata0: enabled=1, ioaddr1=0x1f0, ioaddr2=0x3f0, irq=14
@@ -44,8 +44,9 @@ com1: enabled=1, mode=socket-server, dev=localhost:8888
 # Весь ввод/вывод — через serial (socket-server).
 display_library: nogui
 
-# CPU — pentium с x86_64 (исправлено с bx_generic для Bochs 3.1)
-cpu: count=1, ips=40000000, model=pentium, reset_on_triple_fault=0
+# CPU — athlon64 (long mode + CMOV/SSE2): Limine 12.x требует x86_64
+# и CMOV в stage2; pentium (32-bit, без CMOV) → #GP при загрузке.
+cpu: count=1, ips=40000000, model=athlon64_clawhammer, reset_on_triple_fault=0
 
 # CPUID — включаем x86_64 и необходимые расширения
 # Примечание: в Bochs 3.1 legacy cpuid может не поддерживаться — если ошибка, закомментируй

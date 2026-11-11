@@ -3523,3 +3523,189 @@ make_iso.sh no-fb OK (boot.iso 4,0 МБ).
 Ожидает тестирования в Bochs: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
 [git] 2026-09-05 15:51:29 — commit 40aebff: feat: W^X policy for ELF segments, stack guard pages, panic_current for fatal process errors (7 файлов: bochsrc.bxrc, iso/kernel.elf, my_kernel.log, src/elf.rs, src/interrupts.rs, src/process.rs, src/process_manager.rs)
 [git] 2026-09-05 15:51:59 — push: 34f1c60..40aebff разработка -> origin/разработка (commit 40aebff опубликован)
+
+=== 2026-11-03: проверка сборки + init/arrow_test/sysinfo + getpid/yield ===
+
+ПРОБЛЕМА: проект не собирался из чистого клона —
+  src/fs_initrd.rs: include_bytes!("../user_programs/init.elf"),
+  src/shell.rs:     include_bytes!("../user_programs/arrow_test.elf"),
+  но init.asm/init.elf и arrow_test.asm/arrow_test.elf отсутствовали.
+  .gitignore игнорировал user_programs/*.{asm,ld,elf}, поэтому
+  исходники и ELF не попадали в git.
+
+ИСПРАВЛЕНО:
+  - user_programs/init.asm — первая user-программа (write + exit)
+  - user_programs/arrow_test.asm — hex-дамп клавиш, выход по 'q'
+  - user_programs/sysinfo.asm — getpid (#39) + yield (#24)
+  - build_all_user.sh — сборка всех *.asm; программы с .data
+    (syscall_test, ipc_receiver, arrow_test, sysinfo) линкуются через
+    syscall_test.ld — иначе один RWX-сегмент, а W^X в elf.rs помечает
+    writable-сегмент как NO_EXECUTE → код стал бы неисполняемым.
+    build_ipc.sh для ipc_receiver тоже переведён на syscall_test.ld.
+  - .gitignore: user_programs/*.asm, *.ld, *.elf теперь отслеживаются
+  - shell.rs: arrow_test грузится из VFS (/bin/arrow_test.elf)
+  - fs_initrd.rs: + arrow_test.elf, sysinfo.elf (9 файлов)
+
+make_iso.sh:
+  - убран жёсткий cd /home/makgeer/my_kernel → cd "$(dirname "$0")"
+  - xorriso → fallback genisoimage/mkisofs (с правильным порядком -o)
+  - CARGO="${CARGO:-cargo}" (можно CARGO="cargo +nightly")
+  - удалён мёртвый хвост с /usr/local/bin/xorriso и dd в boot.iso
+
+SYSCALLS:
+  - #24 yield — process_manager::yield_current_and_switch
+    (текущий остаётся Ready, RIP без -2 — продолжение после int 0x80)
+  - #39 getpid — process_manager::current_pid
+  - apply_process_switch() — общий helper вместо трёх копий кода
+
+СБОРКА:
+  - cargo +nightly check: 0 ошибок (47 warnings)
+  - cargo +nightly build --release --no-default-features: OK
+  - ./make_iso.sh no-fb: OK (boot.iso 3.5 МБ)
+  - ./build_all_user.sh: OK (9 ELF)
+
+ТЕСТИРОВАНИЕ:
+  - Bochs 3.1 в окружении отсутствует; локально собран Bochs 2.7
+    (Debian) — Limine 12.5.2 падает в stage2 (#GP, EIP=0x322f3130)
+    до передачи управления ядру. Это ограничение версии Bochs,
+    а не кода; проверка в Bochs 3.1 остаётся за разработчиком.
+
+=== 2026-11-11: АУДИТ КОДА (user-space драйверы, планировщик, IPC) ===
+
+СОСТОЯНИЕ СБОРКИ:
+  - cargo +nightly check: 0 ошибок, 51 warning.
+  - В рабочем дереве: незакоммиченные irq_claim/irq_wait/io_in (#42-44),
+    IPC-статистика, блокирующий ipc_send, idle-контекст shell,
+    keyboardd.asm/seriald.asm, сборка ISO без жёстких путей.
+  - Bochs 3.1 в окружении ЕСТЬ (./bochs-bin); bochs.log показывает
+    успешную загрузку BIOS + VBE 1024x768, т.е. ограничение Bochs 2.7
+    из записи 2026-11-03 больше не актуально. Serial идёт в
+    socket-server (localhost:8888), поэтому вывод ядра виден только
+    через `nc localhost 8888`, в bochs.log его нет.
+
+НАЙДЕННЫЕ ПРОБЛЕМЫ (по убыванию важности):
+
+1. [КРИТИЧНО, латентно] src/process_manager.rs: context_switch
+   (asm, ~стр. 1591) использует смещения, НЕ совпадающие с
+   #[repr(C)] ProcessContext:
+     struct: rip=0x78, cs=0x80, rsp=0x88, ss=0x90, rflags=0x98, cr3=0xA0
+     asm:    rip=0x78, rsp=0x80, rflags=0x88, cr3=0x90
+   asm сохраняет RSP в поле cs, RFLAGS в rsp, CR3 в ss, а загружает
+   CR3 из ss и RSP из cs. Вызывается из panic_current (фатальная
+   ошибка процесса) → переключение с мусорными RSP/CR3.
+   Исправление: либо привести asm к смещениям структуры
+   (0x80/0x88/0x90/0x98/0xA0), либо убрать cs/ss из структуры.
+
+2. [КРИТИЧНО, архитектура] Вытеснение процесса ВНУТРИ syscall.
+   timer_schedule_rust сохраняет IRET-фрейм, в котором RIP/RSP
+   указывают в ring 0 (середина syscall_handler_rust), а стек —
+   общий TSS.rsp0 (KERNEL_RETURN_STACK, 16 КБ) для ВСЕХ процессов.
+   Второй процесс, войдя в syscall, затрёт этот стек, и первый
+   вернётся в испорченный кадр. Нужен kernel-стек на процесс либо
+   запрет вытеснения при current в ring 0 (флаг «в syscall»).
+
+3. [ВАЖНО] block_current_and_switch возвращает None, но процесс
+   уже помечен Blocked и pm.current=None. В ipc_send (#40) и
+   ipc_recv (#41) при None обработчик просто пишет rax=-1 и
+   возвращает управление в user mode: процесс продолжает
+   выполняться, оставаясь Blocked в таблице (рассогласование
+   состояния, повторная блокировка/потеря пробуждения).
+   В irq_wait (#42) для этого случая есть switch_to_kernel_shell,
+   в #40/#41 — нет.
+
+4. [ВАЖНО] Неатомарность подготовки блокировки: set_waiting_irq /
+   set_waiting_send берут PROCESS_MANAGER отдельно от
+   block_current_and_switch. Между ними таймер может вытеснить
+   процесс и сохранить контекст с RIP ПОСЛЕ int 0x80 (без -2),
+   нарушив протокол «повторить syscall при возобновлении».
+   Нужна единая функция «пометить ожидание + заблокировать» под
+   одним lock и без прерываний.
+
+5. [ВАЖНО] ipc_send будит получателя при любом Blocked
+   (process_manager.rs ~686), не проверяя, что он ждёт именно
+   ipc_recv. Ложные пробуждения процессов в irq_wait и в
+   блокирующем send; для irq_wait это лишний цикл, для send —
+   повторная попытка (данные не теряются, но логика хрупкая).
+   Нужно отдельное состояние ожидания (WaitKind).
+
+6. [ВАЖНО] terminate_current не снимает waiting_send_to у
+   отправителей, ждущих ящик завершённого получателя → процесс
+   навсегда Blocked (будит только ipc_recv этого PID).
+   При exit получателя нужно будить таких отправителей с ошибкой
+   (IPC_NO_RECEIVER).
+
+7. [ВАЖНО] claim_irq (#44) не проверяет, что IRQ свободен, и не
+   проверяет capability: любой процесс может перехватить IRQ у
+   работающего драйвера; прежний владелец навсегда останется в
+   irq_wait. Нужны: отказ при занятом IRQ (или явный steal),
+   освобождение IRQ в kill/terminate.
+
+8. [ВАЖНО] kill <pid> (src/shell.rs:543) считает PID = индекс+1,
+   но PID выдаётся из next_pid и не равен индексу+1 после
+   переиспользования слотов. Плюс terminate(idx) не освобождает
+   IRQ владельца (в отличие от terminate_current) → устройство
+   остаётся без обслуживания. Нужен terminate_by_pid с поиском по
+   pid и release_irq_owner.
+
+9. [БЕЗОПАСНОСТЬ] Каналы ipc_send на PID 0 (ввод) и PID 1
+   (вывод) доступны любому процессу: непривилегированная
+   программа может подделать ввод shell (записать байты в
+   KEYBOARD_BUFFER) и печатать в консоль. Нужен capability на
+   консольные каналы (например, флаг процесса или проверка
+   владения IRQ1/IRQ4).
+
+10. [ВАЖНО для теста] Диагностический шум в рабочем коде:
+    - syscall_handler_rust печатает каждый syscall, кроме #0/#1,
+      т.е. КАЖДЫЙ irq_wait (#42) и io_in (#43) в цикле seriald —
+      по два println на байт;
+    - timer_schedule_rust печатает состояние раз в 200 тиков;
+    - serial_irq_handler ([I4]) и shell::read_key ([K]) — отладочные
+      строки.
+    Всё это идёт в тот же COM1, через который тестируется shell,
+    и мешает протоколу ввода/вывода. Убрать или спрятать за
+    feature/уровень лога.
+
+11. [СРЕДНЕ] run_process из shell (keyboardd, seriald, arrow_test,
+    run_elf) не создаёт idle-контекст: если драйвер сразу
+    блокируется в irq_wait и других Ready-процессов нет,
+    switch_to_kernel_shell идёт по fallback-пути
+    kernel_return_to_shell → повторный вызов shell::shell()
+    (рекурсия стека на каждую такую блокировку). Idle-контекст
+    решает это только когда shell был вытеснен таймером.
+
+12. [СРЕДНЕ] Мёртвый код планировщика: timer_handler
+    (extern "x86-interrupt") с scheduler_tick/reset_quantum_if_running
+    больше не зарегистрирован в IDT (вектор 0x20 занят
+    timer_handler_naked). Дублирующая логика вводит в заблуждение.
+
+13. [МЕЛКО] panic_current печатает PID как idx+1 (неверно после
+    переиспользования слотов); комментарий ManagedProcess.pid
+    «индекс + 1» устарел. yield_current_and_switch может выбрать
+    сам текущий процесс (переключение на себя).
+
+14. [СБОРКА] include_bytes! для init/arrow_test/sysinfo/keyboardd/
+    seriald требует, чтобы ./build_all_user.sh был выполнен ДО
+    cargo build. Автоматизации в build.rs нет — чистый клон без
+    ELF не соберётся (повторение проблемы 2026-11-03, теперь для
+    двух новых драйверов).
+
+15. [ДОКИ] README/plan.txt частично устарели: «кооперативный
+    планировщик» в разделе архитектуры, FAT32 в плане (удалён),
+    нет syscalls #42-44 и команд keyboardd/seriald/irqstat/ipcstat,
+    число файлов initrd.
+
+НЕ ЯВЛЯЕТСЯ ПРОБЛЕМОЙ (проверено):
+  - port_allowed ограничивает io_in белым списком (PS/2, COM1,
+    ATA); capability-проверка «процесс владеет хотя бы одним IRQ»
+    есть, но см. п.7.
+  - user_range_valid/copy_from_user/copy_to_user проверяют каждую
+    страницу по активной P4 (при syscall это P4 процесса) —
+    корректно.
+  - KERNEL_RETURN_STACK = 16 КБ: буфер write 4 КБ на стеке
+    помещается, но запас невелик (см. п.2 — стек общий).
+
+СБОРКА/ПРОВЕРКИ ЭТОЙ СЕССИИ:
+  - cargo +nightly check: 0 ошибок (51 warning).
+  - Правок кода не вносилось — только фиксация результатов аудита.
+  - Коммит: см. следующий [git]-маркер.
+[git] 2026-11-11 — commit "audit: user-space drivers (irq_claim/irq_wait/io_in), blocking IPC, idle context" (25 файлов; 15 найденных проблем зафиксированы в my_kernel.log и plan.txt; push не выполнялся)

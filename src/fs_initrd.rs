@@ -15,6 +15,10 @@ static LOOP_B: &[u8] = include_bytes!("../user_programs/loop_b.elf");
 static SYSCALL_TEST: &[u8] = include_bytes!("../user_programs/syscall_test.elf");
 static IPC_SENDER: &[u8] = include_bytes!("../user_programs/ipc_sender.elf");
 static IPC_RECEIVER: &[u8] = include_bytes!("../user_programs/ipc_receiver.elf");
+static ARROW_TEST: &[u8] = include_bytes!("../user_programs/arrow_test.elf");
+static SYSINFO: &[u8] = include_bytes!("../user_programs/sysinfo.elf");
+static KEYBOARDD: &[u8] = include_bytes!("../user_programs/keyboardd.elf");
+static SERIALD: &[u8] = include_bytes!("../user_programs/seriald.elf");
 
 /// Создаёт каталог /bin с программами.
 fn create_bin_dir() -> FsNode {
@@ -26,6 +30,10 @@ fn create_bin_dir() -> FsNode {
     bin.add_child(Box::new(FsNode::file("syscall_test.elf", SYSCALL_TEST)));
     bin.add_child(Box::new(FsNode::file("ipc_sender.elf", IPC_SENDER)));
     bin.add_child(Box::new(FsNode::file("ipc_receiver.elf", IPC_RECEIVER)));
+    bin.add_child(Box::new(FsNode::file("arrow_test.elf", ARROW_TEST)));
+    bin.add_child(Box::new(FsNode::file("sysinfo.elf", SYSINFO)));
+    bin.add_child(Box::new(FsNode::file("keyboardd.elf", KEYBOARDD)));
+    bin.add_child(Box::new(FsNode::file("seriald.elf", SERIALD)));
     bin
 }
 
@@ -33,6 +41,6 @@ fn create_bin_dir() -> FsNode {
 pub fn mount() {
     let bin = create_bin_dir();
     crate::fs::mount_root(vec![Box::new(bin)]);
-    crate::println!("initrd: mounted /bin ({} files)", 7);
+    crate::println!("initrd: mounted /bin ({} files)", 11);
 }
 

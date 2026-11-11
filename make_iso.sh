@@ -1,10 +1,16 @@
 #!/bin/bash
 
-cd /home/makgeer/my_kernel
+# Переходим в каталог скрипта, а не в жёстко заданный путь:
+# проект может быть склонирован в любое место.
+cd "$(dirname "$0")"
 
 # Cargo установлен через rustup в ~/.cargo/bin, но в Flatpak-VSCode
 # PATH не содержит этой папки. Явно добавляем её в PATH.
 export PATH="$HOME/.cargo/bin:$PATH"
+
+# Cargo можно переопределить (например, CARGO="cargo +nightly"),
+# если nightly не выбран toolchain по умолчанию.
+CARGO="${CARGO:-cargo}"
 
 echo "=== Building kernel ==="
 # Режим сборки: по умолчанию с framebuffer (fb).
@@ -13,10 +19,10 @@ echo "=== Building kernel ==="
 # Текстовый VGA 80x25 + serial, term-дисплей работает.
 if [ "$1" = "no-fb" ]; then
     echo "Mode: no-fb (текстовый VGA, для Bochs term)"
-    cargo build --release --no-default-features
+    $CARGO build --release --no-default-features
 else
     echo "Mode: fb (по умолчанию, графический framebuffer)"
-    cargo build --release
+    $CARGO build --release
 fi
 
 if [ $? -ne 0 ]; then
@@ -34,9 +40,35 @@ cp limine-binary/limine-bios.sys iso/
 cp limine-binary/limine-bios-cd.bin iso/limine-cd.bin
 
 echo "=== Creating ISO ==="
-xorriso -as mkisofs -b limine-cd.bin \
-    -no-emul-boot -boot-load-size 4 -boot-info-table \
-    iso -o boot.iso
+# xorriso предпочтителен, но его может не быть в системе —
+# genisoimage/mkisofs даёт совместимый ISO9660 + El Torito.
+#
+# КРИТИЧНО: обязательны -R (Rock Ridge) и -J (Joliet). Без них имена
+# файлов в ISO9660 обрезаются/переводятся в ВЕРХНИЙ регистр
+# (kernel.elf → KERNEL.ELF;1), и Limine не находит ни limine.conf,
+# ни kernel.elf — загрузка останавливается молча.
+if command -v xorriso >/dev/null 2>&1; then
+    xorriso -as mkisofs -R -J -b limine-cd.bin \
+        -no-emul-boot -boot-load-size 4 -boot-info-table \
+        iso -o boot.iso
+elif command -v genisoimage >/dev/null 2>&1; then
+    # ВАЖНО: genisoimage требует -o ДО пути к каталогу.
+    genisoimage -R -J -b limine-cd.bin \
+        -no-emul-boot -boot-load-size 4 -boot-info-table \
+        -o boot.iso iso
+elif command -v mkisofs >/dev/null 2>&1; then
+    mkisofs -R -J -b limine-cd.bin \
+        -no-emul-boot -boot-load-size 4 -boot-info-table \
+        -o boot.iso iso
+else
+    echo "ERROR: нужен xorriso, genisoimage или mkisofs"
+    exit 1
+fi
+
+if [ $? -ne 0 ] || [ ! -f boot.iso ]; then
+    echo "ERROR: не удалось создать boot.iso"
+    exit 1
+fi
 
 echo "=== Done ==="
 echo "ISO created: boot.iso"
@@ -44,34 +76,4 @@ echo "Run manually with Bochs: ./bochs-bin/bin/bochs -q -f bochsrc.bxrc"
 # Проверка
 echo "=== ISO Structure ==="
 ls -la iso/
-
-# Создание ISO
-XORRISO_BIN="/usr/local/bin/xorriso"
-if [ ! -f "$XORRISO_BIN" ]; then
-    echo "ERROR: xorriso not found at $XORRISO_BIN"
-    exit 1
-fi
-
-$XORRISO_BIN -as mkisofs \
-    -volid "RUSTKERNEL" \
-    -joliet -rock \
-    -isohybrid-mbr limine-binary/limine-bios-cd.bin \
-    -c boot.catalog \
-    -b limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table \
-    -graft-points \
-    /limine.conf=iso/limine.conf \
-    /kernel.elf=iso/kernel.elf \
-    /limine-bios-cd.bin=iso/limine-bios-cd.bin \
-    /limine-bios.sys=iso/limine-bios.sys \
-    -o boot.iso
-
-echo ""
-echo "=== Installing Limine ==="
-# Limine требует специальной установки
-dd if=limine-binary/limine-bios-cd.bin of=boot.iso bs=2048 count=1 conv=notrunc 2>/dev/null || true
-
-echo ""
-echo "=== Final ISO ==="
 ls -lh boot.iso
-file boot.iso
-isoinfo -R -f -i boot.iso | head -20

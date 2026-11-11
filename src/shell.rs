@@ -42,7 +42,7 @@ pub fn getchar() -> (char, bool) {
         // Источник 2: serial (COM1) — ввод через -serial stdio.
         // Bochs переводит терминал в raw mode (нет локального эха),
         // поэтому символы выводим сами в read_line().
-        if crate::serial::serial_has_data() {
+        if serial_direct_available() {
             let byte = crate::serial::serial_read();
             return (byte as char, true);
         }
@@ -51,6 +51,15 @@ pub fn getchar() -> (char, bool) {
             unsafe { core::arch::asm!("nop"); }
         }
     }
+}
+
+/// Можно ли читать COM1 напрямую из ядра.
+///
+/// Если IRQ4 заявлен user-space драйвером (seriald), UART принадлежит
+/// ему: ядро читает байты только из KEYBOARD_BUFFER, куда драйвер
+/// пересылает их через IPC. Иначе байты «уводились» бы у драйвера.
+fn serial_direct_available() -> bool {
+    crate::process_manager::irq_owner(4).is_none() && crate::serial::serial_has_data()
 }
 
 /// Читает одну «клавишу»: PS/2 scancode или serial байт.
@@ -62,9 +71,38 @@ pub fn getchar() -> (char, bool) {
 /// Проверяет ОБА источника: serial ПЕРВЫМ (там escape-последовательности),
 /// затем PS/2 scancodes (стрелки в Bochs идут как scancodes).
 fn read_key() -> Result<char, SpecialKey> {
+    // ДИАГНОСТИКА (временно): пока IRQ4 принадлежит драйверу, первые
+    // вызовы read_key печатают состояние прерываний. Если IF=0 —
+    // прерывания запрещены и ввод (IRQ1/IRQ4) не будет доставлен.
+    {
+        static READ_KEY_AFTER_CLAIM: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        if crate::process_manager::irq_owner(4).is_some() {
+            let call = READ_KEY_AFTER_CLAIM
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if call < 5 {
+                let flags = x86_64::registers::rflags::read();
+                crate::debug::serial_write_str_direct("\n[K] read_key(o4)#");
+                crate::debug::write_hex(call as u64);
+                crate::debug::serial_write_str_direct(" IF=");
+                crate::debug::write_hex(
+                    flags.contains(x86_64::registers::rflags::RFlags::INTERRUPT_FLAG) as u64,
+                );
+                crate::debug::serial_write_str_direct(" tick=");
+                crate::debug::write_hex(
+                    crate::interrupts::TIMER_TICKS
+                        .load(core::sync::atomic::Ordering::Relaxed) as u64,
+                );
+                crate::debug::serial_write_str_direct(" i4=");
+                crate::debug::write_hex(crate::process_manager::irq_total(4));
+                crate::debug::serial_write_str_direct(" ");
+            }
+        }
+    }
+
     // Источник 1: serial (COM1) — проверяем ПЕРВЫМ, чтобы поймать
     // escape-последовательности ESC [ A/B/C/D
-    if crate::serial::serial_has_data() {
+    if serial_direct_available() {
         let byte = crate::serial::serial_read();
         return Ok(byte as char);
     }
@@ -84,14 +122,14 @@ fn read_key() -> Result<char, SpecialKey> {
         for _ in 0..500 {
             unsafe { core::arch::asm!("nop"); }
         }
-        if crate::serial::serial_has_data() {
+        if serial_direct_available() {
             let byte = crate::serial::serial_read();
             Ok(byte as char)
         } else {
             // Ничего нет — бесконечно ждём
             drop(buffer);
             loop {
-                if crate::serial::serial_has_data() {
+                if serial_direct_available() {
                     let byte = crate::serial::serial_read();
                     return Ok(byte as char);
                 }
@@ -458,6 +496,49 @@ pub fn shell() {
             "ps" => {
                 // Список процессов в менеджере процессов (вытесняющий планировщик)
                 crate::process_manager::list_processes();
+            }
+            "ipcstat" => {
+                // Статистика IPC: отправлено / принято / ошибок.
+                crate::process_manager::print_ipc_stats();
+            }
+            "irqstat" => {
+                // Кто владеет аппаратными прерываниями (ядро или
+                // user-space драйвер). Демонстрация выноса драйверов.
+                for irq in 0..16u8 {
+                    match crate::process_manager::irq_owner(irq) {
+                        Some(pid) => println!("IRQ{:2}: user driver (PID={})", irq, pid),
+                        None => println!("IRQ{:2}: kernel", irq),
+                    }
+                }
+            }
+            "keyboardd" => {
+                // Запуск PS/2 драйвера в USER SPACE (Ring 3).
+                // Драйвер забирает IRQ1 (irq_claim), ждёт прерывания
+                // (irq_wait), читает порт 0x60 (io_in) и отправляет
+                // символы в консоль ядра через IPC (ipc_send на PID 0).
+                // Выход — Esc. После завершения IRQ1 возвращается ядру.
+                println!("Loading /bin/keyboardd.elf (user-space PS/2 driver)...");
+                match crate::process::load_program_from_fs("/bin/keyboardd.elf") {
+                    Ok(proc) => {
+                        println!("Launching keyboardd ring 3...");
+                        crate::process::run_process(&proc);
+                    }
+                    Err(e) => println!("  FAILED: {}", e),
+                }
+            }
+            "seriald" => {
+                // Запуск драйвера COM1 в USER SPACE (Ring 3).
+                // Проверяемый в headless-Bochs пример: ввод из nc идёт
+                // на COM1 → IRQ4 → irq_wait → io_in(0x3F8) → ipc_send(0).
+                // Выход — Ctrl-C.
+                println!("Loading /bin/seriald.elf (user-space COM1 driver)...");
+                match crate::process::load_program_from_fs("/bin/seriald.elf") {
+                    Ok(proc) => {
+                        println!("Launching seriald ring 3...");
+                        crate::process::run_process(&proc);
+                    }
+                    Err(e) => println!("  FAILED: {}", e),
+                }
             }
             "kill" => {
                 // Завершение процесса по PID (для отладки планировщика).
@@ -869,10 +950,11 @@ pub fn shell() {
                 // test_ipc не возвращается (run_process noreturn).
             }
             "arrow_test" => {
-                // Тест клавиатуры: читает stdin, логирует hex-байты.
-                static ELF: &[u8] = include_bytes!("../user_programs/arrow_test.elf");
-                println!("Loading arrow_test ({} bytes)...", ELF.len());
-                match crate::process::create_elf_process(ELF) {
+                // Тест клавиатуры: читает stdin, печатает hex-байты.
+                // Программа берётся из initrd (/bin/arrow_test.elf), а не
+                // через include_bytes! — проверяем VFS-путь загрузки ELF.
+                println!("Loading /bin/arrow_test.elf from VFS...");
+                match crate::process::load_program_from_fs("/bin/arrow_test.elf") {
                     Ok(proc) => {
                         println!("Launching arrow_test ring 3...");
                         crate::process::run_process(&proc);

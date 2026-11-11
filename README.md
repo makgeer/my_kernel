@@ -34,6 +34,10 @@
 |---|-----|-----------|
 | 0 | `read` | Блокирующее чтение из stdin (PS/2 + COM1) |
 | 1 | `write` | Вывод строки в консоль (через `copy_from_user`) |
+| 24 | `yield` | Добровольная передача кванта планировщику |
+| 39 | `getpid` | PID текущего процесса |
+| 40 | `ipc_send` | Отправка сообщения процессу по PID |
+| 41 | `ipc_recv` | Приём сообщения (блокирующий) |
 | 60 | `exit` | Завершение процесса |
 
 ### Скриптовый движок
@@ -59,6 +63,12 @@
 | `run_user` | Запуск user-программы (inline asm) |
 | `run_elf` | Загрузка и запуск ELF64-программы |
 | `run_syscall` | Тест read/write syscalls (2 PT_LOAD сегмента) |
+| `run <file>` | Загрузка и запуск ELF из VFS (`/bin/<file>`) |
+| `arrow_test` | Тест клавиатуры из Ring 3 (hex-коды клавиш) |
+| `ps` | Список процессов |
+| `kill <pid>` | Завершить процесс по PID |
+| `ls`, `cat` | Просмотр initrd/VFS |
+| `btrfs`, `btrfs-ls`, `btrfs-cat` | Работа с btrfs-диском |
 | `script "<код>"` | Выполнение Rhai-скрипта |
 | `brush` | Вход в bash-совместимую оболочку |
 
@@ -92,19 +102,23 @@ malinka/
 ├── Cargo.toml               — манифест пакета
 ├── build.rs                 — компиляция boot.asm через NASM (elf64)
 ├── linker.ld                — линкер-скрипт (higher-half, секция .requests для Limine)
-├── make_iso.sh              — сборка ISO через xorriso + Limine (аргумент: no-fb)
+├── make_iso.sh              — сборка ISO через xorriso/genisoimage + Limine (аргумент: no-fb)
 ├── build_user.sh            — сборка user-программы hello (nasm + ld) → hello.elf
+├── build_all_user.sh        — сборка ВСЕХ user_programs/*.asm → *.elf
 ├── build_syscall_test.sh    — сборка user-программы syscall_test (2 PT_LOAD сегмента)
 ├── bochsrc.bxrc             — конфигурация Bochs
 ├── iso/                     — файлы для ISO (kernel.elf, limine.conf, limine-bios.*)
 ├── limine-binary/           — исходные бинарники Limine
 ├── user_programs/           — пользовательские программы (ring 3)
+│   ├── init.asm             — первая user-программа (write + exit), запускается ядром
 │   ├── hello.asm            — тестовая программа: write() + exit()
-│   ├── hello.ld             — линкер-скрипт (база 0x400000000000)
-│   ├── hello.elf            — собранный статический ET_EXEC
 │   ├── syscall_test.asm     — тест read/write syscalls (2 сегмента)
-│   ├── syscall_test.ld      — линкер-скрипт для syscall_test
-│   └── syscall_test.elf     — собранный ELF
+│   ├── loop_a/b.asm         — тест вытесняющего планировщика
+│   ├── ipc_sender/receiver.asm — тест IPC
+│   ├── arrow_test.asm       — тест клавиатуры (hex-коды клавиш)
+│   ├── sysinfo.asm          — тест getpid (#39) и yield (#24)
+│   ├── hello.ld             — линкер-скрипт (база 0x400000000000)
+│   └── syscall_test.ld      — линкер-скрипт с двумя PT_LOAD
 ├── arhiv/                   — архив неиспользуемых файлов (.bak, устаревшие скрипты)
 ├── plan.txt                 — план разработки
 ├── my_kernel.log            — лог всех изменений (с 2025-08-10)
@@ -113,21 +127,27 @@ malinka/
 └── src/
     ├── main.rs              — точка входа _start_rust, инициализация подсистем, запуск shell
     ├── boot.asm             — 64-битный entry point (установка стека, вызов _start_rust)
-    ├── vga.rs               — VgaWriter + макросы print!/println! (вывод в VGA + serial + framebuffer)
-    ├── serial.rs            — драйвер UART 16550 (COM1): init, write, read, SerialWriter
-    ├── vesa.rs              — вывод на framebuffer: шрифт 8x16, vesa_draw_char/ex, vesa_print_str
+    ├── video.rs             — VGA + framebuffer + макросы print!/println!
+    ├── serial.rs            — драйвер UART 16550 (COM1): init, write, read, IRQ4
     ├── limine_fb.rs         — запросы Limine: FramebufferRequest, HhdmRequest
     ├── gdt.rs               — GDT + TSS + IST, kernel_panic
     ├── interrupts.rs        — IDT, PIC, syscall handler, copy_from/to_user, page_fault
     ├── scheduler.rs         — кооперативный планировщик (до 4 задач)
+    ├── process_manager.rs   — вытесняющий round-robin, IPC-почтовые ящики, ps/kill
     ├── tasks.rs             — демо-задачи: task_hello, task_counter
-    ├── shell.rs             — интерактивный shell: getchar, команды (run_elf, script, brush)
+    ├── shell.rs             — интерактивный shell: getchar, команды (run, ps, script, brush)
     ├── terminal.rs          — терминал 80x25 (ANSI, курсор, рендер)
     ├── allocator.rs         — heap-аллокатор 8 МБ (linked_list_allocator, LockedHeap)
     ├── pmm.rs               — PMM: bitmap-аллокатор физических фреймов 4K
     ├── paging.rs            — пейджинг: map_page/unmap_page/translate, create_user_p4
     ├── process.rs           — процессы: create_process, create_elf_process, run_process
     ├── elf.rs               — ELF64-загрузчик: парсер Ehdr/Phdr + загрузка PT_LOAD
+    ├── fs.rs                — VFS: FsNode, монтирование, read_file
+    ├── fs_initrd.rs         — initrd: встроенные ELF в /bin
+    ├── ata.rs               — ATA PIO драйвер (primary/secondary)
+    ├── btrfs.rs             — чтение btrfs: суперблок, chunk map, каталоги, файлы
+    ├── tests.rs             — тесты планировщика и IPC
+    ├── debug.rs             — безопасный вывод для #PF/#DF
     ├── script.rs            — встроенный скриптовый движок Rhai (no_std)
     └── brush.rs             — bash-совместимая оболочка MVP
 ```
@@ -167,9 +187,13 @@ cargo build --release
 ./make_iso.sh no-fb
 
 # Сборка пользовательских ELF-программ
+./build_all_user.sh          # все user_programs/*.asm → *.elf (init, sysinfo, ...)
 ./build_user.sh              # hello.elf
 ./build_syscall_test.sh      # syscall_test.elf
 ```
+
+Если nightly не выбран toolchain по умолчанию, make_iso.sh принимает
+переопределение: `CARGO="cargo +nightly" ./make_iso.sh no-fb`.
 
 ### Запуск в Bochs
 
