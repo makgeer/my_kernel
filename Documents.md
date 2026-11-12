@@ -66,20 +66,26 @@ allocator.rs	Аллокатор динамической памяти (кучи)
 3.3. Управление процессами и прерываниями
 Файл	Описание
 process.rs	Управление пользовательскими процессами. Создание процессов, маппинг кода и стека в пользовательское адресное пространство, переход в Ring 3 через enter_ring3() и user_mode_entry().
-interrupts.rs	Обработка прерываний. Определяет IDT, обработчики для IRQ0 (таймер), IRQ1 (клавиатура) и int 0x80 (системные вызовы).
+process_manager.rs	Вытесняющий round-robin планировщик, IPC-почтовые ящики, WaitKind, ps/kill, владельцы IRQ.
+interrupts.rs	Обработка прерываний. Определяет IDT, обработчики для IRQ0 (таймер), IRQ1 (клавиатура), IRQ4 (COM1) и int 0x80 (системные вызовы).
 scheduler.rs	Кооперативный планировщик задач. Выполняет задачи (Task) в цикле run_scheduler_once(). Встроен в оболочку.
 gdt.rs	Глобальная таблица дескрипторов. Настройка сегментов для ядра (Ring 0) и пользователя (Ring 3), а также TSS (Task State Segment) для переключения стеков.
 3.4. Ввод-вывод и терминал
 Файл	Описание
 serial.rs	Драйвер UART 16550 (COM1). Используется для отладочного вывода в файл (bochs_serial.log) и для интерактивного ввода через -serial stdio.
-vga.rs	Драйвер VGA текстового режима. Запись в буфер 0xB8000.
-vesa.rs	Драйвер Framebuffer. Вывод графики через VBE (при включённом feature = "fb"), используя шрифт 8x16.
+video.rs	Единый модуль вывода: VGA text buffer (0xB8000), framebuffer (шрифт 8x16) и макросы print!/println!. Заменил прежние vga.rs и vesa.rs.
 limine_fb.rs	Запрос Framebuffer у Limine. Получает информацию о кадровом буфере и HHDM-смещении от загрузчика.
 terminal.rs	Модуль терминала. Буфер размера 80x25 с поддержкой ANSI (цвета, позиционирование курсора). Объединяет вывод в VGA, Framebuffer и Serial. Отрисовка управляется через flush().
 shell.rs	Интерактивная оболочка. Обрабатывает команды пользователя: help, echo, test_*, run_user, run_elf, run_syscall, script, brush и др.
 elf.rs	ELF64-загрузчик. Парс Ehdr/Phdr, загрузка PT_LOAD-сегментов с флагами страниц из p_flags.
 script.rs	Встроенный скриптовый движок Rhai (no_std). Выполнение скриптов через команду `script "<код>"`.
 brush.rs	Bash-совместимая оболочка MVP. Команды set/unset/env/echo/help/exit, подстановка $VAR и $?.
+fs.rs	VFS: FsNode, монтирование, read_file.
+fs_initrd.rs	initrd: встроенные ELF-программы в /bin.
+ata.rs	ATA PIO драйвер (primary/secondary каналы).
+btrfs.rs	Чтение btrfs: суперблок, chunk map, каталоги, файлы.
+tests.rs	Тесты планировщика (run_multi) и IPC (test_ipc).
+debug.rs	Безопасный вывод для обработчиков #PF/#DF.
 4. Пользовательский режим (Ring 3)
 Malinka поддерживает выполнение пользовательского кода в кольце 3 с использованием изолированных таблиц страниц.
 
@@ -93,11 +99,18 @@ Malinka поддерживает выполнение пользовательс
 
 Текущие системные вызовы:
 
-read(0, buf, len) — блокирующее чтение из stdin (PS/2 + COM1) (номер 0).
-
-write(1, buf, len) — вывод строки в консоль (номер 1).
-
-exit(code) — завершение процесса (номер 60).
+| № | Имя | Назначение |
+|---|-----|-----------|
+| 0 | `read` | Блокирующее чтение из stdin (PS/2 + COM1) |
+| 1 | `write` | Вывод строки в консоль (через `copy_from_user`) |
+| 24 | `yield` | Добровольная передача кванта планировщику |
+| 39 | `getpid` | PID текущего процесса |
+| 40 | `ipc_send` | Отправка сообщения процессу по PID (блокирующая при полном ящике) |
+| 41 | `ipc_recv` | Приём сообщения (блокирующий) |
+| 42 | `irq_wait` | Ожидание аппаратного прерывания (user-space драйверы) |
+| 43 | `io_in` | Чтение порта ввода-вывода (белый список + capability) |
+| 44 | `irq_claim` | Захват IRQ драйвером (только свободного) |
+| 60 | `exit` | Завершение процесса |
 
 Аргументы syscalls копируются из пользовательского пространства безопасно: copy_from_user / copy_to_user + user_range_valid.
 
@@ -116,17 +129,26 @@ git clone https://github.com/makgeer/my_kernel.git
 cd my_kernel
 rustup target add x86_64-unknown-none
 
-# Сборка ядра с поддержкой Framebuffer
-cargo build --release --features fb
+# Проверка компиляции
+cargo check
+
+# Сборка ядра с поддержкой Framebuffer (фича fb включена по умолчанию)
+cargo build --release
 
 # Или сборка ядра только для VGA (текстовый режим)
 cargo build --release --no-default-features
+
+Пользовательские ELF-программы (user_programs/*.asm) собираются автоматически в build.rs (NASM + GNU ld) перед компиляцией ядра; отдельные скрипты сборки не нужны.
+
 5.3. Создание загрузочного ISO
 Используйте скрипт make_iso.sh для создания образа boot.iso.
 
 bash
-./make_iso.sh
+./make_iso.sh          # ISO с framebuffer (для GUI Bochs / VBE)
+./make_iso.sh no-fb    # ISO без framebuffer (для nogui + COM1)
 Этот скрипт:
+
+Собирает ядро в выбранном режиме.
 
 Копирует скомпилированный kernel.elf в директорию iso/.
 
@@ -144,12 +166,30 @@ Bochs является основным и рекомендуемым эмуля
 Команда для запуска:
 
 bash
-./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+./bochs-bin/bin/bochs -q -unlock -f bochsrc.bxrc
 6. Отладка и тестирование
 6.1. Логирование
 Вывод в VGA/Framebuffer отображается на экране эмулятора.
 
 Вывод в Serial (COM1) сохраняется в файл bochs_serial.log, что удобно для анализа.
+
+6.1.1. Диагностика framebuffer
+При старте ядро печатает в COM1 параметры видеорежима и проверку записи в LFB:
+
+FB limine: addr=0xffff8000e0000000 hhdm=0xffff800000000000 — адрес от Limine и HHDM offset.
+FB classify: hhdm_range=true phys=0x00000000e0000000 — признак HHDM и вычисленный физический адрес (должен совпадать с окном VBE эмулятора).
+FB mode: 1024x768 pitch=4096 bpp=32 model=1 masks=8/8/8 — параметры режима.
+FB video: addr=... — что сохранил video-модуль (set_framebuffer).
+FB read TL/TR/BL/BR — чтение четырёх углов LFB до записи (проверка маппинга всего буфера).
+FB rb TL/TR/BL/BR — запись и readback в четырёх углах.
+FB check: text_px=... flush=... draw_fb=... — число пикселей цвета текста и счётчики рендера.
+
+Сбор этих данных без GUI и без X11:
+
+bash
+python3 tools/probe_fb.py --serial-only
+
+Скрипт запускает Bochs (nogui, флаг -unlock), подключается к COM1 через socket, ждёт приглашение shell и сохраняет probe_serial.log / probe_report.txt. Окно не создаётся, реальный экран не затрагивается.
 
 6.2. Встроенные тесты
 Оболочка Malinka предоставляет набор команд для проверки работы подсистем:
@@ -187,39 +227,50 @@ my_kernel/
 │   ├── allocator.rs      # Аллокатор кучи
 │   ├── gdt.rs            # GDT и TSS
 │   ├── interrupts.rs     # IDT и обработчики прерываний
-│   ├── limine_fb.rs      # Взаимодействие с Limine (Framebuffer)
+│   ├── limine_fb.rs      # Взаимодействие с Limine (Framebuffer, HHDM)
 │   ├── paging.rs         # Управление страницами памяти
 │   ├── pmm.rs            # Физический менеджер памяти
 │   ├── process.rs        # Пользовательские процессы
-│   ├── scheduler.rs      # Кооперативный планировщик
+│   ├── process_manager.rs # Вытесняющий планировщик и IPC
+│   ├── scheduler.rs      # Кооперативный планировщик (команда tasks)
 │   ├── serial.rs         # Драйвер COM1
-│   ├── shell.rs         # Оболочка
-│   ├── tasks.rs         # Тестовые задачи для планировщика
-│   ├── terminal.rs      # Управление терминалом
-│   ├── vesa.rs         # Драйвер Framebuffer
-│   ├── vga.rs          # Драйвер VGA
-│   ├── elf.rs          # ELF64-загрузчик
-│   ├── script.rs       # Скриптовый движок Rhai
-│   └── brush.rs       # Bash-совместимая оболочка
+│   ├── shell.rs          # Оболочка
+│   ├── tasks.rs          # Тестовые задачи для планировщика
+│   ├── terminal.rs       # Управление терминалом (ANSI, 80x25)
+│   ├── video.rs          # VGA + Framebuffer + макросы вывода
+│   ├── elf.rs            # ELF64-загрузчик
+│   ├── fs.rs             # VFS
+│   ├── fs_initrd.rs      # initrd (/bin)
+│   ├── ata.rs            # ATA PIO драйвер
+│   ├── btrfs.rs          # Чтение btrfs
+│   ├── tests.rs          # Тесты планировщика и IPC
+│   ├── debug.rs          # Вывод для #PF/#DF
+│   ├── script.rs         # Скриптовый движок Rhai
+│   └── brush.rs          # Bash-совместимая оболочка
+├── tools/
+│   └── probe_fb.py       # Запуск Bochs без GUI + сбор serial-лога (диагностика fb)
 ├── .gitignore
 ├── Cargo.toml            # Манифест проекта
-├── build.rs              # Скрипт сборки (компиляция boot.asm)
+├── build.rs              # Скрипт сборки (NASM: boot.asm + user_programs/*.asm)
 ├── linker.ld             # Линкер-скрипт
 ├── make_iso.sh           # Скрипт создания ISO-образа
-├── bochsrc.bxrc          # Конфигурация Bochs
+├── bochsrc.bxrc          # Конфигурация Bochs (nogui + COM1 socket)
+├── bochsrc-gui.bxrc      # Конфигурация Bochs (X11 + VBE, COM1 в файл)
 ├── arhiv/                 # Архив неиспользуемых файлов (.bak, устаревшие скрипты, логи)
 ├── my_kernel.log         # Исторический лог разработки
 └── README.md             # Описание проекта (русский + английский)
 8. План развития
-Планировщик процессов: вытесняющий round-robin, переключение контекста между ring 3 процессами.
+Сделано: вытесняющий round-robin планировщик, IPC (почтовые ящики), VFS + btrfs, W^X и guard pages, user-space драйверы (keyboardd/seriald).
 
-IPC: каналы/почтовые ящики для обмена сообщениями между процессами.
+Ближайшее: проверка отрисовки framebuffer в GUI Bochs (адресация и readback уже подтверждены диагностикой).
 
-Файловая система: VFS + FAT32/ext2.
+Файловая система: расширение btrfs (подтома, сжатие, snapshots).
 
-Защита памяти: SMAP/SMEP, W^X, guard pages, KASLR.
+Защита памяти: SMAP/SMEP, KASLR.
 
 Загружаемые модули: драйверы как отдельные ELF-модули.
+
+SMP: адаптация планировщика для нескольких ядер.
 
 9. Участие в разработке
 Проект открыт для внешнего вклада. Если вы заинтересованы, вы можете:

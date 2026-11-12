@@ -132,7 +132,10 @@ malinka/
 ├── build.rs                 — NASM: boot.asm + user_programs/*.asm → *.elf
 ├── linker.ld                — линкер-скрипт (higher-half, секция .requests для Limine)
 ├── make_iso.sh              — сборка ISO через xorriso/genisoimage + Limine (аргумент: no-fb)
-├── bochsrc.bxrc             — конфигурация Bochs
+├── bochsrc.bxrc             — конфигурация Bochs (nogui + COM1 socket)
+├── bochsrc-gui.bxrc         — конфигурация Bochs (X11 + VBE, COM1 в файл)
+├── tools/
+│   └── probe_fb.py          — запуск Bochs без GUI + сбор serial-лога (диагностика fb)
 ├── iso/                     — файлы для ISO (kernel.elf, limine.conf, limine-bios.*)
 ├── limine-binary/           — исходные бинарники Limine
 ├── user_programs/           — пользовательские программы (ring 3)
@@ -230,12 +233,12 @@ cargo build --release
 ```bash
 # 1. Headless: только serial, ввод/вывод через nc
 ./make_iso.sh no-fb
-./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+./bochs-bin/bin/bochs -q -unlock -f bochsrc.bxrc
 nc localhost 8888
 
 # 2. GUI (X11): окно с VGA-выводом и ввод с клавиатуры (PS/2)
 ./make_iso.sh                    # ISO должен быть собран С framebuffer
-~/.local/bochs-gui/bin/bochs -q -f bochsrc-gui.bxrc
+~/.local/bochs-gui/bin/bochs -q -unlock -f bochsrc-gui.bxrc
 # COM1 пишется в bochs_gui_serial.log
 ```
 
@@ -245,6 +248,10 @@ VGA-буфер `0xB8000` не виден, поэтому ISO обязан быт
 framebuffer (`./make_iso.sh`). И наоборот, для `bochsrc.bxrc` (nogui +
 term) нужен `./make_iso.sh no-fb`. При несовпадении ядро работает и
 пишет в serial, но экран остаётся пустым.
+
+Флаг `-unlock` обязателен, если предыдущий запуск Bochs завершился
+аварийно: иначе эмулятор отказывается стартовать с сообщением
+`[IMG] image locked: 'btrfs.img'`.
 
 `./bochs-bin` собран только с `nogui`/`term` — X11-плагина в нём нет.
 GUI-сборка ставится из исходников в `~/.local/bochs-gui` (без root):
@@ -259,6 +266,42 @@ make -j"$(nproc)" && make install
 
 GUI нужен для проверки PS/2-драйверов (`keyboardd`) и стрелок: в
 headless-режиме клавиатурного устройства нет, доступен только COM1.
+
+### Диагностика framebuffer без GUI
+
+Ядро при старте печатает в COM1 параметры видеорежима и результаты
+проверки записи в LFB — этого достаточно, чтобы отличить ошибку
+адресации от проблемы отрисовки в окне эмулятора:
+
+```
+FB limine: addr=0xffff8000e0000000 hhdm=0xffff800000000000
+FB classify: hhdm_range=true phys=0x00000000e0000000
+FB mode: 1024x768 pitch=4096 bpp=32 model=1 masks=8/8/8
+FB video:  addr=0xffff8000e0000000 1024x768 pitch=4096
+FB read TL/TR/BL/BR: val=0x00000000
+FB rb TL/TR/BL/BR: wrote=... read=... OK
+FB check: text_px=20546 flush=38 draw_fb=38
+```
+
+- `FB limine` / `FB classify` — какой адрес выдал Limine, применён ли
+  HHDM и какой физический адрес получился (должен совпадать с окном
+  VBE эмулятора: `0xe0000000`).
+- `FB read` / `FB rb` — чтение и запись с readback в четырёх углах
+  буфера: проверяют, что замаплен весь LFB, а не только первая страница.
+- `FB check` — число пикселей цвета текста и счётчики `flush()` /
+  `draw_fb()`: подтверждают, что терминал действительно рисует кадр.
+
+Автоматический сбор этих данных без окна и без X11:
+
+```bash
+python3 tools/probe_fb.py --serial-only   # Bochs nogui + COM1 socket
+# результат: probe_serial.log, probe_report.txt
+```
+
+Скрипт запускает Bochs с `-unlock`, подключается к COM1, ждёт
+приглашение shell и сохраняет serial-лог. Режим `--serial-only` не
+сканирует память эмулятора; без него дополнительно выполняется поиск
+буфера в памяти процесса Bochs.
 
 ### Тестирование
 
