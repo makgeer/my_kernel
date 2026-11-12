@@ -2,21 +2,16 @@ use heapless::Vec;
 use spin::Mutex;
 use spin::Once;
 use x86_64::instructions::port::Port;
-use x86_64::instructions::segmentation::{CS, SS, Segment};
 use x86_64::instructions::interrupts;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::paging::{page_table::PageTableFlags, PhysFrame};
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::{PhysAddr, PrivilegeLevel, VirtAddr};
 use x86_64::registers::control::{Cr3, Cr3Flags};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Счётчик тиков таймера — диагностика DOUBLE FAULT
 pub static TIMER_TICKS: AtomicUsize = AtomicUsize::new(0);
-
-/// ДИАГНОСТИКА (временно): сколько раз IRQ4 пришёл при живом владельце.
-static SERIAL_IRQ_OWNER_HITS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
 
 /* IDT создаётся один раз через spin::Once и живёт в static — load() безопасен */
 static IDT: Once<InterruptDescriptorTable> = Once::new();
@@ -37,7 +32,7 @@ pub fn init_idt() {
         // set_handler_addr — CPU переходит на функцию напрямую без пролога.
         unsafe {
             idt[0x20]
-                .set_handler_addr(VirtAddr::new(timer_handler_naked as u64))
+                .set_handler_addr(VirtAddr::new(timer_handler_naked as *const () as u64))
                 .set_stack_index(crate::gdt::TIMER_IST_INDEX);
         }
         // IRQ1 — клавиатура (вектор 0x21, PIC offset), свой стек IST 3
@@ -69,7 +64,7 @@ pub fn init_idt() {
         // неё напрямую (без пролога), а корректный стек-фрейм она строит сама.
         unsafe {
             idt[0x80]
-                .set_handler_addr(VirtAddr::new(syscall_entry as u64))
+                .set_handler_addr(VirtAddr::new(syscall_entry as *const () as u64))
                 .set_privilege_level(PrivilegeLevel::Ring3);
         }
         idt
@@ -98,6 +93,17 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _err_code: u64,
 ) -> ! {
+    // Реальный RSP обработчика (на IST-стеке #DF). Сравнение с IST top
+    // показывает, был ли стек переключён CPU или #DF наложилась на
+    // уже повреждённый стек (тогда фрейм читается неверно).
+    let entry_rsp: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {rsp}, rsp",
+            rsp = out(reg) entry_rsp,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
     // Диагностика: RSP — стек прерванного контекста, CR2 — адрес при #PF.
     // Если CR2 осмысленный (не 0) → было page fault, а не повреждение iretq.
     let cr2: u64;
@@ -122,6 +128,10 @@ extern "x86-interrupt" fn double_fault_handler(
     crate::debug::write_hex(stack_frame.instruction_pointer.as_u64());
     crate::debug::serial_write_str_direct(" CR2=0x");
     crate::debug::write_hex(cr2);
+    crate::debug::serial_write_str_direct(" entry_rsp=0x");
+    crate::debug::write_hex(entry_rsp);
+    crate::debug::serial_write_str_direct(" df_ist_top=0x");
+    crate::debug::write_hex(crate::gdt::double_fault_stack_top());
     crate::debug::serial_write_str_direct("\n");
     // Дамп IRET-фрейма, который iretq пытался вытолкнуть.
     // stack_frame.stack_pointer — это RSP на момент #DF; на нём (или рядом)
@@ -138,12 +148,6 @@ extern "x86-interrupt" fn double_fault_handler(
         stack_frame.code_segment.0,
         stack_frame.cpu_flags.bits(),
         stack_frame.stack_segment.0
-    );
-    // SS/CS, которые видел обработчик таймера при входе (последний тик)
-    crate::println!(
-        "  timer entry: SS=0x{:x}, CS=0x{:x}",
-        LAST_TIMER_SS.load(Ordering::Relaxed),
-        LAST_TIMER_CS.load(Ordering::Relaxed)
     );
     // Вместо зависания (hlt loop) — восстанавливаемся в shell.
     // kernel_panic восстановит kernel CR3, переключится на чистый
@@ -206,9 +210,15 @@ pub fn init_pic() {
     // ICW4: режим 8086
     outb(PIC1_DATA, 0x01);
     outb(PIC2_DATA, 0x01);
-    // Маска master: 0xEF = 0b11101111 — разрешаем IRQ0 (таймер),
-    // IRQ1 (клавиатура) и IRQ4 (serial COM1). Остальные маскируем.
-    outb(PIC1_DATA, 0xEF);
+    // Маска master: в PIC бит 1 = замаскирован, 0 = разрешён.
+    // 0xEC = 0b11101100 — разрешены IRQ0 (таймер), IRQ1 (клавиатура)
+    // и IRQ4 (serial COM1). Остальные замаскированы.
+    //
+    // ВАЖНО: раньше здесь стояло 0xEF (0b11101111) с комментарием
+    // «разрешены IRQ0, IRQ1 и IRQ4», но это разрешало ТОЛЬКО IRQ4:
+    // таймер и клавиатура были замаскированы. Из-за этого не работало
+    // вытеснение (нет IRQ0) и PS/2 (нет IRQ1).
+    outb(PIC1_DATA, 0xEC);
     // Маска slave: 0xFF — маскируем все IRQ 8-15 (в т.ч. RTC IRQ8,
     // spurious IRQ15). Обработчики для них не зарегистрированы.
     outb(PIC2_DATA, 0xFF);
@@ -225,7 +235,7 @@ fn outb(port: u16, value: u8) {
 /// Программирует канал 0 PIT (8253/8254) на периодические прерывания.
 ///
 /// Без этого IRQ0 не приходит вообще: PIC маскирует только то, что мы
-/// сами замаскировали (маска 0xEF разрешает IRQ0), но таймер молчит,
+/// сами замаскировали (маска 0xEC разрешает IRQ0), но таймер молчит,
 /// пока ему не задан режим и делитель. Планировщик работает только по
 /// тику, поэтому без PIT вытеснения нет: заблокированный процесс
 /// (irq_wait) больше никогда не запустится.
@@ -243,30 +253,6 @@ pub fn init_pit() {
     outb(PIT_CH0, (divisor >> 8) as u8);
 }
 
-/* Значения SS/CS в момент входа в обработчик — диагностика повреждения фрейма */
-static LAST_TIMER_SS: AtomicUsize = AtomicUsize::new(0);
-static LAST_TIMER_CS: AtomicUsize = AtomicUsize::new(0);
-
-extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    // Диагностика: сохраняем фактический SS/CS в момент входа в обработчик
-    // (через API крейта — чтение сегментных регистров, без raw asm).
-    LAST_TIMER_SS.store(SS::get_reg().0 as usize, Ordering::Relaxed);
-    LAST_TIMER_CS.store(CS::get_reg().0 as usize, Ordering::Relaxed);
-    // Счётчик тиков для диагностики DOUBLE FAULT
-    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-
-    // Вытесняющий планировщик: уменьшаем квант текущего процесса.
-    // Если квант истёк — нужен context_switch (пока диагностика).
-    if crate::process_manager::scheduler_tick() {
-        // Квант истёк — в будущем здесь будет переключение контекста.
-        // Пока просто сбрасываем квант (процесс продолжает работать).
-        crate::process_manager::reset_quantum_if_running();
-    }
-
-    // Отправляем EOI в PIC (port 0x20) — без этого таймер не выдаст следующее прерывание
-    outb(PIC1, 0x20);
-}
-
 /// Naked timer handler для вытесняющего планировщика.
 ///
 /// Заменяет extern "x86-interrupt" timer_handler на векторе 0x20.
@@ -280,8 +266,9 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 ///
 /// Handler:
 /// 1. Пушит все 15 GPR (rax..r15) → на стеке 15*8 = 120 байт GPR + 40 IRET
-/// 2. mov rdi = rsp (указатель на GPR), lea rsi = [rsp + 120] (указатель на IRET-фрейм)
-/// 3. call timer_schedule_rust(regs: *mut GprRegs, frame: *mut IretFrame)
+/// 2. mov rdi = rsp (указатель на GPR), lea rsi = [rsp + 120] (указатель на IRET-фрейм),
+///    mov rdx = rsp (RSP на входе — для восстановления стека ring 0)
+/// 3. call timer_schedule_rust(regs, frame, rsp_at_entry)
 /// 4. Если вернула false — просто pop GPR, EOI, iretq (нет переключения)
 /// 5. Если вернула true — GPR и IRET-фрейм уже модифицированы планировщиком
 /// 6. pop GPR (возможно изменённые), EOI, iretq → переход к следующему процессу
@@ -308,6 +295,11 @@ unsafe extern "C" fn timer_handler_naked() -> ! {
         "mov rdi, rsp",
         // rsi = указатель на IRET-фрейм (после 15 GPR = 15*8 = 0x78)
         "lea rsi, [rsp + 0x78]",
+        // rdx = RSP на входе в обработчик (после push GPR). Нужен, чтобы
+        // восстановить реальный RSP прерванного контекста: при прерывании
+        // из ring 0 CPU НЕ пушит RSP и SS, и поля frame.rsp/frame.ss
+        // содержат мусор за пределами 3-словного фрейма.
+        "mov rdx, rsp",
         // Вызываем Rust-планировщик
         "call {func}",
         // EOI в PIC — ДО восстановления GPR.
@@ -339,6 +331,10 @@ unsafe extern "C" fn timer_handler_naked() -> ! {
     );
 }
 
+/// Признак того, что предыдущий скан-код был префиксом 0xE0
+/// (extended scancode: стрелки, Home/End, Delete и т.п.).
+static EXTENDED_SCANCODE: AtomicBool = AtomicBool::new(false);
+
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     // Если IRQ1 заявлен user-space драйвером (keyboardd), ядро НЕ читает
     // порт 0x60: иначе байт будет потерян для драйвера. Ядро только
@@ -351,6 +347,36 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
 
     let mut port = Port::<u8>::new(0x60);
     let scancode = unsafe { port.read() };
+
+    // Префикс extended-сканкода: сам по себе символом не является.
+    if scancode == 0xE0 {
+        EXTENDED_SCANCODE.store(true, Ordering::SeqCst);
+        outb(PIC1, 0x20);
+        return;
+    }
+
+    // Extended-сканкод: стрелки приводим к тому же виду, в котором они
+    // приходят из serial (ESC [ A/B/C/D). Тогда shell разбирает стрелки
+    // единообразно независимо от источника ввода.
+    if EXTENDED_SCANCODE.swap(false, Ordering::SeqCst) {
+        let sequence: &[u8] = match scancode {
+            0x48 => b"\x1b[A", // Up
+            0x50 => b"\x1b[B", // Down
+            0x4D => b"\x1b[C", // Right
+            0x4B => b"\x1b[D", // Left
+            _ => &[],
+        };
+        if !sequence.is_empty() {
+            let mut buffer = KEYBOARD_BUFFER.lock();
+            for &b in sequence {
+                if buffer.push(b).is_err() {
+                    break;
+                }
+            }
+        }
+        outb(PIC1, 0x20);
+        return;
+    }
 
     let c = scancode_to_char(scancode);
 
@@ -376,19 +402,7 @@ extern "x86-interrupt" fn serial_irq_handler(_stack_frame: InterruptStackFrame) 
     // IRQ4 заявлен user-space драйвером (seriald) — ядро не читает UART,
     // только учитывает прерывание и будит драйвер.
     if crate::process_manager::irq_owner(4).is_some() {
-        let hit = SERIAL_IRQ_OWNER_HITS.fetch_add(1, Ordering::Relaxed);
-        let delivered = crate::process_manager::notify_irq(4);
-        if hit < 8 {
-            crate::debug::serial_write_str_direct("\n[I4] hit=");
-            crate::debug::write_hex(hit as u64);
-            crate::debug::serial_write_str_direct(" delivered=");
-            crate::debug::write_hex(delivered as u64);
-            crate::debug::serial_write_str_direct(" pend=");
-            crate::debug::write_hex(
-                crate::process_manager::irq_pending_count(4) as u64,
-            );
-            crate::debug::serial_write_str_direct(" ");
-        }
+        crate::process_manager::notify_irq(4);
         outb(PIC1, 0x20);
         return;
     }
@@ -718,60 +732,23 @@ fn port_allowed(port: u16) -> bool {
 /// Возвращает управление в kernel shell.
 ///
 /// Порядок приоритетов:
-/// 1. Сохранённый idle-контекст (shell был вытеснен таймером) — iretq
-///    продолжит shell ровно с точки прерывания. Без рекурсии.
-/// 2. Иначе (процесс запущен напрямую через run_process) — переход на
+/// 1. Сохранённый idle-контекст (shell был вытеснен таймером) —
+///    явное восстановление RSP и jmp в точку прерывания. iretq здесь
+///    не подходит: при возврате в ring 0 он не загружает RSP.
+/// 2. Иначе (процесс запущен напрямую) — переход на
 ///    kernel_return_to_shell, который восстановит точку возврата shell.
 fn switch_to_kernel_shell(
-    regs: &mut SyscallRegisters,
+    _regs: &mut SyscallRegisters,
     frame: &mut InterruptStackFrame,
 ) {
-    // 1. Есть сохранённый контекст ядра — восстанавливаем его целиком.
-    if let Some((gpr, iret, cr3)) = crate::process_manager::take_idle_context() {
-        regs.rax = gpr.rax;
-        regs.rbx = gpr.rbx;
-        regs.rcx = gpr.rcx;
-        regs.rdx = gpr.rdx;
-        regs.rsi = gpr.rsi;
-        regs.rdi = gpr.rdi;
-        regs.rbp = gpr.rbp;
-        regs.r8 = gpr.r8;
-        regs.r9 = gpr.r9;
-        regs.r10 = gpr.r10;
-        regs.r11 = gpr.r11;
-        regs.r12 = gpr.r12;
-        regs.r13 = gpr.r13;
-        regs.r14 = gpr.r14;
-        regs.r15 = gpr.r15;
-
-        if cr3 != 0 {
-            unsafe {
-                let phys_frame = PhysFrame::containing_address(PhysAddr::new(cr3));
-                Cr3::write(phys_frame, Cr3Flags::empty());
-            }
-        }
-
-        unsafe {
-            let mut m = frame.as_mut();
-            m.update(|f| {
-                f.instruction_pointer = VirtAddr::new(iret.rip);
-                f.code_segment = SegmentSelector::new(
-                    (iret.cs as u16) >> 3,
-                    PrivilegeLevel::Ring0,
-                );
-                f.stack_segment = SegmentSelector::new(
-                    (iret.ss as u16) >> 3,
-                    PrivilegeLevel::Ring0,
-                );
-                f.stack_pointer = VirtAddr::new(iret.rsp);
-                f.cpu_flags = x86_64::registers::rflags::RFlags::from_bits_truncate(iret.rflags);
-            });
-        }
-        return;
+    // 1. Есть сохранённый контекст ядра — возвращаемся в него.
+    //    Функция не возвращается при успехе.
+    if crate::process_manager::resume_idle_context() {
+        unreachable!();
     }
 
-    // 2. Запасной путь: shell запустил процесс напрямую (run_process).
-    //    kernel_return_to_shell вернёт управление после вызова run_process.
+    // 2. Запасной путь: kernel_return_to_shell вернёт управление после
+    //    вызова run_process.
     let kernel_p4 = crate::paging::kernel_p4_phys();
     if kernel_p4 != 0 {
         unsafe {
@@ -793,11 +770,8 @@ fn switch_to_kernel_shell(
                 crate::gdt::KERNEL_DATA_SELECTOR >> 3,
                 PrivilegeLevel::Ring0,
             );
-            let stack_ptr =
-                core::ptr::addr_of!(crate::gdt::KERNEL_RETURN_STACK) as *const u8;
-            let stack_top = stack_ptr as u64
-                + crate::gdt::KERNEL_RETURN_STACK.0.len() as u64;
-            f.stack_pointer = VirtAddr::new(stack_top & !0xF);
+            f.stack_pointer =
+                VirtAddr::new((crate::gdt::kernel_return_stack_top() - 256) & !0xF);
         });
     }
 }
@@ -831,23 +805,6 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
     let arg1 = regs.rdi;
     let arg2 = regs.rsi;
     let arg3 = regs.rdx;
-
-    // Диагностика. ВАЖНО: для read (#0) и write (#1) НЕ печатаем —
-    // read блокирующий (многократные вызовы), write вызывается часто
-    // (каждый символ в цикличных процессах). Иначе лог захлёбывается.
-    if syscall_num != 0 && syscall_num != 1 {
-        crate::println!(
-            "SYSCALL #{} from ring 3! (arg1=0x{:016x}, arg2=0x{:016x}, arg3=0x{:016x})",
-            syscall_num, arg1, arg2, arg3
-        );
-        crate::println!(
-            "  user RIP: 0x{:x}, RSP: 0x{:x}, CS: 0x{:x}, RFLAGS: 0x{:x}",
-            frame.instruction_pointer,
-            frame.stack_pointer,
-            frame.code_segment.0,
-            frame.cpu_flags.bits()
-        );
-    }
 
     // Диспетчер системных вызовов по номеру (eax).
     // Номера заимствованы у Linux (x86_64):
@@ -1043,11 +1000,11 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
                 // Прерывание уже накопилось в счётчике — забираем сразу.
                 regs.rax = 0;
             } else {
-                // Помечаем ожидание и блокируем процесс. При возобновлении
-                // процесс повторит int 0x80 (RIP-2) и заберёт прерывание
+                // Блокируем процесс с причиной Irq(irq). Установка
+                // ожидания и state=Blocked выполняются атомарно внутри
+                // block_current_and_switch. При возобновлении процесс
+                // повторит int 0x80 (RIP-2) и заберёт прерывание
                 // из счётчика (его уже увеличил IRQ-handler).
-                crate::process_manager::set_waiting_irq(irq);
-
                 let gpr = [
                     regs.rax, regs.rbx, regs.rcx, regs.rdx,
                     regs.rsi, regs.rdi, regs.rbp,
@@ -1062,6 +1019,7 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
 
                 match crate::process_manager::block_current_and_switch(
                     &gpr, rip, rsp, cs, ss, rflags,
+                    crate::process_manager::WaitKind::Irq(irq),
                 ) {
                     Some((_next_idx, info)) => {
                         apply_process_switch(regs, frame, &info);
@@ -1113,6 +1071,7 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
             let to_pid = arg1 as usize;
             let buf = arg2 as *const u8;
             let len = arg3 as usize;
+            let caller_pid = crate::process_manager::current_pid().unwrap_or(0);
 
             // Копируем данные из user space в kernel-буфер (безопасно).
             let mut kbuf = [0u8; crate::process_manager::IPC_MSG_SIZE];
@@ -1122,27 +1081,40 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
                 regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
             } else if to_pid == 0 {
                 // PID 0 — канал ввода: байты идут в буфер клавиатуры,
-                // откуда их читает shell (sys_read). Так user-space
-                // драйверы поставляют нажатия клавиш.
-                crate::interrupts::console_receive(&kbuf[..copy_len]);
-                crate::process_manager::IPC_SENT
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                regs.rax = 0;
+                // откуда их читает shell (sys_read). Capability: только
+                // владелец IRQ1 (PS/2) или IRQ4 (COM1) может поставлять
+                // ввод, иначе любой процесс подделал бы команды shell.
+                let allowed = crate::process_manager::irq_owner(1) == Some(caller_pid)
+                    || crate::process_manager::irq_owner(4) == Some(caller_pid);
+                if allowed {
+                    crate::interrupts::console_receive(&kbuf[..copy_len]);
+                    crate::process_manager::IPC_SENT
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    regs.rax = 0;
+                } else {
+                    regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EPERM
+                }
             } else if to_pid == 1 {
                 // PID 1 — консольный сервис (вывод): драйверы печатают
                 // диагностику, не имея доступа к VGA/framebuffer.
-                crate::interrupts::console_output(&kbuf[..copy_len]);
-                crate::process_manager::IPC_SENT
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                regs.rax = 0;
+                // Capability: только процесс-драйвер (владеет IRQ).
+                let is_driver = (0..16u8).any(|irq| {
+                    crate::process_manager::irq_owner(irq) == Some(caller_pid)
+                });
+                if is_driver {
+                    crate::interrupts::console_output(&kbuf[..copy_len]);
+                    crate::process_manager::IPC_SENT
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    regs.rax = 0;
+                } else {
+                    regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EPERM
+                }
             } else {
                 let res = crate::process_manager::ipc_send(to_pid, &kbuf[..copy_len]);
                 if res == crate::process_manager::IPC_FULL {
                     // Блокирующий send: ящик получателя переполнен.
-                    // Помечаем ожидание и уступаем CPU. При возобновлении
-                    // процесс повторит int 0x80 и попробует снова.
-                    crate::process_manager::set_waiting_send(to_pid);
-
+                    // Блокируемся с причиной IpcSend(to_pid); при
+                    // возобновлении процесс повторит int 0x80.
                     let gpr = [
                         regs.rax, regs.rbx, regs.rcx, regs.rdx,
                         regs.rsi, regs.rdi, regs.rbp,
@@ -1157,14 +1129,12 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
 
                     match crate::process_manager::block_current_and_switch(
                         &gpr, rip, rsp, cs, ss, rflags,
+                        crate::process_manager::WaitKind::IpcSend(to_pid),
                     ) {
                         Some((_next_idx, info)) => {
                             apply_process_switch(regs, frame, &info);
                         }
                         None => {
-                            crate::println!(
-                                "  ipc_send: mailbox full, no ready process"
-                            );
                             regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EAGAIN
                         }
                     }
@@ -1203,11 +1173,9 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
                         regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EFAULT
                     }
                 } else {
-                    // Нет сообщений — блокируем процесс и переключаемся
-                    // на следующий готовый. При возобновлении процесс
-                    // повторит int 0x80 → ipc_recv снова.
-                    crate::println!("  ipc_recv: blocking (no messages)");
-
+                    // Нет сообщений — блокируем процесс с причиной IpcRecv
+                    // и переключаемся на следующий готовый. При возобновлении
+                    // процесс повторит int 0x80 → ipc_recv снова.
                     // Собираем GPR в правильном порядке (как GprRegs):
                     // rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15.
                     let gpr = [
@@ -1224,14 +1192,15 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
 
                     match crate::process_manager::block_current_and_switch(
                         &gpr, rip, rsp, cs, ss, rflags,
+                        crate::process_manager::WaitKind::IpcRecv,
                     ) {
                         Some((_next_idx, info)) => {
                             apply_process_switch(regs, frame, &info);
                             // iretq в syscall_entry → переход в следующий процесс.
                         }
                         None => {
-                            // Нет готовых процессов — нельзя блокировать.
-                            crate::println!("  ipc_recv: no ready process, returning -1");
+                            // Нет готовых процессов — блокировка откатана
+                            // внутри block_current_and_switch.
                             regs.rax = 0xFFFF_FFFF_FFFF_FFFF; // -1: EAGAIN
                         }
                     }
@@ -1280,6 +1249,9 @@ fn syscall_handler_rust(regs: &mut SyscallRegisters) {
 #[inline(never)]
 fn kernel_return_to_shell() -> ! {
     crate::println!("Returned from user mode to kernel");
+    // Страховка: ядро активно, таймер не должен запускать процессы,
+    // пока shell печатает и держит TERMINAL.lock.
+    crate::process_manager::set_shell_idle(false);
     crate::shell::shell();
     loop {}
 }

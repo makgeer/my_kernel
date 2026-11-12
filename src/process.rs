@@ -5,17 +5,15 @@
 //! - код и данные, замапленные в lower-half (user space)
 //! - стек пользователя
 //!
-//! Переход в ring 3 (user mode) выполняется через IRETQ:
-//! CPU восстанавливает SS:RSP, RFLAGS, CS:RIP из стека ядра.
-//! Устанавливая CS/SS с RPL=3, CPU переходит в ring 3.
+//! Переход в ring 3 выполняет планировщик (timer_schedule_rust):
+//! он подменяет IRET-фрейм на стеке обработчика таймера, и iretq
+//! возвращает CPU в user mode с CR3 процесса.
 
 use x86_64::structures::paging::page_table::PageTableFlags;
 use x86_64::structures::paging::PhysFrame;
 use x86_64::registers::control::{Cr3, Cr3Flags};
-use x86_64::VirtAddr;
 use crate::pmm;
 use crate::paging;
-use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::println;
 use crate::paging::copy_user_mapping_to_kernel;
 
@@ -40,17 +38,6 @@ pub const STACK_GUARD_PAGES: usize = 1;
 pub const VGA_BUFFER_ADDR: u64 = 0xB8000;
 
 const PAGE_SIZE: u64 = 4096;
-
-/// Глобальный указатель на P4 текущего пользовательского процесса.
-/// Используется page fault handler для переключения CR3 при входе
-/// в user mode (iretq выполняется с kernel CR3, PF handler переключает).
-static mut CURRENT_USER_P4: u64 = 0;
-
-/// Точка входа пользовательского процесса (для user_mode_entry).
-static mut USER_ENTRY_POINT: u64 = 0;
-
-/// Вершина пользовательского стека (для user_mode_entry).
-static mut USER_STACK_PTR: u64 = 0;
 
 /// Структура процесса.
 #[derive(Clone, Copy)]
@@ -294,46 +281,6 @@ pub fn create_elf_process(elf_bytes: &[u8]) -> Result<Process, &'static str> {
     })
 }
 
-/// Переход в ring 3 (user mode) через IRETQ.
-///
-/// # Что делает
-/// 1. Кладёт на стек ядра IRETQ-фрейм:
-///    - SS = USER_DATA_SELECTOR (RPL=3)
-///    - RSP = stack_top
-///    - RFLAGS (с IF=1 — прерывания разрешены)
-///    - CS = USER_CODE_SELECTOR (RPL=3)
-///    - RIP = entry_point
-/// 2. Выполняет IRETQ — CPU переходит в ring 3
-///
-/// Обычная extern "C" функция (не naked): по SysV ABI аргументы приходят
-/// в rdi (entry), rsi (stack). Компилятор не трогает эти регистры до asm!.
-///
-/// ВАЖНО: вызывающая сторона должна передавать `stack` выровненным так,
-/// чтобы `stack mod 16 != 0` (см. комментарий в run_process про #GP при
-/// iretq в ring 3). Передавайте `USER_STACK_TOP - 8`, а не сам `USER_STACK_TOP`.
-///
-/// # Безопасность
-/// После IRETQ код выполняется в ring 3. Возврат в kernel mode
-/// возможен только через прерывание (syscall/int).
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "C" fn enter_ring3(entry: u64, stack: u64) -> ! {
-    // Формируем IRETQ-фрейм на текущем (kernel) стеке.
-    // Порядок (снизу вверх): SS, RSP, RFLAGS, CS, RIP
-    core::arch::asm!(
-        "push rsi",        // SS = USER_DATA_SELECTOR (передан в rsi)
-        "push rdx",        // RSP = user stack (передан в rdx, должен быть ≡ 8 mod 16)
-        "pushfq",          // RFLAGS (IF уже установлен — sti в init_idt)
-        "push rcx",        // CS = USER_CODE_SELECTOR (передан в rcx)
-        "push rdi",        // RIP = entry point (передан в rdi)
-        "iretq",
-        in("rdi") entry,
-        in("rsi") USER_DATA_SELECTOR,
-        in("rdx") stack,
-        in("rcx") USER_CODE_SELECTOR,
-        options(noreturn)
-    );
-}
-
 /// Загружает программу из VFS по пути и создаёт процесс.
 ///
 /// Читает ELF-файл из initrd (см. fs_initrd.rs), затем создаёт
@@ -369,11 +316,24 @@ pub fn load_program_from_fs(path: &str) -> Result<Process, &'static str> {
 /// 3. user_mode_entry переключает CR3 на user P4
 /// 4. user_mode_entry формирует новый IRETQ-фрейм с USER CS/SS
 /// 5. iretq → user code (с USER CS/SS, user CR3)
+/// Готовит процесс к запуску в ring 3 и возвращает управление в shell.
+///
+/// Процесс уже зарегистрирован в менеджере (spawn в create_*_process)
+/// в состоянии Ready. Реальный переход в user mode выполняет таймер:
+/// shell возвращается в цикл, входит в idle (sti; hlt), выставляет
+/// SHELL_IDLE, и timer_schedule_rust переключается на процесс, сохранив
+/// idle-контекст ядра. Возврат из процесса (exit/block) идёт через
+/// take_idle_context — в ту же точку shell, без повторного вызова
+/// shell() и без роста стека.
+///
+/// Раньше здесь был прямой iretq в user_mode_entry. При завершении
+/// процесса управление возвращалось через kernel_return_to_shell,
+/// который заново вызывал shell() с RSP на вершине KERNEL_RETURN_STACK.
+/// Это давало рекурсию shell() и падение на границе стека (#DF).
 pub fn run_process(proc: &Process) {
-    // Печатаем ДО перехода — потом kernel P4 неактивна.
-    println!("Launching ring 3 at entry 0x{:016x}...", proc.entry_point);
+    println!("Scheduling ring 3 at entry 0x{:016x}...", proc.entry_point);
 
-    // Диагностика маппингов в P4 процесса (до переключения CR3):
+    // Диагностика маппингов в P4 процесса:
     // код, VGA и верхняя страница стека должны быть замаплены.
     let code_map = paging::check_mapping_in_p4(proc.p4_phys, proc.entry_point);
     let vga_map = paging::check_mapping_in_p4(proc.p4_phys, VGA_BUFFER_ADDR);
@@ -383,101 +343,7 @@ pub fn run_process(proc: &Process) {
         code_map, vga_map, stack_map
     );
 
-    // Сохраняем параметры процесса в статиках для user_mode_entry.
-    unsafe {
-        CURRENT_USER_P4 = proc.p4_phys;
-        USER_ENTRY_POINT = proc.entry_point;
-        USER_STACK_PTR = proc.stack_top;
-    }
-
-    // Отмечаем процесс как Running в менеджере процессов.
-    // Без этого terminate_current() при exit() не найдёт процесс →
-    // он останется в состоянии Ready и будет виден в ps после завершения.
-    crate::process_manager::set_current_by_p4(proc.p4_phys);
-
-    // iretq → user_mode_entry (kernel функция).
-    // user_mode_entry переключит CR3 и перейдёт к user code.
-    // order (снизу вверх): SS, RSP, RFLAGS, CS, RIP
-    //
-    // ВАЖНО: user_mode_entry — это kernel-функция (ring 0), поэтому
-    // SS и CS должны быть KERNEL selectors, а RSP — kernel stack.
-    // user_mode_entry сама создаст IRETQ-фрейм с USER selectors.
-    unsafe {
-        // Берём вершину KERNEL_RETURN_STACK для iretq
-        let kernel_stack = crate::gdt::KERNEL_RETURN_STACK.0.as_ptr() as u64
-            + crate::gdt::KERNEL_RETURN_STACK.0.len() as u64;
-        core::arch::asm!(
-            "push {ss}",
-            "push {sp}",
-            "pushfq",
-            "push {cs}",
-            "push {rip}",
-            "iretq",
-            ss = in(reg) crate::gdt::KERNEL_DATA_SELECTOR,
-            sp = in(reg) kernel_stack,
-            cs = in(reg) crate::gdt::KERNEL_CODE_SELECTOR,
-            rip = in(reg) user_mode_entry as u64,
-            options(noreturn)
-        );
-    }
-}
-
-/// Переход в user mode с переключением CR3.
-/// Вызывается из iretq после run_process.
-/// Переключает CR3 на user P4, затем iretq к user code.
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "C" fn user_mode_entry() -> ! {
-    let p4_phys = CURRENT_USER_P4;
-    let entry = USER_ENTRY_POINT;
-    let stack = USER_STACK_PTR;
-
-    // ДИАГНОСТИКА: маркер входа в user_mode_entry — подтверждает, что
-    // iretq из run_process дошёл до этой функции. Также печатаем текущий
-    // CR3 (должен быть kernel P4) и целевую P4 процесса. Если этой строки
-    // нет в логе — iretq/фрейм osбиваются ещё ДО user_mode_entry.
-    {
-        let (cur_frame, _) = Cr3::read();
-        crate::println!(
-            "user_mode_entry: entered (cur CR3=0x{:016x}, target P4=0x{:016x}, entry=0x{:016x})",
-            cur_frame.start_address().as_u64(),
-            p4_phys,
-            entry
-        );
-    }
-
-    // Переключаем CR3 на user P4
-    if p4_phys != 0 {
-        let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(p4_phys));
-        Cr3::write(frame, x86_64::registers::control::Cr3Flags::empty());
-        // После переключения сразу проверяем фактический CR3 — код ниже
-        // (iretq к user code) исполняется уже в user адресном пространстве.
-        let (new_frame, _) = Cr3::read();
-        crate::println!(
-            "user_mode_entry: CR3 switched (actual CR3=0x{:016x})",
-            new_frame.start_address().as_u64()
-        );
-        // КРИТИЧЕСКИ: инвалидируем TLB после переключения CR3!
-        // Без invlpg CPU использует stale entries из kernel P4,
-        // что приводит к page fault при instruction fetch по USER_CODE_BASE.
-        x86_64::instructions::tlb::flush(VirtAddr::new(USER_CODE_BASE));
-    }
-
-    // Теперь выполняем iretq с user CR3 → user code.
-    // Формируем IRETQ-фрейм на текущем стеке:
-    // SS, RSP, RFLAGS, CS, RIP
-    core::arch::asm!(
-        "push {ss}",
-        "push {sp}",
-        "pushfq",
-        "push {cs}",
-        "push {rip}",
-        "iretq",
-        ss = in(reg) USER_DATA_SELECTOR,
-        sp = in(reg) stack - 8,
-        cs = in(reg) USER_CODE_SELECTOR,
-        rip = in(reg) entry,
-        options(noreturn)
-    );
+    println!("  process will start from scheduler idle (PID registered)");
 }
 
 /// Восстанавливает kernel CR3 после возврата из user mode.

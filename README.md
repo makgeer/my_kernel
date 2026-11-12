@@ -1,6 +1,6 @@
 # Malinka — Учебное ядро ОС на Rust
 
-**Malinka** — учебное ядро операционной системы для архитектуры x86_64 (bare-metal, `no_std` / `no_main`). Загружается через загрузчик [Limine](https://limine-bootloader.org/) в higher-half режиме (базовый адрес `0xFFFFFFFF80000000`). Ядро реализует базовую инфраструктуру ОС: вывод на framebuffer/VGA/serial, обработку прерываний (PIC, IDT, GDT/TSS/IST), кооперативный планировщик задач, пользовательские процессы (ring 3), системные вызовы, ELF64-загрузчик, встроенный скриптовый движок Rhai и интерактивный shell. При разработке данного проекта, огромный вклад был сделан проектом Koda.AI - огромное спасибо разработчикам, за их работу! Без их труда не состоялся бы этот проект.
+**Malinka** — учебное ядро операционной системы для архитектуры x86_64 (bare-metal, `no_std` / `no_main`). Загружается через загрузчик [Limine](https://limine-bootloader.org/) в higher-half режиме (базовый адрес `0xFFFFFFFF80000000`). Ядро реализует базовую инфраструктуру ОС: вывод на framebuffer/VGA/serial, обработку прерываний (PIC, IDT, GDT/TSS/IST), вытесняющий round-robin планировщик процессов, пользовательские процессы (ring 3), системные вызовы, IPC, ELF64-загрузчик, встроенный скриптовый движок Rhai и интерактивный shell. При разработке данного проекта, огромный вклад был сделан проектом Koda.AI - огромное спасибо разработчикам, за их работу! Без их труда не состоялся бы этот проект.
 
 ---
 
@@ -18,10 +18,10 @@
 - **Изолированные адресные пространства**: каждый процесс получает собственную P4-таблицу
 
 ### Прерывания и защита
-- **GDT + TSS + IST**: отдельные стеки для обработчиков #DF (16 КБ), таймера (8 КБ), клавиатуры (8 КБ)
-- **IDT**: breakpoint (#3), double_fault (#DF), page_fault (#PF), timer (IRQ0), keyboard (IRQ1), syscall (int 0x80)
-- **PIC**: master + slave, ремап, маскирование (разрешены только IRQ0 и IRQ1)
-- **#PF handler**: диагностика (CR2, RIP, CS/SS, RFLAGS), восстановление kernel CR3 при панике
+- **GDT + TSS + IST**: отдельные стеки для обработчиков #DF (16 КБ), таймера, клавиатуры, #PF и serial (по 8 КБ)
+- **IDT**: breakpoint (#3), double_fault (#DF), page_fault (#PF), timer (IRQ0), keyboard (IRQ1), serial (IRQ4), syscall (int 0x80)
+- **PIC**: master + slave, ремап, маскирование (разрешены IRQ0, IRQ1 и IRQ4)
+- **#PF handler**: диагностика (CR2, RIP, CS/SS, RFLAGS), обнаружение guard page, восстановление kernel CR3 при панике
 
 ### Пользовательские процессы (Ring 3)
 - **create_process** — создание процесса с маппингом кода и стека
@@ -36,15 +36,36 @@
 | 1 | `write` | Вывод строки в консоль (через `copy_from_user`) |
 | 24 | `yield` | Добровольная передача кванта планировщику |
 | 39 | `getpid` | PID текущего процесса |
-| 40 | `ipc_send` | Отправка сообщения процессу по PID |
+| 40 | `ipc_send` | Отправка сообщения процессу по PID (блокирующая при полном ящике) |
 | 41 | `ipc_recv` | Приём сообщения (блокирующий) |
+| 42 | `irq_wait` | Ожидание аппаратного прерывания (user-space драйверы) |
+| 43 | `io_in` | Чтение порта ввода-вывода (белый список + capability) |
+| 44 | `irq_claim` | Захват IRQ драйвером (только свободного) |
 | 60 | `exit` | Завершение процесса |
+
+### Планировщик и IPC
+- **Вытесняющий round-robin**: до 16 процессов, квант 5 тиков PIT (100 Гц)
+- **Переключение контекста**: `timer_schedule_rust` + IRET-фрейм, отдельный CR3 на процесс
+- **Состояния**: Ready / Running / Blocked / Terminated; причина блокировки — `WaitKind`
+  (Irq, IpcRecv, IpcSend), поэтому процесс будится только своим событием
+- **Блокирующий IPC**: почтовые ящики на 4 сообщения; при переполнении отправитель
+  засыпает и просыпается после `ipc_recv` получателя
+- **Завершение**: `exit`/`kill` освобождают IRQ, будят ожидающих отправителей
+  и переключают на следующий Ready-процесс
+- **Idle-контекст**: shell, вытесненный таймером, продолжает работу с точки
+  прерывания (без рекурсивного вызова `shell()`)
 
 ### Скриптовый движок
 - **Rhai** (no_std) — выполнение скриптов прямо в ядре через команду `script "<код>"`
 - **Brush** — собственная bash-совместимая оболочка MVP: `set`/`unset`/`env`/`echo`/`help`/`exit`, подстановка `$VAR` и `$?`
 
 ### Shell — интерактивная оболочка
+
+Редактирование строки: Backspace (в том числе в середине строки),
+стрелки влево/вправо, история последних 25 команд по стрелкам
+вверх/вниз. Стрелки работают одинаково для PS/2 и COM1: скан-коды
+`0xE0 0x48/0x50/0x4B/0x4D` и serial-последовательности `ESC [ A/B/C/D`
+приводятся к одному виду.
 | Команда | Описание |
 |---------|----------|
 | `help` | Список команд |
@@ -54,8 +75,9 @@
 | `clear` | Очистка экрана |
 | `cursor` | Управление курсором |
 | `color` | Демонстрация 16-цветной палитры SGR |
-| `reboot` | Перезагрузка |
+| `reboot` / `rb` / `rebut` | Перезагрузка |
 | `hlt` | Останов CPU |
+| `exit` | Останов системы и выход из shell |
 | `test_alloc` | Тест аллокатора кучи |
 | `test_pmm` | Тест физической памяти |
 | `test_paging` | Тест страничной адресации |
@@ -64,9 +86,15 @@
 | `run_elf` | Загрузка и запуск ELF64-программы |
 | `run_syscall` | Тест read/write syscalls (2 PT_LOAD сегмента) |
 | `run <file>` | Загрузка и запуск ELF из VFS (`/bin/<file>`) |
+| `run_multi` | Запуск нескольких процессов (тест вытеснения) |
+| `test_ipc` | Тест IPC (отправитель + получатель) |
+| `keyboardd` | User-space драйвер PS/2 (IRQ1 → IPC PID 0) |
+| `seriald` | User-space драйвер COM1 (IRQ4 → IPC PID 0) |
 | `arrow_test` | Тест клавиатуры из Ring 3 (hex-коды клавиш) |
 | `ps` | Список процессов |
 | `kill <pid>` | Завершить процесс по PID |
+| `irqstat` | Владельцы IRQ (ядро или user-space драйвер) |
+| `ipcstat` | Статистика IPC (sent/received/failed) |
 | `ls`, `cat` | Просмотр initrd/VFS |
 | `btrfs`, `btrfs-ls`, `btrfs-cat` | Работа с btrfs-диском |
 | `script "<код>"` | Выполнение Rhai-скрипта |
@@ -78,17 +106,18 @@
 
 | Компонент | Версия | Назначение |
 |-----------|--------|------------|
-| Rust (nightly) | — | Язык реализации, `#![feature(abi_x86_interrupt)]` |
+| Rust (nightly) | — | Язык реализации, `#![feature(abi_x86_interrupt)]`; версия фиксируется `rust-toolchain.toml` |
 | `x86_64` | 0.15.2 | API для работы с портами, сегментами, IDT, GDT, TSS |
 | `spin` | 0.9.8 | `Mutex` и `Once` без аллокации (no_std) |
 | `heapless` | 0.7.16 | `Vec<u8, 256>` для буфера клавиатуры без аллокации |
 | `limine` | 0.6.5 | Limine Boot Protocol (запрос framebuffer, HHDM) |
 | `linked_list_allocator` | 0.10.x | Heap-аллокатор (8 МБ, `LockedHeap`) |
 | `rhai` | 1.25.1 | Скриптовый движок (no_std, `features = ["no_std"]`) |
+| `btrfs-no-std` | 0.2 | Структуры дискового формата btrfs (no_std) |
 | Limine (загрузчик) | 12.5.2 | Передаёт управление в higher-half, framebuffer, HHDM |
 | NASM | — | Компиляция `boot.asm` и user-программ |
 | GNU ld | — | Линковка user-программ |
-| xorriso | — | Создание загрузочного ISO |
+| xorriso / genisoimage | — | Создание загрузочного ISO |
 | Bochs | — | Эмулятор для тестирования |
 
 ---
@@ -100,12 +129,9 @@ malinka/
 ├── .cargo/
 │   └── config.toml          — цель сборки x86_64-unknown-none, build-std, флаги линкера
 ├── Cargo.toml               — манифест пакета
-├── build.rs                 — компиляция boot.asm через NASM (elf64)
+├── build.rs                 — NASM: boot.asm + user_programs/*.asm → *.elf
 ├── linker.ld                — линкер-скрипт (higher-half, секция .requests для Limine)
 ├── make_iso.sh              — сборка ISO через xorriso/genisoimage + Limine (аргумент: no-fb)
-├── build_user.sh            — сборка user-программы hello (nasm + ld) → hello.elf
-├── build_all_user.sh        — сборка ВСЕХ user_programs/*.asm → *.elf
-├── build_syscall_test.sh    — сборка user-программы syscall_test (2 PT_LOAD сегмента)
 ├── bochsrc.bxrc             — конфигурация Bochs
 ├── iso/                     — файлы для ISO (kernel.elf, limine.conf, limine-bios.*)
 ├── limine-binary/           — исходные бинарники Limine
@@ -117,6 +143,8 @@ malinka/
 │   ├── ipc_sender/receiver.asm — тест IPC
 │   ├── arrow_test.asm       — тест клавиатуры (hex-коды клавиш)
 │   ├── sysinfo.asm          — тест getpid (#39) и yield (#24)
+│   ├── keyboardd.asm        — user-space драйвер PS/2 (IRQ1 → IPC PID 0)
+│   ├── seriald.asm          — user-space драйвер COM1 (IRQ4 → IPC PID 0)
 │   ├── hello.ld             — линкер-скрипт (база 0x400000000000)
 │   └── syscall_test.ld      — линкер-скрипт с двумя PT_LOAD
 ├── arhiv/                   — архив неиспользуемых файлов (.bak, устаревшие скрипты)
@@ -132,10 +160,10 @@ malinka/
     ├── limine_fb.rs         — запросы Limine: FramebufferRequest, HhdmRequest
     ├── gdt.rs               — GDT + TSS + IST, kernel_panic
     ├── interrupts.rs        — IDT, PIC, syscall handler, copy_from/to_user, page_fault
-    ├── scheduler.rs         — кооперативный планировщик (до 4 задач)
+    ├── scheduler.rs         — демо-задачи для команды tasks (кооперативный проход)
     ├── process_manager.rs   — вытесняющий round-robin, IPC-почтовые ящики, ps/kill
     ├── tasks.rs             — демо-задачи: task_hello, task_counter
-    ├── shell.rs             — интерактивный shell: getchar, команды (run, ps, script, brush)
+    ├── shell.rs             — интерактивный shell: read_key, команды (run, ps, script, brush)
     ├── terminal.rs          — терминал 80x25 (ANSI, курсор, рендер)
     ├── allocator.rs         — heap-аллокатор 8 МБ (linked_list_allocator, LockedHeap)
     ├── pmm.rs               — PMM: bitmap-аллокатор физических фреймов 4K
@@ -185,22 +213,52 @@ cargo build --release
 
 # Режим без framebuffer (только VGA 80x25 + serial, для Bochs term)
 ./make_iso.sh no-fb
-
-# Сборка пользовательских ELF-программ
-./build_all_user.sh          # все user_programs/*.asm → *.elf (init, sysinfo, ...)
-./build_user.sh              # hello.elf
-./build_syscall_test.sh      # syscall_test.elf
 ```
+
+Пользовательские ELF-программы (`user_programs/*.asm`) собираются
+автоматически в `build.rs` перед компиляцией ядра (NASM + GNU ld).
+Отдельные скрипты запускать не нужно: `cargo build` и `make_iso.sh`
+всегда получают актуальные `.elf`.
 
 Если nightly не выбран toolchain по умолчанию, make_iso.sh принимает
 переопределение: `CARGO="cargo +nightly" ./make_iso.sh no-fb`.
 
 ### Запуск в Bochs
 
+Два варианта конфигурации:
+
 ```bash
-# Запуск строго вручную в системном терминале
+# 1. Headless: только serial, ввод/вывод через nc
+./make_iso.sh no-fb
 ./bochs-bin/bin/bochs -q -f bochsrc.bxrc
+nc localhost 8888
+
+# 2. GUI (X11): окно с VGA-выводом и ввод с клавиатуры (PS/2)
+./make_iso.sh                    # ISO должен быть собран С framebuffer
+~/.local/bochs-gui/bin/bochs -q -f bochsrc-gui.bxrc
+# COM1 пишется в bochs_gui_serial.log
 ```
+
+**Важно:** режим ISO должен соответствовать конфигурации Bochs.
+`bochsrc-gui.bxrc` включает VBE 1024x768x32 — в этом режиме текстовый
+VGA-буфер `0xB8000` не виден, поэтому ISO обязан быть собран с
+framebuffer (`./make_iso.sh`). И наоборот, для `bochsrc.bxrc` (nogui +
+term) нужен `./make_iso.sh no-fb`. При несовпадении ядро работает и
+пишет в serial, но экран остаётся пустым.
+
+`./bochs-bin` собран только с `nogui`/`term` — X11-плагина в нём нет.
+GUI-сборка ставится из исходников в `~/.local/bochs-gui` (без root):
+
+```bash
+curl -sL https://github.com/bochs-emu/Bochs/archive/refs/heads/master.tar.gz | tar xz
+cd Bochs-master/bochs
+./configure --prefix="$HOME/.local/bochs-gui" --with-x11 \
+            --enable-x86-64 --enable-cpu-level=6 --enable-long-phy-address
+make -j"$(nproc)" && make install
+```
+
+GUI нужен для проверки PS/2-драйверов (`keyboardd`) и стрелок: в
+headless-режиме клавиатурного устройства нет, доступен только COM1.
 
 ### Тестирование
 
@@ -235,7 +293,7 @@ cargo build --release
 
 ### Прерывания
 
-- **PIC**: master (0x20-0x27) + slave (0x28-0x2F), маски — разрешены только IRQ0 (таймер) и IRQ1 (клавиатура)
+- **PIC**: master (0x20-0x27) + slave (0x28-0x2F), маски — разрешены IRQ0 (таймер), IRQ1 (клавиатура) и IRQ4 (COM1)
 - **IDT**: breakpoint (#3), double_fault (#DF, IST 1), page_fault (#PF), timer (IRQ0, IST 2), keyboard (IRQ1, IST 3), syscall (int 0x80, DPL=3)
 - **IST-стеки**: `DOUBLE_FAULT_STACK` (16 КБ), `TIMER_STACK` (8 КБ), `KEYBOARD_STACK` (8 КБ)
 - **#PF handler**: диагностика (CR2, RIP, CS/SS, RFLAGS); при PF в user mode — kernel_panic
@@ -244,7 +302,14 @@ cargo build --release
 
 ### Планировщик
 
-Кооперативный, до 4 задач (`Mutex<[Option<Task>; 4]>`). `run_scheduler_once()` выполняет один проход всех задач — вызывается из shell командой `tasks`.
+Вытесняющий round-robin в `process_manager.rs`: до 16 процессов, квант
+5 тиков PIT (100 Гц). `timer_schedule_rust` вызывается из IRQ0, сохраняет
+IRET-фрейм текущего процесса и переключает CR3 + контекст на следующий
+Ready-процесс. Внутри ring 0 вытеснение запрещено — syscall завершается
+на kernel-стеке текущего процесса. Причина блокировки хранится в
+`WaitKind` (Irq, IpcRecv, IpcSend), поэтому процесс будится только своим
+событием. Команда `tasks` запускает отдельный кооперативный проход
+демо-задач из `scheduler.rs` (не связан с процессами ring 3).
 
 ### Пользовательские процессы (Ring 3)
 
@@ -287,7 +352,7 @@ GitHub: https://github.com/makgeer
 
 ## English
 
-**Malinka** is an educational x86_64 kernel written in Rust (bare-metal, `no_std` / `no_main`). It boots via the Limine bootloader in higher-half mode. The kernel implements basic OS infrastructure: framebuffer/VGA/serial output, interrupt handling (PIC, IDT, GDT/TSS/IST), a cooperative task scheduler, user-space processes (ring 3), system calls, an ELF64 loader, an embedded Rhai scripting engine, and an interactive shell.
+**Malinka** is an educational x86_64 kernel written in Rust (bare-metal, `no_std` / `no_main`). It boots via the Limine bootloader in higher-half mode. The kernel implements basic OS infrastructure: framebuffer/VGA/serial output, interrupt handling (PIC, IDT, GDT/TSS/IST), a preemptive round-robin process scheduler, user-space processes (ring 3), system calls, an ELF64 loader, an embedded Rhai scripting engine, and an interactive shell.
 
 ### Quick start
 

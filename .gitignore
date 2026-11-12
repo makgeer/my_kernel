@@ -28,3 +28,16 @@ build_init.sh
 # ISO и бинарник ядра (генерируются при сборке)
 /boot.iso
 iso/kernel.elf
+# Диагностические артефакты Bochs и зондов (генерируются при запуске)
+bochs-gui.log
+bochs_gui_serial.log
+bochs_run.out
+bochs_serial_test.log
+headless_session.log
+probe_bochs.out
+probe_report.txt
+probe_serial.log
+/snapshot.bmp
+# Python-кэш (tools/)
+__pycache__/
+*.pyc

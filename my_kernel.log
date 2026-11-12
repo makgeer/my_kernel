@@ -3709,3 +3709,249 @@ SYSCALLS:
   - Правок кода не вносилось — только фиксация результатов аудита.
   - Коммит: см. следующий [git]-маркер.
 [git] 2026-11-11 — commit "audit: user-space drivers (irq_claim/irq_wait/io_in), blocking IPC, idle context" (25 файлов; 15 найденных проблем зафиксированы в my_kernel.log и plan.txt; push не выполнялся)
+
+================================================================
+2026-11-12: ИСПРАВЛЕНИЕ 15 ПРОБЛЕМ АУДИТА
+================================================================
+
+1. context_switch (process_manager.rs) переписан под фактические
+   смещения ProcessContext: rip=0x78, cs=0x80, rsp=0x88, ss=0x90,
+   rflags=0x98, cr3=0xA0. Вместо push/ret собирается IRET-фрейм
+   и выполняется iretq. panic_current использует select_next(),
+   выставляет current и force_unlock перед переключением.
+
+2. Вытеснение в ring 0 запрещено: timer_schedule_rust проверяет
+   (frame.cs & 3) == 0 и возвращает false. Syscall завершается на
+   kernel-стеке текущего процесса, общий TSS.rsp0 больше не
+   переключается посередине обработчика.
+
+3. Введён enum WaitKind { None, Irq(u8), IpcRecv, IpcSend(usize) }.
+   block_current_and_switch(..., wait) выставляет ожидание и
+   Blocked атомарно под PROCESS_MANAGER; если Ready-процессов нет,
+   для Irq состояние остаётся Blocked, для IPC — откат в Running.
+
+4. ipc_send будит получателя только при wait == IpcRecv;
+   ipc_recv будит отправителей с IpcSend(recv_pid). Ложные
+   пробуждения устранены.
+
+5. exit/terminate освобождает IRQ процесса и будит отправителей
+   через wake_senders_waiting_for.
+
+6. claim_irq использует compare_exchange: захват только свободного
+   IRQ, повторный claim владельцем идемпотентен.
+
+7. kill <pid> → terminate_by_pid (поиск по pid, не индекс+1),
+   добавлена обёртка с without_interrupts.
+
+8. Каналы IPC PID 0/1 ограничены capability: PID 0 принимает
+   сообщения только от владельца IRQ1/IRQ4, PID 1 — от любого
+   владельца IRQ.
+
+9. Удалён диагностический шум: [T]/[TS] в таймере, [I4] в serial,
+   [K] в read_key, println на каждый syscall #42/#43.
+
+10. Удалён мёртвый timer_handler (extern "x86-interrupt") вместе
+    с LAST_TIMER_SS/CS; вектор 0x20 обслуживает только
+    timer_handler_naked.
+
+11. panic_current печатает p.pid; yield_current_and_switch исключает
+    текущий процесс из выбора.
+
+12. build.rs собирает user_programs/*.asm через nasm + ld перед
+    компиляцией крейта (syscall_test.ld для программ с .data,
+    hello.ld иначе), проверяет mtime и печатает rerun-if-changed.
+    Ручные build_all_user.sh, build_user.sh, build_syscall_test.sh,
+    build_ipc.sh, build_loop.sh удалены; комментарии в asm и
+    shell.rs обновлены.
+
+13. README.md: раздел «Планировщик» описывает вытесняющий
+    round-robin и WaitKind, добавлены IRQ4, keyboardd/seriald,
+    убраны ручные скрипты сборки, исправлен английский текст.
+    plan.txt: добавлен статус исправлений аудита.
+
+14. Удалён мёртвый код: set_waiting_irq/clear_waiting_irq/
+    set_waiting_send/wake_irq_waiters, irq_total/irq_pending_count/
+    IRQ_TOTAL/IRQ_DELIVERED, idle_context_valid/invalidate_idle_
+    context, next_process/scheduler_tick/reset_quantum_if_running/
+    reset_quantum/tick/active_count, Mailbox::has_messages,
+    free_slots, scheduler::run_scheduler, serial::SerialWriter/
+    SERIAL, pmm::set_range/total_count, paging::map_kernel_page,
+    elf::PF_R, process::enter_ring3, fs::{create_file,create_dir,
+    remove,copy,rename,write_file}, ata::{CMD_WRITE_SECTORS,
+    write_sector}, неиспользуемые константы btrfs.rs, shell::getchar,
+    зависимость volatile в Cargo.toml.
+
+СБОРКА/ПРОВЕРКИ:
+  - cargo check --no-default-features: EXIT=0, предупреждений
+    проекта нет (только future-incompat от core).
+  - cargo check (fb): EXIT=0.
+  - cargo build --release --no-default-features: OK.
+  - ./make_iso.sh no-fb: OK, boot.iso 3.6 МБ.
+  - Проверка автосборки: touch user_programs/hello.asm →
+    hello.elf пересобран build.rs.
+
+ОСТАЛОСЬ:
+  - Рантайм-проверка в Bochs (ring 3, ps/kill, keyboardd/seriald,
+    IPC, отсутствие шума в COM1) — в этой сессии не запускалась.
+  - Коммит не создавался; push не выполнялся.
+
+================================================================
+2026-11-12: ЖИВОЙ ПРОГОН + ИСТОРИЯ КОМАНД, СТРЕЛКИ, exit/rb
+================================================================
+
+ПРОВЕРЕНО В ЗАПУЩЕННОМ BOCHS (bochs_serial.log):
+  - init (PID=1): ring 3 → write → exit → Terminated → возврат в shell.
+  - ps, ls, test_pmm (PASSED), run_user ("Hello from user mode!").
+  - Диагностический шум в COM1 отсутствует ([T]/[TS]/[I4]/[K]).
+  - btrfs: "bad magic 0x0" — образ btrfs.img целиком нулевой (проверено
+    на хосте: суперблок по 0x10000 пуст). Это не дефект драйвера,
+    образ нужно пересоздать mkfs.btrfs.
+
+НАЙДЕНО И ИСПРАВЛЕНО (клавиатура/shell):
+1. Стрелки PS/2 не работали: keyboard_handler конвертировал скан-код
+   в ASCII и клал в KEYBOARD_BUFFER символ, а read_key сравнивал байты
+   буфера со скан-кодами 0x48/0x50/0x4B/0x4D — сравнение не срабатывало
+   никогда. Сами стрелки (0xE0 0x48) отсутствовали в scancode_to_char
+   и терялись.
+   Исправление: keyboard_handler отслеживает префикс 0xE0
+   (EXTENDED_SCANCODE) и кладёт в буфер ESC-последовательность
+   "\x1b[A/B/C/D" — тот же вид, в котором стрелки приходят из serial.
+
+2. Serial-стрелки печатались как "[A": read_line после ESC читал
+   serial_read_nonblocking() напрямую, но байты '[' и 'A' уже забрал
+   serial_irq_handler в KEYBOARD_BUFFER → ESC разбирался впустую, а
+   остаток печатался как обычный текст.
+   Исправление: единый разбор в read_key → parse_escape_sequence()
+   поверх общего потока байт (PUSHBACK → COM1 → KEYBOARD_BUFFER),
+   таймаут 1 тик PIT для остатка последовательности, чтобы одиночный
+   ESC не съедал следующий символ.
+
+3. История команд: в HISTORY сохранялся весь буфер input_buf (64 байта),
+   поэтому после Backspace в истории оставались удалённые символы.
+   Теперь копируются только input_len байт, пустые команды не пишутся,
+   hist_idx сбрасывается при ручном вводе.
+
+4. Backspace в середине строки: удалялся символ перед курсором без
+   сдвига хвоста (портилась строка). Теперь хвост сдвигается, строка
+   перерисовывается.
+
+5. Ожидание ввода: busy-wait (nop) заменён на sti; hlt — CPU спит до
+   прерывания, Bochs не крутит холостой цикл.
+
+6. serial::serial_read_nonblocking удалён (стал мёртвым кодом).
+
+НОВЫЕ КОМАНДЫ SHELL:
+  - exit — останов системы (cli; hlt) с сообщением; shell — единственный
+    поток ядра, поэтому «выход» = остановка.
+  - rb, rebut — алиасы reboot.
+
+СБОРКА: cargo check --no-default-features — EXIT=0, предупреждений
+проекта нет. ./make_iso.sh no-fb — OK (boot.iso 3,6 МБ, 14:21).
+
+================================================================
+2026-11-12: BOCHS С X11 ДЛЯ ПРОВЕРКИ PS/2
+================================================================
+
+Проблема: ./bochs-bin собран только с nogui/term, X11-плагина нет
+("display library 'x' not available"). Без GUI нельзя проверить
+keyboardd и стрелки — в headless нет устройства клавиатуры.
+
+Решение: Bochs собран из исходников (GitHub master) с X11, установлен
+в ~/.local/bochs-gui (без root):
+  ./configure --prefix=$HOME/.local/bochs-gui --with-x11 \
+              --enable-x86-64 --enable-cpu-level=6 \
+              --enable-long-phy-address
+  make -j8 && make install
+
+bochsrc-gui.bxrc переписан под пользовательскую установку:
+  display_library: x, ROM-образы из ~/.local/bochs-gui/share/bochs,
+  com1 mode=file → bochs_gui_serial.log, btrfs.img на ata1.
+
+Проверка запуска (timeout 12): "installing x module as the Bochs GUI",
+ядро дошло до приглашения shell "> ", лог COM1 пишется в файл.
+Исходники в /tmp удалены после установки (110 МБ), установка — 19 МБ.
+
+Wayland не используется: в системе нет WAYLAND_DISPLAY (сессия X11),
+а Bochs GUI работает через X11. SDL2 в системе есть (2.30.0), но
+X11-сборка ближе к текущей конфигурации.
+
+--- Пустой экран в GUI: несовпадение режима ISO и Bochs ---
+Симптом: окно X11 открывается, но на экране ничего нет, хотя система
+работает (serial-лог полон, приглашение "> " есть).
+
+Причина: ISO был собран ./make_iso.sh no-fb. В этом режиме ядро пишет
+только в текстовый VGA-буфер 0xB8000 ("Framebuffer disabled (no-fb
+mode, text VGA only)"), а bochsrc-gui.bxrc включает VBE 1024x768x32
+(Limine: "VBE set xres (1024), yres (768), bpp (32)"). В графическом
+режиме текстовый буфер не отображается — экран пустой.
+
+Исправление: для GUI ISO собирается С framebuffer — ./make_iso.sh.
+Проверено: "Framebuffer found: 1024x768", "Framebuffer output enabled",
+"Welcome to Malinka shell!" в serial.
+
+Правило: bochsrc-gui.bxrc (X11 + VBE) требует ./make_iso.sh;
+bochsrc.bxrc (nogui + term, nc) требует ./make_iso.sh no-fb.
+
+================================================================
+2026-11-12: ДИАГНОСТИКА FRAMEBUFFER БЕЗ GUI (только логи)
+================================================================
+
+Проблема: в окне X11 (bochsrc-gui.bxrc) изображения нет, хотя ядро
+стартует и serial-лог доходит до приглашения shell.
+
+ОГРАНИЧЕНИЕ СЕССИИ: экран и инструменты управления окнами не
+используются (предыдущие проверки через снятие экрана подвешивали
+систему). Вся диагностика — через serial-лог и файлы.
+
+ДОБАВЛЕНО (диагностика в ядре, src/main.rs + src/video.rs +
+src/terminal.rs):
+  - FB limine: addr + hhdm offset (какой адрес выдал Limine).
+  - FB classify: признак HHDM-диапазона и вычисленный физ. адрес.
+  - FB mode: width/height/pitch/bpp/memory_model/размеры масок RGB.
+  - FB video: что реально сохранил video-модуль (set_framebuffer).
+  - FB read TL/TR/BL/BR: чтение 4 углов LFB до записи (проверка,
+    что замаплен весь буфер, а не только первая страница).
+  - FB rb TL/TR/BL/BR: запись + readback в 4 углах.
+  - FB check: число пикселей цвета текста (0x00AAAAAA) по всему
+    экрану + счётчики flush()/draw_fb() (terminal::render_counters).
+  - video::fb_debug_state() и video::fb_read_px() для диагностики.
+
+РЕЗУЛЬТАТ ПРОГОНА (probe_serial.log, Bochs nogui + COM1 socket):
+  Paging initialized: HHDM offset 0xffff800000000000
+  FB limine: addr=0xffff8000e0000000 hhdm=0xffff800000000000
+  FB classify: hhdm_range=true phys=0x00000000e0000000
+  FB mode: 1024x768 pitch=4096 bpp=32 model=1 masks=8/8/8
+  FB video:  addr=0xffff8000e0000000 1024x768 pitch=4096
+  FB read TL/TR/BL/BR: val=0x00000000 (весь LFB замаплен и обнулён)
+  FB rb TL/TR/BL/BR: wrote==read, все четыре OK
+  FB check: text_px=20546 flush=38 draw_fb=38
+
+ВЫВОД:
+  - Двойного применения HHDM offset НЕТ: phys = addr - hhdm =
+    0xe0000000, что совпадает с окном VBE Bochs
+    ("Register memory access handlers: 0x0000e0000000-0x0000e0ffffff").
+  - Формат режима корректен: model=1 (RGB), маски 8/8/8 → XRGB8888.
+  - Запись доходит до последней страницы LFB (BR off=0x2ffffc, OK).
+  - Терминал реально рисует: draw_fb=38, в LFB 20546 пикселей текста.
+  Следовательно адресация/маппинг framebuffer исправны; остаётся
+  отрисовка на стороне GUI Bochs/X11 (не проверялась — запрещено
+  трогать экран).
+
+ОТКЛОНЁННАЯ ГИПОТЕЗА: поиск пикселей в guest RAM (580 МБ) и подбор
+смещения буфера по «распознанным глифам». VBE LFB в Bochs — отдельный
+буфер плагина vga (MMIO-обработчик на 0xe0000000), а не часть guest
+RAM; совпадения в RAM (~2620) — шум. Декодер удалён из плана.
+
+НОВЫЕ ФАЙЛЫ:
+  - tools/probe_fb.py — запуск Bochs (nogui, -unlock), подключение к
+    COM1 через socket, сбор serial-лога. Режим --serial-only: только
+    лог, без сканирования памяти. Не использует X11 и снимки экрана.
+  - .gitignore: добавлены артефакты Bochs/зондов (bochs-gui.log,
+    bochs_gui_serial.log, bochs_run.out, bochs_serial_test.log,
+    headless_session.log, probe_*.out/log, probe_report.txt,
+    snapshot.bmp).
+
+СБОРКА: ./make_iso.sh (fb) — OK, boot.iso 3,6 МБ.
+ОСТАЛОСЬ: проверка отрисовки в GUI (xwd одного окна с таймаутом) —
+только после явного разрешения; коммит и push не выполнялись.
+

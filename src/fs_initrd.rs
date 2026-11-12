@@ -22,7 +22,7 @@ static SERIALD: &[u8] = include_bytes!("../user_programs/seriald.elf");
 
 /// Создаёт каталог /bin с программами.
 fn create_bin_dir() -> FsNode {
-    let mut bin = FsNode::dir("bin");
+    let bin = FsNode::dir("bin");
     bin.add_child(Box::new(FsNode::file("init.elf", INIT)));
     bin.add_child(Box::new(FsNode::file("hello.elf", HELLO)));
     bin.add_child(Box::new(FsNode::file("loop_a.elf", LOOP_A)));

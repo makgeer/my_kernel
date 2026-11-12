@@ -100,7 +100,84 @@ pub extern "C" fn _start_rust() -> ! {
                     width as u32,
                     height as u32,
                 );
+                // --- ДИАГНОСТИКА АДРЕСАЦИИ FRAMEBUFFER ---
+                // 1. Какой адрес выдал Limine: физический или виртуальный.
+                //    Признак HHDM: старшие биты равны 0xffff8000_0000_0000.
+                // 2. HHDM offset, чтобы вручную проверить преобразование.
+                // 3. Физический адрес: virt - hhdm (если адрес виртуальный).
+                //    Он должен совпасть с окном VBE, которое эмулирует Bochs
+                //    (bochs.log: "Register memory access handlers:
+                //     0x0000e0000000 - 0x0000e0ffffff").
+                let hhdm = crate::limine_fb::get_hhdm_offset();
+                let fb_addr = fb.address() as u64;
+                let in_hhdm = (fb_addr & 0xFFFF_8000_0000_0000) == 0xFFFF_8000_0000_0000;
+                let fb_phys = if in_hhdm {
+                    fb_addr.wrapping_sub(hhdm)
+                } else {
+                    fb_addr
+                };
+                println!(
+                    "FB limine: addr=0x{:016x} hhdm=0x{:016x}",
+                    fb_addr, hhdm
+                );
+                println!(
+                    "FB classify: hhdm_range={} phys=0x{:016x}",
+                    in_hhdm, fb_phys
+                );
+                println!(
+                    "FB mode: {}x{} pitch={} bpp={} model={} masks={}/{}/{}",
+                    width,
+                    height,
+                    fb.pitch,
+                    fb.bpp,
+                    fb.memory_model,
+                    fb.red_mask_size,
+                    fb.green_mask_size,
+                    fb.blue_mask_size
+                );
+                let (vaddr, vw, vh, vpitch) = video::fb_debug_state();
+                println!(
+                    "FB video:  addr=0x{:016x} {}x{} pitch={}",
+                    vaddr, vw, vh, vpitch
+                );
                 video::clear_screen(0x000000);
+                // --- READBACK В ЧЕТЫРЁХ УГЛАХ ---
+                // Чтение до записи проверяет, что весь LFB замаплен:
+                // если последняя страница не замаплена, будет #PF с CR2.
+                unsafe {
+                    let pitch_px = (fb.pitch / 4) as usize;
+                    let w = width as usize;
+                    let h = height as usize;
+                    let corners = [
+                        ("TL", 0usize),
+                        ("TR", w - 1),
+                        ("BL", (h - 1) * pitch_px),
+                        ("BR", (h - 1) * pitch_px + w - 1),
+                    ];
+                    for (name, off) in corners.iter() {
+                        let v = core::ptr::read_volatile(fb_virt.add(*off));
+                        println!(
+                            "FB read {}: off=0x{:08x} val=0x{:08x}",
+                            name,
+                            off * 4,
+                            v
+                        );
+                    }
+                    let vals = [0x00112233u32, 0x00445566, 0x00778899, 0x00AABBCC];
+                    for (i, (_, off)) in corners.iter().enumerate() {
+                        core::ptr::write_volatile(fb_virt.add(*off), vals[i]);
+                    }
+                    for (i, (name, off)) in corners.iter().enumerate() {
+                        let v = core::ptr::read_volatile(fb_virt.add(*off));
+                        println!(
+                            "FB rb {}: wrote=0x{:08x} read=0x{:08x} {}",
+                            name,
+                            vals[i],
+                            v,
+                            if v == vals[i] { "OK" } else { "MISMATCH" }
+                        );
+                    }
+                }
                 println!("Framebuffer output enabled");
             } else {
                 println!("No framebuffer available");
@@ -127,6 +204,23 @@ pub extern "C" fn _start_rust() -> ! {
     add_task("Counter", task_counter);
     
     println!("=== KERNEL READY ===");
+    #[cfg(feature = "fb")]
+    {
+        // Считаем пиксели цвета текста по всему экрану: если терминал
+        // действительно дорисовывает кадр, их будут десятки тысяч.
+        let (fb_w, fb_h) = (1024usize, 768usize);
+        let mut text_px = 0usize;
+        for i in 0..(fb_w * fb_h) {
+            if video::fb_read_px(i) == 0x00AAAAAA {
+                text_px += 1;
+            }
+        }
+        let (flushes, draws) = crate::terminal::render_counters();
+        println!(
+            "FB check: text_px={} flush={} draw_fb={}",
+            text_px, flushes, draws
+        );
+    }
     println!("Commands: help, echo, clear, reboot, hlt");
     
     // Запускаем init.elf — первый пользовательский процесс (Ring 3).

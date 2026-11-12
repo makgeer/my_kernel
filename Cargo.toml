@@ -8,7 +8,6 @@ x86_64 = "0.15.2"
 spin = "0.9.8"
 heapless = "0.7.16"
 limine = "0.6.5"
-volatile = "0.6.1"
 linked_list_allocator = "0.10"
 
 # BTRFS дисковый формат (no_std) — для файловой системы, похожей на btrfs

@@ -32,7 +32,8 @@ static mut HEAP: [u8; HEAP_SIZE] = [0x00; HEAP_SIZE];
 /// Вызывать ОДИН раз в _start_rust, до первой аллокации.
 pub fn init_heap() {
     unsafe {
-        ALLOCATOR.lock().init(HEAP.as_mut_ptr(), HEAP_SIZE);
+        let heap_ptr = core::ptr::addr_of_mut!(HEAP) as *mut u8;
+        ALLOCATOR.lock().init(heap_ptr, HEAP_SIZE);
     }
     println!("Heap initialized: {} KiB", HEAP_SIZE / 1024);
 }

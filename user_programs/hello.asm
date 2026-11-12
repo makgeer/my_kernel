@@ -1,5 +1,5 @@
 ; Тестовая пользовательская программа для загрузчика ELF ядра malinka.
-; Компиляция: nasm -f elf64 + ld (см. build_user.sh).
+; Компиляция: автоматически в build.rs (nasm + ld).
 ; Вызывает системные вызовы через int 0x80:
 ;   eax = номер (1 = write, 60 = exit)
 ;   rdi = arg1, rsi = arg2, rdx = arg3

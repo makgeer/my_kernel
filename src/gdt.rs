@@ -67,11 +67,33 @@ static mut KEYBOARD_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 static mut PAGE_FAULT_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 static mut SERIAL_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 
+/// Размер kernel-стека возврата из user mode.
+pub const KERNEL_RETURN_STACK_SIZE: usize = 16384;
+
 /// Kernel stack для возврата из user mode (ring 3 → ring 0).
 /// При int 0x80 из user mode CPU переключается на TSS.rsp0 — этот стек.
 /// После модификации IRET-фрейма в syscall_handler, iretq возвращает
 /// нас в kernel mode на этом стеке.
-pub static mut KERNEL_RETURN_STACK: AlignedStack<16384> = AlignedStack([0; 16384]);
+pub static mut KERNEL_RETURN_STACK: AlignedStack<KERNEL_RETURN_STACK_SIZE> =
+    AlignedStack([0; KERNEL_RETURN_STACK_SIZE]);
+
+/// Вершина KERNEL_RETURN_STACK (стек растёт вниз).
+pub fn kernel_return_stack_top() -> u64 {
+    // SAFETY: адрес статика только вычисляется, память не читается.
+    unsafe {
+        core::ptr::addr_of!(KERNEL_RETURN_STACK.0) as *const u8 as u64
+            + KERNEL_RETURN_STACK_SIZE as u64
+    }
+}
+
+/// Вершина IST-стека #DF — для диагностики в double_fault_handler.
+pub fn double_fault_stack_top() -> u64 {
+    // SAFETY: адрес статика только вычисляется, память не читается.
+    unsafe {
+        core::ptr::addr_of!(DOUBLE_FAULT_STACK.0) as *const u8 as u64
+            + core::mem::size_of::<AlignedStack<16384>>() as u64
+    }
+}
 /* GDT и TSS живут в static mut — append() требует &mut self, load() требует
    &'static self. init_gdt() вызывается один раз при старте ядра — data race
    невозможна. */
@@ -101,9 +123,7 @@ pub fn init_gdt() {
         // Без RSP0 при int из user mode CPU использует RSP=0 → page fault.
         // В x86_64 crate TSS.rsp0 называется privilege_stack_table[0].
         // Указываем на вершину KERNEL_RETURN_STACK (стек растёт вниз).
-        TSS.privilege_stack_table[0] = VirtAddr::new(
-            KERNEL_RETURN_STACK.0.as_ptr() as u64 + KERNEL_RETURN_STACK.0.len() as u64
-        );
+        TSS.privilege_stack_table[0] = VirtAddr::new(kernel_return_stack_top());
 
         // Добавляем 64-битный сегмент кода (kernel_code_segment)
         let code_sel = GDT.append(Descriptor::kernel_code_segment());
@@ -177,11 +197,12 @@ pub fn kernel_panic(msg: &str) -> ! {
     // cli/sti: запрещаем прерывания на время переключения стека
     // (чтобы ни один обработчик не использовал полу-перезаписанный RSP),
     // затем снова разрешаем — shell нуждается в IRQ0/IRQ1 (клавиатура).
-    // Выравнивание 16 байт (SysV ABI): call push'ит 8 байт → RSP%16==8
-    // внутри shell, что соответствует ABI.
+    //
+    // RSP = top - 256, а не top: адрес top — граница массива стека,
+    // обращение к [top] уходит в незамапленную страницу и даёт #PF.
+    // Запас в 256 байт оставляет место под пролог shell и IRET-фрейм.
     unsafe {
-        let stack_top = (core::ptr::addr_of!(KERNEL_RETURN_STACK) as *const u8 as u64
-            + KERNEL_RETURN_STACK.0.len() as u64) & !0xF;
+        let stack_top = (kernel_return_stack_top() - 256) & !0xF;
         core::arch::asm!(
             "cli",
             "mov rsp, {sp}",   // чистый kernel стек

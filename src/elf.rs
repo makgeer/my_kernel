@@ -43,9 +43,6 @@ const PF_X: u32 = 1;
 /// PF_W — сегмент доступен для записи
 const PF_W: u32 = 2;
 
-/// PF_R — сегмент доступен для чтения
-const PF_R: u32 = 4;
-
 /// Размер страницы 4K
 const PAGE_SIZE: u64 = 4096;
 
@@ -288,9 +285,7 @@ fn load_segment(
         paging::map_page_in_p4(p4_phys, page_virt, phys, flags)?;
 
         // Получаем доступ к физическому фрейму через HHDM
-        let frame_ptr = unsafe {
-            (phys + hhdm) as *mut u8
-        };
+        let frame_ptr = (phys + hhdm) as *mut u8;
 
         // Сначала заполняем всю страницу нулями (bss + padding)
         unsafe {

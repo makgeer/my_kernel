@@ -444,6 +444,7 @@ impl Terminal {
     /// он получает символы потоково в put_char (см. комментарий там).
     /// Остаются только VGA-буфер и Framebuffer (запись в память — быстро).
     pub fn flush(&mut self) {
+        FLUSH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.draw_vga();
         self.draw_fb();
         self.advance_blink();
@@ -459,6 +460,22 @@ impl Terminal {
 
 /// Счётчик мигания курсора: меняет фазу примерно каждые 5 перерисовок.
 static BLINK_COUNTER: Mutex<usize> = Mutex::new(0);
+
+/// Диагностика: сколько раз вызывались flush() и draw_fb().
+/// Нужна, чтобы отличить «отрисовка не вызывается» от «пишет не туда».
+static FLUSH_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static FB_DRAW_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Диагностика: (flush, draw_fb) — счётчики вызовов рендера.
+pub fn render_counters() -> (usize, usize) {
+    use core::sync::atomic::Ordering;
+    (
+        FLUSH_COUNT.load(Ordering::Relaxed),
+        FB_DRAW_COUNT.load(Ordering::Relaxed),
+    )
+}
 
 impl Terminal {
     /// Инкрементит счётчик мигания курсора.
@@ -572,6 +589,7 @@ impl Terminal {
 
     /// Рисует экран на Framebuffer через шрифт 8x16 с шагом 9 px по X.
     fn draw_fb(&self) {
+        FB_DRAW_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let cursor_on = self.cursor_on();
         for r in 0..ROWS {
             for c in 0..COLS {

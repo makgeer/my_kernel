@@ -8,7 +8,7 @@
 //! Используется BTRFS-модулем (src/btrfs.rs) для чтения блочных
 //! данных с диска.
 
-use x86_64::instructions::port::{Port, PortRead, PortWrite};
+use x86_64::instructions::port::Port;
 
 /// База портов первичного ATA-канала.
 const ATA_PRIMARY_BASE: u16 = 0x1F0;
@@ -35,7 +35,6 @@ const REG_STATUS: u16 = 0x007;        // статус
 
 /// Команды ATA.
 const CMD_READ_SECTORS: u8 = 0x20;
-const CMD_WRITE_SECTORS: u8 = 0x30;
 const CMD_IDENTIFY: u8 = 0xEC;
 
 /// Биты статуса.
@@ -131,42 +130,6 @@ pub fn read_sectors(lba: u32, buffer: &mut [u8]) -> bool {
         buffer[i * 512..(i + 1) * 512].copy_from_slice(&sector);
     }
     true
-}
-
-/// Записывает один сектор (512 байт) по LBA28.
-pub fn write_sector(lba: u32, buffer: &[u8; 512]) -> bool {
-    if !wait_not_busy() {
-        return false;
-    }
-
-    let b = base();
-    let mut drive = Port::<u8>::new(b + REG_DRIVE);
-    let mut count = Port::<u8>::new(b + REG_SECTOR_COUNT);
-    let mut lo = Port::<u8>::new(b + REG_LBA_LO);
-    let mut mid = Port::<u8>::new(b + REG_LBA_MID);
-    let mut hi = Port::<u8>::new(b + REG_LBA_HI);
-    let mut cmd = Port::<u8>::new(b + REG_COMMAND);
-
-    unsafe {
-        drive.write(0xE0 | ((lba >> 24) & 0x0F) as u8);
-        count.write(1);
-        lo.write((lba & 0xFF) as u8);
-        mid.write(((lba >> 8) & 0xFF) as u8);
-        hi.write(((lba >> 16) & 0xFF) as u8);
-        cmd.write(CMD_WRITE_SECTORS);
-    }
-
-    if !wait_drq() {
-        return false;
-    }
-
-    let mut data = Port::<u16>::new(b + REG_DATA);
-    for i in 0..256 {
-        let word = (buffer[i * 2] as u16) | ((buffer[i * 2 + 1] as u16) << 8);
-        unsafe { data.write(word); }
-    }
-
-    wait_not_busy()
 }
 
 /// IDENTIFY DEVICE — проверка наличия диска на текущем канале.

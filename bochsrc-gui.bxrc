@@ -1,7 +1,14 @@
-# Bochs GUI configuration for malinka (системный Bochs с X11/GTK)
-# Запуск: /usr/local/bin/bochs -q -f bochsrc-gui.bxrc
-# Показывает окно Bochs с графическим выводом ядра (framebuffer).
-# Ввод — с клавиатуры окна Bochs (PS/2). COM1 — в файл для лога.
+# Bochs GUI configuration for malinka (X11, собран из исходников).
+#
+# Бинарник и BIOS-образы установлены в ~/.local/bochs-gui (без root):
+#   ./configure --prefix=$HOME/.local/bochs-gui --with-x11 \
+#               --enable-x86-64 --enable-cpu-level=6
+#
+# Запуск: ~/.local/bochs-gui/bin/bochs -q -f bochsrc-gui.bxrc
+#
+# Окно X11: VGA-вывод ядра + ввод с клавиатуры (PS/2).
+# COM1 пишется в файл bochs_gui_serial.log — по нему проверяются
+# shell-команды и логи ядра.
 
 # Память 512 MB
 megs: 512
@@ -12,13 +19,17 @@ boot: cdrom
 # VGA — стандартный VBE для framebuffer
 vga: extension=vbe
 
-# ROM images — системные BIOS Bochs
-romimage: file=/usr/local/share/bochs/BIOS-bochs-latest
-vgaromimage: file=/usr/local/share/bochs/VGABIOS-lgpl-latest
+# ROM images — из пользовательской установки Bochs
+romimage: file=/home/makgeer/.local/bochs-gui/share/bochs/BIOS-bochs-latest
+vgaromimage: file=/home/makgeer/.local/bochs-gui/share/bochs/VGABIOS-lgpl-latest.bin
 
 # CD-ROM на ATA канале 0
 ata0: enabled=1, ioaddr1=0x1f0, ioaddr2=0x3f0, irq=14
 ata0-master: type=cdrom, path="boot.iso", status=inserted
+
+# Btrfs-диск на ATA канале 1 (secondary, 0x170)
+ata1: enabled=1, ioaddr1=0x170, ioaddr2=0x370, irq=15
+ata1-master: type=disk, path="btrfs.img", mode=flat
 
 # Serial COM1 → файл (лог для диагностики)
 com1: enabled=1, mode=file, dev="bochs_gui_serial.log"
@@ -26,11 +37,8 @@ com1: enabled=1, mode=file, dev="bochs_gui_serial.log"
 # Display library — X11 (графическое окно Bochs)
 display_library: x
 
-# CPU — bx_generic с x86_64
-cpu: count=1, ips=40000000, model=bx_generic, reset_on_triple_fault=0
-
-# CPUID — включаем x86_64 и необходимые расширения
-cpuid: x86_64=1, mmx=1, sep=1, simd=sse4_2, apic=xapic, aes=1, movbe=1, xsave=1
+# CPU — athlon64 (long mode + CMOV/SSE2): Limine 12.x требует x86_64
+cpu: count=1, ips=40000000, model=athlon64_clawhammer, reset_on_triple_fault=0
 
 # Лог Bochs
 log: bochs-gui.log

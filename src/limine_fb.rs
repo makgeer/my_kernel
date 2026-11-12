@@ -1,7 +1,9 @@
 // Limine Framebuffer Protocol
 // Получаем framebuffer напрямую из Limine Bootloader
 
-use limine::request::{FramebufferRequest, HhdmRequest};
+use limine::request::HhdmRequest;
+#[cfg(feature = "fb")]
+use limine::request::FramebufferRequest;
 
 // Возвращены атрибуты #[used] и #[link_section = ".requests"]:
 // Limine сканирует секцию .requests и предоставляет ядру framebuffer.

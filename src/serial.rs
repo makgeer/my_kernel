@@ -2,8 +2,6 @@
 // Позволяет видеть весь вывод ядра в файле (bochs_serial.log) независимо
 // от видеорежима, который включает загрузчик Limine.
 
-use core::fmt;
-use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 /// Адрес порта COM1 — стандартный первый последовательный порт
@@ -55,16 +53,6 @@ pub fn serial_read() -> u8 {
     }
 }
 
-/// Считывает байт из COM1, если данные есть (возвращает Option).
-/// Не блокирует — возвращает None, если данных нет.
-pub fn serial_read_nonblocking() -> Option<u8> {
-    if serial_has_data() {
-        Some(serial_read())
-    } else {
-        None
-    }
-}
-
 /// Запись строки в COM1 (переводит '\n' в CRLF для корректного отображения)
 pub fn write_str(s: &str) {
     for b in s.bytes() {
@@ -87,6 +75,7 @@ pub fn serial_write_byte(byte: u8) {
 /// Запись неотрицательного числа (0..=999) в десятичном виде поразрядно.
 /// Используется терминалом для ANSI SGR-цветов и позиции курсора,
 /// где нельзя форматировать строки (нет alloc).
+/// Пишет десятичное число (0..=255) в COM1.
 pub fn serial_write_num(n: u16) {
     if n == 0 {
         write_byte(b'0');
@@ -104,16 +93,3 @@ pub fn serial_write_num(n: u16) {
     }
     write_byte(b'0' + ones as u8);
 }
-
-/// Обёртка для использования в макросах через fmt::Write
-pub struct SerialWriter;
-
-impl fmt::Write for SerialWriter {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        write_str(s);
-        Ok(())
-    }
-}
-
-/// Статик для макросов print!/println!
-pub static SERIAL: Mutex<SerialWriter> = Mutex::new(SerialWriter);

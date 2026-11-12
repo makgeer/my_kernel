@@ -80,13 +80,6 @@ unsafe fn set_frame(frame: usize, used: bool) {
     }
 }
 
-/// Помечает диапазон фреймов как занятый/свободный.
-unsafe fn set_range(start_frame: usize, count: usize, used: bool) {
-    for i in 0..count {
-        set_frame(start_frame + i, used);
-    }
-}
-
 /// Инициализация PMM: разбирает карту памяти от Limine, строит bitmap.
 ///
 /// Вызывать ОДИН раз в _start_rust, до первого alloc_frame().
@@ -200,9 +193,4 @@ pub fn dealloc_frame(addr: u64) {
 /// Возвращает количество свободных фреймов (для диагностики).
 pub fn free_count() -> usize {
     unsafe { FREE_FRAMES }
-}
-
-/// Возвращает общее количество фреймов.
-pub fn total_count() -> usize {
-    unsafe { TOTAL_FRAMES }
 }

@@ -10,7 +10,7 @@
 //! Использует btrfs-no-std для структур дискового формата и
 //! ATA PIO драйвер (src/ata.rs) для чтения секторов.
 
-use btrfs_no_std::{SuperBlock, Header, Key, Item, Chunk, KeyPointer, InodeItem};
+use btrfs_no_std::{SuperBlock, Header, Key, Item, Chunk, KeyPointer};
 
 /// Адрес суперблока (64 КБ от начала диска).
 const SUPERBLOCK_ADDR: u64 = 0x10000;
@@ -19,16 +19,12 @@ const SUPERBLOCK_ADDR: u64 = 0x10000;
 const BTRFS_MAGIC: u64 = 0x4D5F53665248425F;
 
 /// Типы ключей btrfs.
-const INODE_ITEM_KEY: u8 = 1;
-const INODE_REF_KEY: u8 = 12;
 const DIR_ITEM_KEY: u8 = 84;
 const EXTENT_DATA_KEY: u8 = 108;
 const ROOT_ITEM_KEY: u8 = 132;
 const CHUNK_ITEM_KEY: u8 = 228;
 
 /// Object IDs корневых деревьев.
-const ROOT_TREE_OBJECTID: u64 = 1;
-const CHUNK_TREE_OBJECTID: u64 = 3;
 const FS_TREE_OBJECTID: u64 = 5;
 // Корневой каталог FS tree = 256 (BTRFS_FIRST_FREE_OBJECTID).
 // НЕ 6 (BTRFS_ROOT_TREE_DIR_OBJECTID=6 — это каталог root tree).
@@ -52,8 +48,6 @@ static mut FS_ROOT_ADDR: u64 = 0;
 
 /// Типы файловых записей в DIR_ITEM (btrfs_dir_item.type).
 /// Код выделен бирюзовым цветом (правило .kodaruls п.6).
-const DIR_TYPE_UNKNOWN: u8 = 0;
-const DIR_TYPE_REGULAR: u8 = 1;
 const DIR_TYPE_DIRECTORY: u8 = 2;
 
 /// Размер DirItem в leaf B-дерева btrfs (30 байт).
@@ -65,7 +59,6 @@ const FILE_EXTENT_HEADER_SIZE: usize = 37;
 /// Типы EXTENT_DATA (btrfs_file_extent_item.type).
 const EXTENT_TYPE_INLINE: u8 = 0;
 const EXTENT_TYPE_REGULAR: u8 = 1;
-const EXTENT_TYPE_PREALLOC: u8 = 2;
 
 /// Возвращает логический адрес корня FS tree (подтом objectid=5).
 /// Кэширует результат для повторных вызовов.

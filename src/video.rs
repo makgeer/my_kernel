@@ -43,6 +43,7 @@ static mut VESA_HEIGHT: u16 = 0;
 /// Устанавливает framebuffer, полученный от Limine.
 /// Заполняет глобальные static'ы, которые использует draw_char_ex
 /// и clear_screen.
+#[cfg(feature = "fb")]
 pub fn set_framebuffer(addr: *mut u32, pitch: u32, width: u32, height: u32) {
     unsafe {
         VESA_FRAMEBUFFER = addr;
@@ -50,6 +51,27 @@ pub fn set_framebuffer(addr: *mut u32, pitch: u32, width: u32, height: u32) {
         VESA_WIDTH = width as u16;
         VESA_HEIGHT = height as u16;
     }
+}
+
+/// Диагностика: (адрес, ширина, высота, pitch) текущего framebuffer.
+/// Нужна для проверки, что Limine выдал корректные параметры режима.
+#[cfg(feature = "fb")]
+pub fn fb_debug_state() -> (usize, usize, usize, usize) {
+    unsafe {
+        (
+            VESA_FRAMEBUFFER as usize,
+            VESA_WIDTH as usize,
+            VESA_HEIGHT as usize,
+            VESA_PITCH as usize,
+        )
+    }
+}
+
+/// Диагностика: чтение пикселя framebuffer по линейному смещению (в u32).
+/// Сравнение с записанным значением показывает, доступна ли видеопамять.
+#[cfg(feature = "fb")]
+pub fn fb_read_px(offset: usize) -> u32 {
+    unsafe { core::ptr::read_volatile(VESA_FRAMEBUFFER.add(offset)) }
 }
 
 // --- Шрифт 8x16 (только ASCII 32-126) ---
@@ -277,6 +299,7 @@ pub fn draw_char_ex(c: char, x: usize, y: usize, fg: u32, bg: u32) {
 }
 
 /// Очищает экран заданным цветом
+#[cfg(feature = "fb")]
 pub fn clear_screen(color: u32) {
     unsafe {
         let total_pixels = (VESA_WIDTH as usize) * (VESA_HEIGHT as usize);
