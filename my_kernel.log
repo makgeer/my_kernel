@@ -4020,3 +4020,14 @@ video.rs вместо vga.rs/vesa.rs, таблица syscalls #24/#39/#40-44,
   - plan.txt   — то же правило в разделе ПРАВИЛ.
   - day_plan.txt — строка в блоке «ПРАВИЛО СЕССИИ».
 
+================================================================
+2026-11-12: КОММИТ — WORKSPACE-ФАЙЛ VS CODE
+================================================================
+
+ДОБАВЛЕНО:
+  - src/malinka.code-workspace — файл рабочего пространства VS Code:
+    корень malinka и вложенная папка my_kernel.
+
+[git] 2026-11-12 — commit "chore: workspace-файл VS Code"
+(src/malinka.code-workspace, my_kernel.log).
+
