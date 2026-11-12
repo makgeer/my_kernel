@@ -4031,3 +4031,17 @@ video.rs вместо vga.rs/vesa.rs, таблица syscalls #24/#39/#40-44,
 [git] 2026-11-12 — commit "chore: workspace-файл VS Code"
 (src/malinka.code-workspace, my_kernel.log).
 
+================================================================
+2026-11-12: СТАТУС PUSH
+================================================================
+
+[git] 2026-11-12 — commit ef03051 "chore: workspace-файл VS Code".
+
+PUSH В ORIGIN НЕ ВЫПОЛНЕН: аутентификация GitHub не настроена
+(credential.helper отсутствует, ~/.git-credentials и ~/.ssh нет,
+gh не установлен). Все локальные коммиты ветки разработка
+остаются неотправленными.
+
+Локальный бэкап обновлён: /home/makgeer/Документы/malinka/
+my_kernel-backup.git — ветка разработка на ef03051.
+
