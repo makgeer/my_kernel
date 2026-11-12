@@ -3958,4 +3958,10 @@ RAM; совпадения в RAM (~2620) — шум. Декодер удалён
 стрелки, диагностика framebuffer" в ветке разработка (53 файла:
 исправления аудита, стрелки PS/2, история/Backspace, exit/rb,
 диагностика fb, tools/probe_fb.py, .gitignore). Push не выполнялся.
+[git] 2026-11-12 — commit 717ba75 "docs: диагностика framebuffer,
+актуализация модулей и syscalls" (README.md, Documents.md, plan.txt).
+Обновлено: структура проекта (bochsrc-gui.bxrc, tools/probe_fb.py),
+флаг -unlock, раздел «Диагностика framebuffer без GUI», модули
+video.rs вместо vga.rs/vesa.rs, таблица syscalls #24/#39/#40-44,
+раздел 6.1.1, статус в plan.txt. Push не выполнялся.
 
