@@ -22,6 +22,10 @@ pub const PAGE_FAULT_IST_INDEX: u16 = 4;
 /// без риска DOUBLE FAULT при переполнении стека.
 pub const SERIAL_IST_INDEX: u16 = 5;
 
+/// IST для #GP — собственный стек, чтобы обработчик диагностики не упал
+/// в #DF, если проблема в самом IRET-фрейме (например, #GP от iretq).
+pub const GENERAL_PROTECTION_IST_INDEX: u16 = 6;
+
 /// Селекторы сегментов (индексы в GDT).
 /// Каждый селектор = индекс * 8 + DPL (0=kernel, 3=user).
 ///
@@ -66,6 +70,7 @@ static mut TIMER_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 static mut KEYBOARD_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 static mut PAGE_FAULT_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 static mut SERIAL_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
+static mut GENERAL_PROTECTION_STACK: AlignedStack<8192> = AlignedStack([0; 8192]);
 
 /// Размер kernel-стека возврата из user mode.
 pub const KERNEL_RETURN_STACK_SIZE: usize = 16384;
@@ -94,6 +99,7 @@ pub fn double_fault_stack_top() -> u64 {
             + core::mem::size_of::<AlignedStack<16384>>() as u64
     }
 }
+
 /* GDT и TSS живут в static mut — append() требует &mut self, load() требует
    &'static self. init_gdt() вызывается один раз при старте ядра — data race
    невозможна. */
@@ -118,6 +124,11 @@ pub fn init_gdt() {
             VirtAddr::new(PAGE_FAULT_STACK.0.as_ptr() as u64 + PAGE_FAULT_STACK.0.len() as u64);
         TSS.interrupt_stack_table[SERIAL_IST_INDEX as usize] =
             VirtAddr::new(SERIAL_STACK.0.as_ptr() as u64 + SERIAL_STACK.0.len() as u64);
+        TSS.interrupt_stack_table[GENERAL_PROTECTION_IST_INDEX as usize] =
+            VirtAddr::new(
+                GENERAL_PROTECTION_STACK.0.as_ptr() as u64
+                    + GENERAL_PROTECTION_STACK.0.len() as u64,
+            );
 
         // RSP0 — стек для перехода из ring 3 в ring 0 (int 0x80, прерывания).
         // Без RSP0 при int из user mode CPU использует RSP=0 → page fault.

@@ -37,6 +37,10 @@ headless_session.log
 probe_bochs.out
 probe_report.txt
 probe_serial.log
+# Артефакты tools/probe_session.py (Bochs nogui + COM1)
+session_bochs.out
+session_report.txt
+session_serial.log
 /snapshot.bmp
 # Python-кэш (tools/)
 __pycache__/

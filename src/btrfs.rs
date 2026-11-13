@@ -120,9 +120,16 @@ fn read_disk(phys_addr: u64, buffer: &mut [u8]) -> bool {
 /// Читает суперблок btrfs с диска.
 ///
 /// Возвращает скопированный суперблок или None.
+///
+/// `#[inline(never)]` и буфер в куче — принципиально: суперблок 4 КБ,
+/// а boot-стек всего 16 КБ. При инлайне в `_start_rust` этот буфер
+/// складывался с буфером `mount`, фрейм достигал 8 КБ и переполнение
+/// стека затирало хвост HEAP (статические данные, лежащие сразу под стеком).
+#[inline(never)]
 pub fn read_superblock() -> Option<SuperBlock> {
-    // Суперблок на 0x10000 = 64 КБ = сектор 128
-    let mut buf = [0u8; 4096];
+    // Суперблок на 0x10000 = 64 КБ = сектор 128.
+    // Буфер в куче, а не на стеке: к моменту вызова куча уже инициализирована.
+    let mut buf = alloc::vec![0u8; 4096];
     if !read_disk(SUPERBLOCK_ADDR, &mut buf) {
         crate::println!("btrfs: failed to read superblock sector");
         return None;
@@ -457,6 +464,10 @@ fn find_item(root_addr: u64, target_objectid: u64, target_type: u8, target_offse
 }
 
 /// Монтирует btrfs: читает суперблок, проверяет.
+///
+/// `#[inline(never)]` — чтобы фрейм mount (и вызываемого read_superblock)
+/// не сливался с гигантским фреймом `_start_rust` на 16-КБ boot-стеке.
+#[inline(never)]
 pub fn mount() -> bool {
     crate::ata::select_channel(0x170); // secondary channel
     match read_superblock() {

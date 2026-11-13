@@ -195,7 +195,7 @@ pub extern "C" fn _start_rust() -> ! {
     
     // Инициализируем GDT
     gdt::init_gdt();
-    
+
     interrupts::init_idt();
     println!("Interrupts enabled");
     

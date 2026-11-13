@@ -43,6 +43,19 @@ pub fn init_idt() {
         // это пробуждает sys_read из sti;hlt.
         let s = idt[0x24].set_handler_fn(serial_irq_handler);
         unsafe { s.set_stack_index(crate::gdt::SERIAL_IST_INDEX) };
+        // ВСЕ остальные линии PIC (0x22, 0x23, 0x25..0x27, 0x28..0x2F)
+        // обязаны иметь обработчик. Иначе spurious-прерывание (например,
+        // IRQ7 от PIC) попадает на not-present запись IDT → #NP с error
+        // code = селектор записи (0x13b = вектор 0x27) → #DF.
+        // IRQ7/IRQ15 обрабатываются отдельно: у них spurious-семантика.
+        for vector in 0x22u8..=0x2F {
+            if vector == 0x24 || vector == 0x27 || vector == 0x2F {
+                continue;
+            }
+            idt[vector].set_handler_fn(irq_default_handler);
+        }
+        idt[0x27].set_handler_fn(irq7_spurious_handler);
+        idt[0x2F].set_handler_fn(irq15_spurious_handler);
         // #PF — page fault, нужен для диагностики проблем с маппингами
         // в user mode (отсутствует обработчик → DOUBLE FAULT).
         // Собственный IST-стек (IST 4): #PF может возникнуть в ring 3,
@@ -50,6 +63,26 @@ pub fn init_idt() {
         // гарантирует валидный стек для обработчика независимо от RSP0.
         let pf = idt.page_fault.set_handler_fn(page_fault_handler);
         unsafe { pf.set_stack_index(crate::gdt::PAGE_FAULT_IST_INDEX) };
+        // #GP — диагностика: без обработчика #GP (например, от iretq с
+        // невалидным SS/CS) сразу превращается в #DF, и исходная причина
+        // теряется. Отдельный IST-стек, чтобы не упасть в #DF повторно.
+        let gp = idt
+            .general_protection_fault
+            .set_handler_fn(general_protection_handler);
+        unsafe { gp.set_stack_index(crate::gdt::GENERAL_PROTECTION_IST_INDEX) };
+        // Ловушки для исключений без собственных обработчиков: без них
+        // CPU пытается доставить #NP на пустой дескриптор IDT → #DF, и
+        // исходный вектор теряется. Error code у #NP = номер этого вектора.
+        let np = idt
+            .segment_not_present
+            .set_handler_fn(segment_not_present_handler);
+        unsafe { np.set_stack_index(crate::gdt::GENERAL_PROTECTION_IST_INDEX) };
+        let ud = idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        unsafe { ud.set_stack_index(crate::gdt::GENERAL_PROTECTION_IST_INDEX) };
+        // #SS — с error code (селектор SS). Второй вероятный кандидат
+        // после #UD: iretq всегда загружает SS, даже в ring 0.
+        let ss = idt.stack_segment_fault.set_handler_fn(stack_segment_handler);
+        unsafe { ss.set_stack_index(crate::gdt::GENERAL_PROTECTION_IST_INDEX) };
         // int 0x80 — syscall из user mode (ring 3). DPL=3 разрешает
         // вызов int 0x80 из ring 3. Без DPL=3 → #GP при int 0x80 из user.
         // IST не используется — CPU переключается на TSS.rsp0 (kernel stack).
@@ -154,6 +187,121 @@ extern "x86-interrupt" fn double_fault_handler(
     // kernel стек и вызовет shell::shell(). Пользователь продолжит
     // работу, а не перезагрузит систему вручную.
     crate::gdt::kernel_panic("Double fault — recovering to kernel shell");
+}
+
+/// Обработчик IRQ, для которого нет отдельного драйвера (0x22, 0x23,
+/// 0x25, 0x26, 0x28..0x2E). Подтверждает прерывание и считает его.
+///
+/// Нужен обязательно: без обработчика запись IDT остаётся not present,
+/// и любое прерывание по этой линии даёт #NP (error code = селектор
+/// записи), а следом #DF — система падает из-за незанятой линии PIC.
+extern "x86-interrupt" fn irq_default_handler(_stack_frame: InterruptStackFrame) {
+    IRQ_UNEXPECTED.fetch_add(1, Ordering::Relaxed);
+    outb(PIC1, 0x20);
+}
+
+/// Spurious IRQ7 (вектор 0x27).
+///
+/// PIC выдаёт его, когда прерывание по линии 7 исчезло до подтверждения.
+/// По документации 8259A: если в ISR master бит 7 не установлен, это
+/// ложное прерывание и EOI посылать НЕЛЬЗЯ — иначе будет потеряно
+/// реальное прерывание, обслуживаемое в этот момент.
+extern "x86-interrupt" fn irq7_spurious_handler(_stack_frame: InterruptStackFrame) {
+    let isr: u8;
+    unsafe {
+        outb(PIC1, 0x0B); // OCW3: read ISR
+        let mut port = Port::<u8>::new(PIC1);
+        isr = port.read();
+    }
+    if isr & 0x80 == 0 {
+        IRQ_SPURIOUS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    outb(PIC1, 0x20);
+}
+
+/// Spurious IRQ15 (вектор 0x2F).
+///
+/// Для slave EOI посылается master (каскад), но не slave: если в ISR
+/// slave бит 7 не установлен, прерывание ложное.
+extern "x86-interrupt" fn irq15_spurious_handler(_stack_frame: InterruptStackFrame) {
+    let isr: u8;
+    unsafe {
+        outb(PIC2, 0x0B); // OCW3: read ISR
+        let mut port = Port::<u8>::new(PIC2);
+        isr = port.read();
+    }
+    if isr & 0x80 == 0 {
+        IRQ_SPURIOUS.fetch_add(1, Ordering::Relaxed);
+        // Только master: slave ложное прерывание не подтверждаем.
+        outb(PIC1, 0x20);
+        return;
+    }
+    outb(PIC2, 0x20);
+    outb(PIC1, 0x20);
+}
+
+/// Счётчики неожиданных и ложных прерываний (диагностика).
+pub static IRQ_UNEXPECTED: AtomicUsize = AtomicUsize::new(0);
+pub static IRQ_SPURIOUS: AtomicUsize = AtomicUsize::new(0);
+
+/// Обработчик #GP (вектор 13) — только диагностика.
+///
+/// Зачем нужен: #DF вторичен. Если iretq выталкивает невалидный SS/CS
+/// или недопустимый RFLAGS, CPU сначала даёт #GP; без обработчика #GP
+/// он сразу эскалируется в #DF, и исходная причина теряется.
+///
+/// Error code: селектор, вызвавший нарушение (для #GP от iretq — SS или
+/// CS), либо 0, если причина не в селекторе (например, RFLAGS).
+///
+/// Поля stack_frame при доставке через IST валидны всегда: CPU пушит
+/// SS:RSP безусловно, в том числе для прерывания из ring 0.
+extern "x86-interrupt" fn general_protection_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    crate::debug::serial_write_str_direct("\n[GP] err=0x");
+    crate::debug::write_hex(error_code);
+    crate::debug::serial_write_str_direct(" rip=0x");
+    crate::debug::write_hex(stack_frame.instruction_pointer.as_u64());
+    crate::debug::serial_write_str_direct("\n");
+    crate::gdt::kernel_panic("General protection fault");
+}
+
+/// Ловушка #NP (вектор 11). Error code — селектор not-present записи
+/// (для исключений и прерываний) либо селектор сегмента.
+extern "x86-interrupt" fn segment_not_present_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    crate::debug::serial_write_str_direct("\n[NP] err=0x");
+    crate::debug::write_hex(error_code);
+    crate::debug::serial_write_str_direct(" rip=0x");
+    crate::debug::write_hex(stack_frame.instruction_pointer.as_u64());
+    crate::debug::serial_write_str_direct("\n");
+    crate::gdt::kernel_panic("Segment not present");
+}
+
+/// Ловушка #SS (вектор 12). Error code — селектор SS, при загрузке
+/// которого возникла ошибка.
+extern "x86-interrupt" fn stack_segment_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    crate::debug::serial_write_str_direct("\n[SS] err=0x");
+    crate::debug::write_hex(error_code);
+    crate::debug::serial_write_str_direct(" rip=0x");
+    crate::debug::write_hex(stack_frame.instruction_pointer.as_u64());
+    crate::debug::serial_write_str_direct("\n");
+    crate::gdt::kernel_panic("Stack segment fault");
+}
+
+/// Ловушка #UD (вектор 6) — недопустимая инструкция.
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    crate::debug::serial_write_str_direct("\n[UD] rip=0x");
+    crate::debug::write_hex(stack_frame.instruction_pointer.as_u64());
+    crate::debug::serial_write_str_direct("\n");
+    crate::gdt::kernel_panic("Invalid opcode");
 }
 
 /* Увеличен буфер с 16 до 256 символов — клавиатура генерирует прерывания быстрее обработки */
@@ -295,10 +443,9 @@ unsafe extern "C" fn timer_handler_naked() -> ! {
         "mov rdi, rsp",
         // rsi = указатель на IRET-фрейм (после 15 GPR = 15*8 = 0x78)
         "lea rsi, [rsp + 0x78]",
-        // rdx = RSP на входе в обработчик (после push GPR). Нужен, чтобы
-        // восстановить реальный RSP прерванного контекста: при прерывании
-        // из ring 0 CPU НЕ пушит RSP и SS, и поля frame.rsp/frame.ss
-        // содержат мусор за пределами 3-словного фрейма.
+        // rdx = RSP на входе в обработчик. Не используется Rust-стороной:
+        // таймер доставляется через IST, и CPU в long mode всегда пушит
+        // 5-словный фрейм (SS:RSP входят в него и из ring 0).
         "mov rdx, rsp",
         // Вызываем Rust-планировщик
         "call {func}",
@@ -517,6 +664,11 @@ pub struct SyscallRegisters {
     pub rcx: u64,
     pub rax: u64,
 }
+
+// Layout SyscallRegisters обязан совпадать со стеком после 15 push в
+// syscall_entry: 15 * 8 = 120 байт. Иначе syscall_handler_rust читает
+// регистры со сдвигом, а IRET-фрейм ищется не там, где лежит.
+const _: () = assert!(core::mem::size_of::<SyscallRegisters>() == 120);
 
 /// asm-обёртка системного вызова int 0x80.
 ///

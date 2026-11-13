@@ -254,9 +254,9 @@ pub struct ProcessContext {
 ///
 /// При переходе из ring 3 CPU пушит 5 значений:
 ///   SS, RSP, RFLAGS, CS, RIP (в порядке пуша — SS первым).
-/// При прерывании внутри ring 0 пушатся только RIP, CS и RFLAGS —
-/// поля rsp/ss в этом случае лежат за пределами фрейма и содержат
-/// мусор (см. timer_schedule_rust, параметр rsp_at_entry).
+/// При использовании IST (таймер, #DF, #PF) CPU в long mode пушит те же
+/// 5 значений и из ring 0. Только обычное прерывание без IST из ring 0
+/// даёт 3-словный фрейм (RIP, CS, RFLAGS).
 ///
 /// Порядок полей = порядок на стеке (RIP по наименьшему адресу).
 /// Используется для модификации IRET-фрейма при переключении контекста
@@ -302,6 +302,12 @@ pub struct GprRegs {
     pub r14: u64,
     pub r15: u64,
 }
+
+// Layout GprRegs обязан совпадать со стеком timer_handler_naked:
+// push r15 первым … push rax последним → по адресу rsp лежит rax.
+// 15 * 8 = 120 байт. Структура НЕ взаимозаменяема с SyscallRegisters
+// (там обратный порядок push и первое поле r15).
+const _: () = assert!(core::mem::size_of::<GprRegs>() == 120);
 
 impl ProcessContext {
     /// Создаёт пустой контекст (все регистры = 0).
@@ -980,9 +986,8 @@ pub fn set_shell_idle(idle: bool) {
 /// Вызывается из таймера, когда shell вытесняется впервые.
 ///
 /// `frame_rsp`/`frame_ss` — реальные RSP и SS прерванного контекста.
-/// Их нельзя брать из IRET-фрейма напрямую: при прерывании из ring 0
-/// CPU пушит только RIP, CS и RFLAGS, а поля rsp/ss в структуре
-/// IretFrame оказываются мусором за пределами фрейма.
+/// Таймер доставляется через IST, поэтому CPU в long mode пушит SS:RSP
+/// безусловно (даже из ring 0), и эти поля IRET-фрейма валидны.
 ///
 /// # Safety
 /// Вызывается только из обработчика прерывания (монопольный доступ
@@ -1024,12 +1029,11 @@ pub fn take_idle_context() -> Option<(GprRegs, IretFrame, u64)> {
 ///
 /// Возвращает false, если сохранённого контекста нет.
 ///
-/// Почему не iretq: в long mode при возврате в ТОТ ЖЕ уровень
-/// привилегий (ring 0 → ring 0) iretq не загружает RSP и SS — они
-/// остаются от прерванного обработчика. Код shell продолжился бы с
-/// чужим RSP, а его локальные переменные лежат по адресам старого
-/// стека → чтение мусора и #PF/#DF. Поэтому RSP восстанавливается
-/// явно, а переход выполняется через jmp.
+/// Почему не iretq: вызов идёт из обычной Rust-функции на стеке
+/// обработчика, а не из asm-обёртки с готовым фреймом. Поэтому RSP
+/// восстанавливается явно, а переход выполняется через jmp.
+/// (В long mode iretq, в отличие от 32-битного режима, загружает
+/// RSP и SS и при возврате в ring 0.)
 ///
 /// Регистры-источники (rax, rcx, rdx, rsi, rdi, r8, r9, r10) не
 /// пересекаются с восстанавливаемыми (rsp, rbp, rbx, r12-r15),
@@ -1052,20 +1056,22 @@ pub fn resume_idle_context() -> bool {
         }
     }
 
-    // Диагностика: точка и стек возобновления. Если rip не совпадает с
-    // адресом после hlt (или rsp вне ожидаемого стека) — IDLE_CTX снят
-    // не в той точке.
-    crate::debug::serial_write_str_direct("[IDLE] resume rip=0x");
-    crate::debug::write_hex(iret.rip);
-    crate::debug::serial_write_str_direct(" rsp=0x");
-    crate::debug::write_hex(iret.rsp);
-    crate::debug::serial_write_str_direct(" cs=0x");
-    crate::debug::write_hex(iret.cs);
-    crate::debug::serial_write_str_direct(" ss=0x");
-    crate::debug::write_hex(iret.ss);
-    crate::debug::serial_write_str_direct(" cr3=0x");
-    crate::debug::write_hex(cr3);
-    crate::debug::serial_write_str_direct("\n");
+    // SS/DS/ES после int 0x80 из ring 3 равны NULL: CPU обнуляет их при
+    // переходе в ring 0. jmp сегменты не восстанавливает, поэтому
+    // следующий iretq из таймера вытолкнул бы SS=0 — по SDM это #GP.
+    //
+    // В long mode SS не задаёт базу стека (адресация плоская), поэтому
+    // RSP из IDLE_CTX и SS=0x10 согласованы: стек выбирается по RSP.
+    unsafe {
+        core::arch::asm!(
+            "mov ax, 0x10",
+            "mov ss, ax",
+            "mov ds, ax",
+            "mov es, ax",
+            out("ax") _,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 
     unsafe {
         core::arch::asm!(
@@ -1304,8 +1310,8 @@ pub fn yield_current_and_switch(
 /// # Аргументы (от asm):
 /// - `regs` — указатель на сохранённые GPR на стеке (массив 15 u64)
 /// - `frame` — указатель на IRET-фрейм на стеке
-/// - `rsp_at_entry` — RSP сразу после push 15 GPR (нужен для корректного
-///   восстановления RSP при прерывании из ring 0, где CPU не пушит RSP/SS)
+/// - `rsp_at_entry` — RSP сразу после push 15 GPR (не используется:
+///   при доставке таймера через IST IRET-фрейм всегда 5-словный)
 ///
 /// # Возврат
 /// - `false` — переключения нет, asm просто восстанавливает GPR и iretq
@@ -1336,22 +1342,21 @@ pub extern "C" fn timer_schedule_rust(
 
     // Реальные RSP/SS прерванного контекста.
     //
-    // При прерывании из ring 3 CPU пушит 5 слов (RIP, CS, RFLAGS, RSP, SS),
-    // при прерывании из ring 0 — только 3 (RIP, CS, RFLAGS). Во втором
-    // случае поля frame.rsp/frame.ss лежат за пределами фрейма и содержат
-    // мусор: RSP равен rsp_at_entry + 0x78 (15 GPR) + 24 (3 слова фрейма),
-    // а SS — это текущий селектор данных ядра.
-    let frame_cs = unsafe { (*frame).cs };
-    let (frame_rsp, frame_ss) = if (frame_cs & 3) == 0 {
-        (
-            rsp_at_entry + 0x78 + 24,
-            crate::gdt::KERNEL_DATA_SELECTOR as u64,
-        )
-    } else {
-        unsafe { ((*frame).rsp, (*frame).ss) }
-    };
+    // Таймер доставляется через IST (TIMER_IST_INDEX), поэтому CPU в long
+    // mode ВСЕГДА пушит 5 слов — SS, RSP, RFLAGS, CS, RIP — даже если
+    // прерывание произошло в ring 0 (Intel SDM: при использовании IST
+    // SS:RSP пушатся безусловно). Значит поля frame.rsp/frame.ss валидны
+    // в обоих случаях, и их нужно ЧИТАТЬ, а не вычислять их адрес.
+    //
+    // ИСТОРИЯ БАГА: раньше для ring 0 сохранялся адрес поля RSP
+    // (rsp_at_entry + 0x78 + 24). В IDLE_CTX попадал указатель внутрь
+    // TIMER_STACK; возврат из idle шёл на IST-стек таймера, следующий
+    // тик затирал рабочие данные read_line → DOUBLE FAULT.
+    let (frame_rsp, frame_ss) = unsafe { ((*frame).rsp, (*frame).ss) };
+    let _ = rsp_at_entry;
 
     let mut pm = PROCESS_MANAGER.lock();
+
 
     // Страховка для доставки прерываний в user space: если IRQ-handler
     // не смог взять лок (был занят), ожидающий процесс будится здесь.
