@@ -4226,4 +4226,37 @@ shell::read_line, то есть точка возврата КОРРЕКТНА.
 СБОРКА: cargo check --no-default-features — 0 ошибок (единственное
   предупреждение render_counters — давнее); ./make_iso.sh no-fb — OK.
 
+================================================================
+2026-11-13: ПРОВЕРКА kill/keyboardd/ipcstat, НАЙДЕН ДЕФЕКТ kill
+================================================================
+
+1. `kill <pid>` НЕ РАБОТАЛ. Симптом в логе: "kill 2" →
+   "Unknown command: kill 2". Причина: match сравнивал ВСЮ строку
+   с "kill", поэтому команда с аргументом уходила в ветку `_`,
+   хотя внутри ветки уже был разбор PID из cmd[5..].
+   ИСПРАВЛЕНО (src/shell.rs): guard
+     cmd if cmd == "kill" || cmd.starts_with("kill ")
+   Проверено: kill 2 завершает seriald → "process PID=2 (elf) ->
+   Terminated"; irqstat показывает IRQ4: kernel (владелец освобождён);
+   ps пуст. То же для keyboardd (IRQ1 → kernel).
+
+2. keyboardd: запускается, irq_claim IRQ1 -> PID=2, irqstat
+   показывает "IRQ 1: user driver (PID=2)", kill освобождает линию.
+
+3. test_ipc: ОБНАРУЖЕН ДЕФЕКТ ТЕСТА (не ядра).
+   Вывод: receiver (PID=2) в Blocked, sender (PID=3) завершился,
+   но "HELLO" не напечатан, ipcstat: sent=0, received=0, failed=0.
+   Причина: ipc_sender.asm жёстко отправляет на PID=1, а receiver
+   получает PID=2. next_pid монотонный: init занял PID 1 и завершился,
+   поэтому первый процесс из shell получает 2. Тест рассчитан на
+   запуск ДО init (receiver=PID 1, sender=PID 2) и после init
+   не работает.
+   НЕ ИСПРАВЛЕНО: требует передачи фактического PID получателя
+   (argv/регистр при запуске) либо отдельного канала. Записано
+   в остаток.
+
+ИТОГ ДНЯ: оба заявленных дефекта (#DF из idle, порча HEAP/seriald)
+  закрыты; дополнительно исправлена команда kill. Открытым остаётся
+  только тест IPC с фиксированными PID.
+
 

@@ -949,8 +949,16 @@ read через block_current_and_switch(WaitKind::Stdin), а не sti; hlt в �
 
 5. ОСТАЛОСЬ:
    - Проверить kill <pid> для seriald: освобождение IRQ4 и снятие
-     процесса из irq_wait.
-   - keyboardd и ipcstat (пункты 10-11 day_plan).
+     процесса из irq_wait. ВЫПОЛНЕНО: попутно найден и исправлен
+     дефект — match сравнивал всю строку с "kill", поэтому "kill 2"
+     давал Unknown command. После фикса kill освобождает IRQ4/IRQ1,
+     irqstat возвращает линии в kernel, ps пуст.
+   - keyboardd и ipcstat (пункты 10-11 day_plan). keyboardd проверен:
+     irq_claim IRQ1 -> PID, kill освобождает. ipcstat выявил дефект
+     ТЕСТА: ipc_sender.asm жёстко шлёт на PID=1, а после init receiver
+     получает PID=2 (next_pid монотонный), поэтому "HELLO" не
+     доставляется и sent=0. Нужен способ передать фактический PID
+     получателя (argv/регистр при запуске) либо отдельный канал.
    - GUI-проверка framebuffer — только после явного разрешения.
    - Push в origin невозможен (нет аутентификации); локальный бэкап
      /home/makgeer/Документы/malinka/my_kernel-backup.git.
